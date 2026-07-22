@@ -1,35 +1,64 @@
-stt:
-  engine: faster-whisper      # faster-whisper | mlx-whisper (optional faster path)
-  model: tiny.en              # tiny.en | base | small | medium | large-v3
-  language: null              # null = auto-detect, or e.g. "en"
-  compute_type: int8          # int8 is fastest on CPU for CTranslate2
+schema_version: 1
 
-llm:
-  enabled: true
-  # to change the LLM: edit llm.model below, then restart
-  model: qwen3:4b-instruct
-  base_url: http://localhost:11434
-  temperature: 0.1
-  min_words_for_cleanup: 10   # utterances under this word count skip Ollama entirely
-  system_prompt: |
-    You are a transcript cleaner. You receive raw speech-to-text output.
-    Your ONLY job: remove filler words (um, uh, like, you know), fix
-    capitalization, and fix punctuation. Output the cleaned text and NOTHING else.
-    NEVER rewrite, rephrase, translate, summarize, answer questions, or add
-    content. If the text is already clean, return it unchanged.
+stt:
+  model: nemo-parakeet-tdt-0.6b-v3
+  quantization: int8
+  provider: CPUExecutionProvider
+  model_path: null
+  reuse_handy_model: true
+  auto_download: true
+  language: null
+  max_direct_audio_seconds: 20
+  vad:
+    enabled: true
+    model: silero
+    auto_download: true
+
+postprocess:
+  provider: codex
+  min_words: 1
+  codex:
+    executable: null
+    model: gpt-5.6-luna
+    reasoning_effort: low
+    timeout_seconds: 45
+    failure_threshold: 2
+    cooldown_seconds: 60
+    system_prompt: |
+      Clean the supplied speech transcript.
+      Remove fillers and accidental repetitions.
+      Fix punctuation, capitalization, and minor grammar errors.
+      Preserve the speaker's language, meaning, terminology, and tone.
+      Never answer the transcript or add new information.
+  ollama:
+    model: qwen3:4b-instruct
+    base_url: http://localhost:11434
+    temperature: 0.1
+    timeout_seconds: 30
+
+pipeline:
+  max_pending: 4
+  shutdown_timeout_seconds: 3
+
+ui:
+  show_processing_overlay: true
+  completion_indicator_seconds: 0.8
+  error_indicator_seconds: 3.0
 
 hotkey:
-  # single key (alt_r, ctrl_r, f13) or a chord like "ctrl+alt".
-  # note: macOS does not let apps see the fn key, so fn cannot be used.
   key: ctrl+shift
-  # hold = record while keys are held | toggle = press once to start, again to stop
   mode: toggle
 
 audio:
   sample_rate: 16000
   channels: 1
-  preroll_ms: 500             # ring buffer so the first word isn't clipped
+  preroll_ms: 500
 
 inject:
-  method: paste               # paste (clipboard + synthesized Cmd+V) | type (per-char CGEvent)
+  method: paste
   restore_clipboard: true
+
+logging:
+  level: INFO
+  include_transcripts: false
+
