@@ -32,12 +32,21 @@ def create_postprocessor(
     if config.provider == "codex":
         from voiceflow.postprocess.codex import CodexPostProcessor
 
-        return CodexPostProcessor(config.codex, min_words=config.min_words, **kwargs)
+        return CodexPostProcessor(
+            config.codex,
+            min_words=config.min_words,
+            system_prompt=config.system_prompt,
+            **kwargs,
+        )
     if config.provider == "ollama":
         from voiceflow.postprocess.ollama import OllamaPostProcessor
 
-        return OllamaPostProcessor(config.ollama, min_words=config.min_words, **kwargs)
+        return OllamaPostProcessor(
+            config.ollama,
+            min_words=config.min_words,
+            system_prompt=config.system_prompt,
+            **kwargs,
+        )
     from voiceflow.postprocess.none import NoPostProcessor
 
-    return NoPostProcessor()
-
+    return NoPostProcessor(**kwargs)

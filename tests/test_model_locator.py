@@ -32,9 +32,7 @@ def test_invalid_explicit_and_environment_paths_are_errors(
         ).resolve()
 
 
-def test_handy_is_reused_in_place(
-    app_config: AppConfig, valid_model: Path, tmp_path: Path
-) -> None:
+def test_handy_is_reused_in_place(app_config: AppConfig, valid_model: Path, tmp_path: Path) -> None:
     result = ModelLocator(
         app_config.stt,
         environ={},

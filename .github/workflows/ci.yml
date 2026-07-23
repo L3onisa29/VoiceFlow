@@ -17,5 +17,6 @@ jobs:
       - run: uv sync --locked
       - run: uv lock --check
       - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
       - run: uv run --locked pytest
-
+      - run: uv build --wheel

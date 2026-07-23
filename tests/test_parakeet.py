@@ -52,9 +52,7 @@ def make_transcriber(
     return ParakeetTranscriber(app_config.stt, locator=locator, onnx_module=onnx)
 
 
-def test_exact_model_and_cpu_provider_arguments(
-    app_config: AppConfig, valid_model: Path
-) -> None:
+def test_exact_model_and_cpu_provider_arguments(app_config: AppConfig, valid_model: Path) -> None:
     onnx = FakeOnnx()
     transcriber = make_transcriber(app_config, valid_model, onnx)
     transcriber.load()
@@ -102,9 +100,7 @@ def test_loading_emits_visible_states(app_config: AppConfig, valid_model: Path) 
     assert states == [ModelState.RESOLVING, ModelState.LOADING, ModelState.READY]
 
 
-def test_corrupt_cache_is_backed_up_then_downloaded(
-    app_config: AppConfig, tmp_path: Path
-) -> None:
+def test_corrupt_cache_is_backed_up_then_downloaded(app_config: AppConfig, tmp_path: Path) -> None:
     cache = tmp_path / "parakeet-tdt-0.6b-v3-int8"
     cache.mkdir()
     (cache / "broken").write_text("bad", encoding="utf-8")
@@ -119,9 +115,7 @@ def test_corrupt_cache_is_backed_up_then_downloaded(
             path.mkdir()
             for filename in MODEL_FILES:
                 content = (
-                    '{"model_type":"nemo-conformer-tdt"}'
-                    if filename == "config.json"
-                    else "data"
+                    '{"model_type":"nemo-conformer-tdt"}' if filename == "config.json" else "data"
                 )
                 (path / filename).write_text(content, encoding="utf-8")
             return super().load_model(*args, **kwargs)
@@ -142,3 +136,56 @@ def test_corrupt_cache_is_backed_up_then_downloaded(
         ModelState.LOADING,
         ModelState.READY,
     ]
+
+
+def test_nonempty_but_unloadable_voiceflow_cache_is_repaired(
+    app_config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    app_config.stt.model_path = None
+    app_config.stt.reuse_handy_model = False
+    cache_root = tmp_path / "cache"
+    cache = cache_root / "parakeet-tdt-0.6b-v3-int8"
+    cache.mkdir(parents=True)
+    for filename in MODEL_FILES:
+        content = (
+            '{"model_type":"nemo-conformer-tdt"}'
+            if filename == "config.json"
+            else "not-empty-but-invalid"
+        )
+        (cache / filename).write_text(content, encoding="utf-8")
+
+    class RepairingOnnx(FakeOnnx):
+        calls = 0
+
+        def load_model(self, *args: Any, **kwargs: Any) -> FakeModel:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("invalid ONNX")
+            path = Path(args[1])
+            path.mkdir()
+            for filename in MODEL_FILES:
+                content = (
+                    '{"model_type":"nemo-conformer-tdt"}'
+                    if filename == "config.json"
+                    else "downloaded"
+                )
+                (path / filename).write_text(content, encoding="utf-8")
+            return super().load_model(*args, **kwargs)
+
+    transcriber = ParakeetTranscriber(
+        app_config.stt,
+        locator=ModelLocator(
+            app_config.stt,
+            environ={},
+            handy_path=tmp_path / "handy",
+            cache_root=cache_root,
+        ),
+        onnx_module=RepairingOnnx(),
+    )
+    result = transcriber.load()
+
+    assert result.source == "repair-download"
+    assert transcriber.corrupt_cache_backup is not None
+    assert transcriber.corrupt_cache_backup.is_dir()
+    assert "nemo128.onnx" not in MODEL_FILES

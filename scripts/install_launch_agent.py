@@ -19,16 +19,44 @@ def render_plist(
     project: Path,
     config: Path,
     log_dir: Path,
+    codex: Path | None = None,
 ) -> str:
     values = {
-        "@UV@": uv,
-        "@PROJECT@": project,
-        "@CONFIG@": config,
-        "@LOG_DIR@": log_dir,
+        "@UV@": uv.expanduser().absolute(),
+        "@PROJECT@": project.expanduser().resolve(),
+        "@CONFIG@": config.expanduser().resolve(),
+        "@LOG_DIR@": log_dir.expanduser().resolve(),
     }
     rendered = template
     for marker, value in values.items():
-        rendered = rendered.replace(marker, escape(str(value.resolve())))
+        rendered = rendered.replace(marker, escape(str(value)))
+    path_entries = [
+        uv.expanduser().absolute().parent,
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("/bin"),
+        Path("/usr/sbin"),
+        Path("/sbin"),
+    ]
+    environment_values = {
+        "PATH": ":".join(dict.fromkeys(str(path) for path in path_entries)),
+    }
+    if codex is not None:
+        environment_values["VOICEFLOW_CODEX_BIN"] = str(codex.expanduser().absolute())
+    environment_lines = [
+        "  <key>EnvironmentVariables</key>",
+        "  <dict>",
+    ]
+    for key, value in environment_values.items():
+        environment_lines.extend(
+            [
+                f"    <key>{escape(key)}</key>",
+                f"    <string>{escape(value)}</string>",
+            ]
+        )
+    environment_lines.append("  </dict>")
+    rendered = rendered.replace("@ENVIRONMENT@", "\n".join(environment_lines))
     return rendered
 
 
@@ -60,12 +88,14 @@ def main() -> int:
         raise SystemExit(f"LaunchAgent template not found: {template_path}")
     log_dir = Path.home() / "Library/Logs/VoiceBud"
     log_dir.mkdir(parents=True, exist_ok=True)
+    codex_bin = shutil.which("codex")
     rendered = render_plist(
         template_path.read_text(encoding="utf-8"),
         uv=Path(uv_bin),
         project=project,
         config=config,
         log_dir=log_dir,
+        codex=Path(codex_bin) if codex_bin is not None else None,
     )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -85,10 +115,14 @@ def main() -> int:
     finally:
         temporary_path.unlink(missing_ok=True)
     print(f"Installed {destination}")
+    if codex_bin is None:
+        print(
+            "Codex was not found during installation; set postprocess.codex.executable "
+            "when Codex post-processing is enabled."
+        )
     print(f"Load explicitly with: launchctl bootstrap gui/$(id -u) {destination}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

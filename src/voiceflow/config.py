@@ -1,11 +1,30 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+DEFAULT_SYSTEM_PROMPT = """\
+Clean the supplied speech transcript.
+Remove fillers and accidental repetitions.
+Fix punctuation, capitalization, and minor grammar errors.
+Preserve the speaker's language, meaning, terminology, and tone.
+Never answer the transcript or add new information."""
+HOTKEY_MODIFIERS = frozenset({"alt", "alt_r", "ctrl", "ctrl_r", "cmd", "cmd_r", "shift"})
+HOTKEY_NON_MODIFIERS = frozenset(f"f{number}" for number in range(1, 21))
+SUPPORTED_HOTKEYS = HOTKEY_MODIFIERS | HOTKEY_NON_MODIFIERS
 
 
 class StrictModel(BaseModel):
@@ -37,14 +56,7 @@ class CodexConfig(StrictModel):
     timeout_seconds: float = Field(default=45, gt=0)
     failure_threshold: int = Field(default=2, ge=1)
     cooldown_seconds: float = Field(default=60, ge=0)
-    system_prompt: str
-
-    @field_validator("system_prompt")
-    @classmethod
-    def non_empty_prompt(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("system_prompt cannot be empty")
-        return value.strip()
+    validate_model_on_startup: bool = False
 
 
 class OllamaConfig(StrictModel):
@@ -57,13 +69,22 @@ class OllamaConfig(StrictModel):
 class PostprocessConfig(StrictModel):
     provider: Literal["codex", "ollama", "none"] = "codex"
     min_words: int = Field(default=1, ge=1)
-    codex: CodexConfig
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    codex: CodexConfig = Field(default_factory=CodexConfig)
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+
+    @field_validator("system_prompt")
+    @classmethod
+    def non_empty_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("system_prompt cannot be empty")
+        return value.strip()
 
 
 class PipelineConfig(StrictModel):
     max_pending: int = Field(default=4, ge=1)
     shutdown_timeout_seconds: float = Field(default=3, ge=0)
+    injection_timeout_seconds: float = Field(default=2, gt=0)
 
 
 class UiConfig(StrictModel):
@@ -73,28 +94,75 @@ class UiConfig(StrictModel):
 
 
 class HotkeyConfig(StrictModel):
-    key: str = "ctrl+shift"
+    key: str = "f12"
     mode: Literal["hold", "toggle"] = "toggle"
+
+    @field_validator("key")
+    @classmethod
+    def safe_hotkey(cls, value: str) -> str:
+        names = [name.strip().casefold() for name in value.split("+") if name.strip()]
+        if not names:
+            raise ValueError("hotkey.key cannot be empty")
+        unknown = sorted(set(names) - SUPPORTED_HOTKEYS)
+        if unknown:
+            raise ValueError(f"Unknown hotkey(s): {unknown}")
+        if len(names) != len(set(names)):
+            raise ValueError("hotkey.key cannot contain duplicate keys")
+        if not set(names) & HOTKEY_NON_MODIFIERS:
+            raise ValueError(
+                "hotkey.key must contain a non-modifier function key from f1 through f20"
+            )
+        return "+".join(names)
 
 
 class AudioConfig(StrictModel):
-    sample_rate: int = Field(default=16000, gt=0)
+    sample_rate: Literal[8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000] = 16000
     channels: Literal[1] = 1
-    preroll_ms: int = Field(default=500, ge=0)
+    device: str | int | None = None
+    minimum_recording_ms: int = Field(default=150, ge=0)
+    silence_rms_threshold: float = Field(default=0.001, ge=0)
+    maximum_recording_seconds: float = Field(default=120, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_preroll(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "preroll_ms" not in value:
+            return value
+        migrated = value.copy()
+        migrated.pop("preroll_ms")
+        return migrated
+
+    @field_validator("device")
+    @classmethod
+    def non_empty_device(cls, value: str | int | None) -> str | int | None:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("audio.device cannot be empty")
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def coherent_duration_limits(self) -> AudioConfig:
+        if self.maximum_recording_seconds * 1000 < self.minimum_recording_ms:
+            raise ValueError(
+                "audio.maximum_recording_seconds must not be shorter than "
+                "audio.minimum_recording_ms"
+            )
+        return self
 
 
 class InjectConfig(StrictModel):
     method: Literal["paste", "type"] = "paste"
-    restore_clipboard: bool = True
+    clipboard_clear_after_seconds: float | None = Field(default=60, gt=0)
 
 
 class LoggingConfig(StrictModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
-    include_transcripts: bool = False
+    file: Path | None = Path("~/Library/Logs/VoiceBud/voicebud.log")
+    max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024)
+    backup_count: int = Field(default=3, ge=1)
 
 
 class AppConfig(StrictModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     stt: SttConfig
     postprocess: PostprocessConfig
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
@@ -109,6 +177,31 @@ class AppConfig(StrictModel):
     def source_path(self) -> Path:
         return self._source_path
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_schema_v1(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            return value
+        migrated = deepcopy(value)
+        postprocess = migrated.get("postprocess")
+        if isinstance(postprocess, dict):
+            codex = postprocess.get("codex")
+            if isinstance(codex, dict):
+                old_prompt = codex.pop("system_prompt", None)
+                if "system_prompt" not in postprocess and old_prompt is not None:
+                    postprocess["system_prompt"] = old_prompt
+        inject = migrated.get("inject")
+        if isinstance(inject, dict):
+            inject.pop("restore_clipboard", None)
+        logging_config = migrated.get("logging")
+        if isinstance(logging_config, dict):
+            logging_config.pop("include_transcripts", None)
+        hotkey = migrated.get("hotkey")
+        if isinstance(hotkey, dict) and hotkey.get("key") == "ctrl+shift":
+            hotkey["key"] = "f12"
+        migrated["schema_version"] = 2
+        return migrated
+
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -122,7 +215,14 @@ def resolve_config_path(
 ) -> Path:
     env = os.environ if environ is None else environ
     selected = cli_path or env.get("VOICEFLOW_CONFIG")
-    path = Path(selected).expanduser() if selected else (root or project_root()) / "config.yaml"
+    if selected:
+        path = Path(selected).expanduser()
+    elif root is not None:
+        path = root / "config.yaml"
+    else:
+        source_default = project_root() / "config.yaml"
+        packaged_default = Path(__file__).resolve().parent / "data/default-config.yaml"
+        path = source_default if source_default.is_file() else packaged_default
     return path.resolve()
 
 
@@ -150,6 +250,11 @@ def load_config(
     executable = config.postprocess.codex.executable
     if executable is not None and not executable.is_absolute():
         config.postprocess.codex.executable = (base / executable).resolve()
+    log_file = config.logging.file
+    if log_file is not None:
+        log_file = log_file.expanduser()
+        config.logging.file = (
+            log_file.resolve() if log_file.is_absolute() else (base / log_file).resolve()
+        )
     config._source_path = path
     return config
-

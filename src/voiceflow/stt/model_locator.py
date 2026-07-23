@@ -11,7 +11,6 @@ MODEL_FILES = (
     "config.json",
     "encoder-model.int8.onnx",
     "decoder_joint-model.int8.onnx",
-    "nemo128.onnx",
     "vocab.txt",
 )
 EXPECTED_MODEL_TYPE = "nemo-conformer-tdt"
@@ -73,7 +72,7 @@ class ModelLocator:
         self.handy_path = handy_path
         self.cache_root = cache_root
 
-    def resolve(self) -> ModelResolution:
+    def resolve(self, *, skip_handy: bool = False) -> ModelResolution:
         if self.config.model_path is not None:
             path = self.config.model_path.expanduser().resolve()
             validate_model(path)
@@ -85,7 +84,7 @@ class ModelLocator:
             validate_model(path)
             return ModelResolution(path, "environment")
 
-        if self.config.reuse_handy_model:
+        if self.config.reuse_handy_model and not skip_handy:
             try:
                 validate_model(self.handy_path)
             except ModelValidationError:

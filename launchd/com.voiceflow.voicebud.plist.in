@@ -18,14 +18,14 @@
   </array>
   <key>WorkingDirectory</key>
   <string>@PROJECT@</string>
+@ENVIRONMENT@
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <false/>
   <key>StandardOutPath</key>
-  <string>@LOG_DIR@/voicebud.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>@LOG_DIR@/voicebud-error.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>
-

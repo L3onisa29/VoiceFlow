@@ -49,27 +49,7 @@ class ParakeetTranscriber:
         self._state_callback(ModelState.RESOLVING, None)
         try:
             resolution = self.locator.resolve()
-            if resolution.needs_download:
-                self._state_callback(ModelState.DOWNLOADING, None)
-                if resolution.source == "repair-download" and resolution.path.exists():
-                    backup = resolution.path.with_name(
-                        f"{resolution.path.name}.corrupt-{time.time_ns()}"
-                    )
-                    resolution.path.rename(backup)
-                    self.corrupt_cache_backup = backup
-                    LOGGER.warning("Moved corrupt model cache to %s", backup)
-                resolution.path.parent.mkdir(parents=True, exist_ok=True)
-            else:
-                self._state_callback(ModelState.LOADING, None)
-            model = self._onnx().load_model(
-                "nemo-parakeet-tdt-0.6b-v3",
-                resolution.path,
-                quantization="int8",
-                providers=["CPUExecutionProvider"],
-            )
-            if resolution.needs_download:
-                validate_model(resolution.path)
-                self._state_callback(ModelState.LOADING, None)
+            model, resolution = self._load_with_recovery(resolution)
         except Exception as exc:
             self._state_callback(ModelState.ERROR, str(exc))
             raise
@@ -80,7 +60,7 @@ class ParakeetTranscriber:
             try:
                 vad = self._onnx().load_vad(
                     self.config.vad.model,
-                    providers=["CPUExecutionProvider"],
+                    providers=[self.config.provider],
                 )
                 self._vad_model = model.with_vad(vad)
             except Exception as exc:
@@ -94,6 +74,53 @@ class ParakeetTranscriber:
             self.vad_error = RuntimeError("Silero VAD download is disabled")
         self._state_callback(ModelState.READY, str(resolution.path))
         return resolution
+
+    def _load_with_recovery(self, resolution: ModelResolution) -> tuple[Any, ModelResolution]:
+        try:
+            return self._load_resolution(resolution), resolution
+        except Exception:
+            if resolution.source == "handy":
+                LOGGER.warning(
+                    "The Handy model could not be loaded; falling back to the VoiceFlow cache",
+                    exc_info=True,
+                )
+                return self._load_with_recovery(self.locator.resolve(skip_handy=True))
+            if resolution.source == "voiceflow-cache" and self.config.auto_download:
+                LOGGER.warning(
+                    "The VoiceFlow model cache could not be loaded; repairing it",
+                    exc_info=True,
+                )
+                repair = ModelResolution(
+                    resolution.path,
+                    "repair-download",
+                    needs_download=True,
+                )
+                return self._load_resolution(repair), repair
+            raise
+
+    def _load_resolution(self, resolution: ModelResolution) -> Any:
+        if resolution.needs_download:
+            self._state_callback(ModelState.DOWNLOADING, None)
+            if resolution.source == "repair-download" and resolution.path.exists():
+                backup = resolution.path.with_name(
+                    f"{resolution.path.name}.corrupt-{time.time_ns()}"
+                )
+                resolution.path.rename(backup)
+                self.corrupt_cache_backup = backup
+                LOGGER.warning("Moved corrupt model cache to %s", backup)
+            resolution.path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self._state_callback(ModelState.LOADING, None)
+        model = self._onnx().load_model(
+            self.config.model,
+            resolution.path,
+            quantization=self.config.quantization,
+            providers=[self.config.provider],
+        )
+        if resolution.needs_download:
+            validate_model(resolution.path)
+            self._state_callback(ModelState.LOADING, None)
+        return model
 
     def transcribe(self, audio: np.ndarray, *, sample_rate: int = 16000) -> str:
         if self._direct_model is None:

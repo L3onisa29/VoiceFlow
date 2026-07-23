@@ -1,2 +1,1 @@
 """VoiceBud AppKit user interface."""
-

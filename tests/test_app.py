@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import pytest
+
+from voiceflow.app import VoiceBudApplication, _single_instance_lock, run
+from voiceflow.config import AppConfig
+from voiceflow.state import ActivityState, ModelState, SystemState
+from voiceflow.system.permissions import PermissionStatus
+from voiceflow.system.text_injector import FocusTarget, InjectionDestination
+
+
+class Status:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+        self.messages: list[str] = []
+        self.state = SimpleNamespace(
+            model=ModelState.READY,
+            system=SystemState.READY,
+        )
+
+    def update(self, **changes: Any) -> None:
+        self.updates.append(changes)
+        for key, value in changes.items():
+            setattr(self.state, key, value)
+
+    def transient(self, text: str, **_kwargs: Any) -> None:
+        self.messages.append(text)
+
+
+class Helper:
+    def __init__(self) -> None:
+        self.scheduled: list[Any] = []
+        self.stopped = 0
+
+    def callAfter(self, function: Any, *args: Any) -> None:
+        self.scheduled.append((function, args))
+
+    def stopEventLoop(self) -> None:
+        self.stopped += 1
+
+
+class RecordingPipeline:
+    def __init__(self) -> None:
+        self.reservations = 0
+        self.cancelled = 0
+        self.submissions: list[tuple[np.ndarray, dict[str, Any]]] = []
+
+    def try_reserve(self) -> bool:
+        self.reservations += 1
+        return True
+
+    def cancel_reservation(self) -> None:
+        self.cancelled += 1
+
+    def submit_reserved(self, audio: np.ndarray, **kwargs: Any) -> None:
+        self.submissions.append((audio, kwargs))
+
+
+class RecordingRecorder:
+    device_name = "Test microphone"
+    sample_rate = 16000
+    last_duration = 1.0
+    last_rms = 0.5
+    last_peak = 0.8
+
+    def __init__(self) -> None:
+        self.recording = False
+
+    def start(self) -> bool:
+        self.recording = True
+        return True
+
+    def stop(self) -> np.ndarray:
+        self.recording = False
+        return np.ones(160, dtype=np.float32)
+
+
+def make_recording_app(app_config: AppConfig) -> VoiceBudApplication:
+    app = VoiceBudApplication.__new__(VoiceBudApplication)
+    app.config = app_config
+    app._lock = threading.RLock()
+    app._closing = False
+    app._recording_reserved = False
+    app.pipeline = RecordingPipeline()
+    app.recorder = RecordingRecorder()
+    app.status = Status()
+    return app
+
+
+def test_destination_is_captured_when_recording_stops(
+    app_config: AppConfig,
+) -> None:
+    destination = InjectionDestination.focused(FocusTarget(7, "selected-during-recording"))
+    capture_calls = 0
+
+    def capture_destination() -> InjectionDestination:
+        nonlocal capture_calls
+        capture_calls += 1
+        return destination
+
+    app = make_recording_app(app_config)
+    app.injector = SimpleNamespace(capture_destination=capture_destination)
+
+    assert app._recording_started()
+    assert capture_calls == 0
+    assert app._recording_stopped()
+
+    assert capture_calls == 1
+    assert len(app.pipeline.submissions) == 1
+    _audio, kwargs = app.pipeline.submissions[0]
+    assert kwargs["injection_destination"] == destination
+
+
+def test_missing_destination_at_stop_uses_clipboard_only(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.injector = SimpleNamespace(
+        capture_destination=lambda: (_ for _ in ()).throw(RuntimeError("No focused destination"))
+    )
+
+    assert app._recording_started()
+    assert app._recording_stopped()
+
+    _audio, kwargs = app.pipeline.submissions[0]
+    assert kwargs["injection_destination"].uses_clipboard_only
+
+
+def test_recording_state_is_shared_independently_from_display_context(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.injector = SimpleNamespace(capture_destination=InjectionDestination.clipboard_only)
+
+    assert not app._is_recording()
+    assert app._recording_started()
+    assert app._is_recording()
+    assert app._recording_stopped()
+    assert not app._is_recording()
+
+
+def test_stt_loading_is_independent_from_postprocess_preflight() -> None:
+    loaded: list[str] = []
+    helper = Helper()
+    app = VoiceBudApplication.__new__(VoiceBudApplication)
+    app.transcriber = SimpleNamespace(load=lambda: loaded.append("stt"))
+    app.postprocessor = SimpleNamespace(
+        preflight=lambda: pytest.fail("postprocess must not gate STT")
+    )
+    app.status = Status()
+    app._app_helper = helper
+    app._lock = threading.RLock()
+    app._loading = True
+    app._activate_input = lambda: None
+
+    app._load_services()
+
+    assert loaded == ["stt"]
+    assert helper.scheduled == [(app._activate_input, ())]
+    assert not app._loading
+
+
+def test_activation_rollback_does_not_publish_stopping(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown_calls: list[dict[str, Any]] = []
+
+    class Recorder:
+        device_name = "Default"
+        sample_rate = 16000
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Pipeline:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def shutdown(self, **kwargs: Any) -> None:
+            shutdown_calls.append(kwargs)
+
+    class Hotkey:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("listener failed")
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("voiceflow.app.Recorder", Recorder)
+    monkeypatch.setattr("voiceflow.app.DictationPipeline", Pipeline)
+    monkeypatch.setattr("voiceflow.app.PushToTalk", Hotkey)
+
+    app = VoiceBudApplication.__new__(VoiceBudApplication)
+    app.config = app_config
+    app._lock = threading.RLock()
+    app._closing = False
+    app.pipeline = None
+    app.hotkey = None
+    app.recorder = None
+    app.transcriber = object()
+    app.postprocessor = object()
+    app.injector = object()
+    app.status = Status()
+
+    app._activate_input()
+
+    assert shutdown_calls == [
+        {
+            "close_postprocessor": False,
+            "publish_stopping": False,
+        }
+    ]
+    assert app.status.updates[-1]["activity"] == ActivityState.IDLE
+    assert app.status.updates[-1]["system"] == SystemState.ERROR
+
+
+def test_finish_quit_stops_event_loop_even_if_shutdown_raises() -> None:
+    helper = Helper()
+    app = VoiceBudApplication.__new__(VoiceBudApplication)
+    app.pipeline = SimpleNamespace(
+        shutdown=lambda: (_ for _ in ()).throw(RuntimeError("shutdown failed"))
+    )
+    app.postprocessor = object()
+    app._app_helper = helper
+
+    app._finish_quit()
+
+    assert helper.scheduled == [(helper.stopEventLoop, ())]
+
+
+def test_single_instance_lock_rejects_second_owner(tmp_path: Path) -> None:
+    lock_path = tmp_path / "voicebud.lock"
+    with (
+        _single_instance_lock(lock_path),
+        pytest.raises(RuntimeError, match="already running"),
+        _single_instance_lock(lock_path),
+    ):
+        pass
+
+
+def test_input_health_monitor_reports_revoked_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("voiceflow.app.INPUT_HEALTH_CHECK_SECONDS", 0.001)
+    helper = Helper()
+    status = Status()
+    recorder = SimpleNamespace(active=True)
+    hotkey = SimpleNamespace(alive=True)
+    app = VoiceBudApplication.__new__(VoiceBudApplication)
+    app._lock = threading.RLock()
+    app._closing = False
+    app._app_helper = helper
+    app.status = status
+    app.recorder = recorder
+    app.hotkey = hotkey
+    app._check_permissions = lambda *, request: PermissionStatus(False, True, True)
+
+    app._monitor_input_health(recorder, hotkey, threading.Event())
+
+    assert len(helper.scheduled) == 1
+    callback, args = helper.scheduled[0]
+    callback(*args)
+    assert status.state.system == SystemState.ERROR
+    assert "Input Monitoring" in status.messages[-1]
+
+
+def test_invalid_configuration_is_logged_without_starting_appkit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_configured: list[bool] = []
+    monkeypatch.setattr(
+        "voiceflow.app.load_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad config")),
+    )
+    monkeypatch.setattr(
+        "voiceflow.app._configure_fallback_logging",
+        lambda: fallback_configured.append(True),
+    )
+
+    assert run("invalid.yaml") == 2
+    assert fallback_configured == [True]

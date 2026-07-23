@@ -15,6 +15,7 @@ dependencies = [
   "onnxruntime!=1.24.1,<2",
   "pydantic>=2.10,<3",
   "pynput>=1.7.7,<2",
+  "pyobjc-framework-AVFoundation>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-ApplicationServices>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",
@@ -38,6 +39,7 @@ packages = ["src/voiceflow"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "schemas/codex-postprocess.schema.json" = "voiceflow/data/codex-postprocess.schema.json"
+"config.yaml" = "voiceflow/data/default-config.yaml"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

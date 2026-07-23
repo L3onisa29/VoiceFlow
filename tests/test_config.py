@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from voiceflow.config import load_config, resolve_config_path
+from voiceflow.config import AppConfig, load_config, resolve_config_path
 
 
 def write_config(source: Path, destination: Path, **changes: object) -> None:
@@ -68,4 +68,93 @@ def test_reasoning_is_limited_to_low_or_medium(tmp_path: Path) -> None:
     destination = tmp_path / "invalid.yaml"
     destination.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ValueError, match="reasoning_effort"):
+        load_config(destination)
+
+
+def test_default_input_and_clipboard_policy() -> None:
+    config = load_config(root=Path(__file__).resolve().parents[1], environ={})
+    assert config.schema_version == 2
+    assert config.audio.device == "MacBook Pro Microphone"
+    assert not hasattr(config.audio, "preroll_ms")
+    assert config.hotkey.key == "f12"
+    assert not hasattr(config.inject, "restore_clipboard")
+
+
+def test_legacy_preroll_is_ignored_to_keep_the_microphone_closed() -> None:
+    config = AppConfig.model_validate(
+        {
+            "schema_version": 2,
+            "stt": {},
+            "postprocess": {"provider": "none"},
+            "audio": {"preroll_ms": 500},
+        }
+    )
+    assert not hasattr(config.audio, "preroll_ms")
+
+
+def test_function_key_chords_are_configurable() -> None:
+    config = AppConfig.model_validate(
+        {
+            "schema_version": 2,
+            "stt": {},
+            "postprocess": {"provider": "none"},
+            "hotkey": {"key": "ctrl+shift+f12"},
+        }
+    )
+    assert config.hotkey.key == "ctrl+shift+f12"
+
+
+def test_schema_v1_is_migrated_without_preserving_unsafe_defaults(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1] / "config.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw["schema_version"] = 1
+    raw["postprocess"]["codex"]["system_prompt"] = raw["postprocess"].pop("system_prompt")
+    raw["inject"]["restore_clipboard"] = True
+    raw["logging"]["include_transcripts"] = False
+    raw["hotkey"]["key"] = "ctrl+shift"
+    destination = tmp_path / "legacy.yaml"
+    destination.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    config = load_config(destination)
+
+    assert config.schema_version == 2
+    assert config.hotkey.key == "f12"
+    assert config.postprocess.system_prompt.startswith("Clean the supplied")
+
+
+def test_none_provider_accepts_only_relevant_configuration() -> None:
+    config = AppConfig.model_validate(
+        {
+            "schema_version": 2,
+            "stt": {},
+            "postprocess": {"provider": "none"},
+        }
+    )
+    assert config.postprocess.provider == "none"
+
+
+@pytest.mark.parametrize(
+    ("section", "changes", "match"),
+    [
+        ("hotkey", {"key": "ctrl+shift"}, "non-modifier"),
+        ("audio", {"sample_rate": 96000}, "sample_rate"),
+        (
+            "audio",
+            {"minimum_recording_ms": 1000, "maximum_recording_seconds": 0.5},
+            "maximum_recording_seconds",
+        ),
+    ],
+)
+def test_unsafe_runtime_configuration_is_rejected(
+    tmp_path: Path,
+    section: str,
+    changes: dict[str, object],
+    match: str,
+) -> None:
+    source = Path(__file__).resolve().parents[1] / "config.yaml"
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    raw[section].update(changes)
+    destination = tmp_path / "invalid-runtime.yaml"
+    destination.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
         load_config(destination)

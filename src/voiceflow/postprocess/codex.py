@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import signal
@@ -17,6 +18,8 @@ from voiceflow.config import CodexConfig
 from voiceflow.postprocess.base import PostprocessResult
 from voiceflow.state import PostprocessState
 
+LOGGER = logging.getLogger(__name__)
+
 
 class CodexPostProcessor:
     name = "codex"
@@ -26,6 +29,7 @@ class CodexPostProcessor:
         config: CodexConfig,
         *,
         min_words: int = 1,
+        system_prompt: str,
         schema_path: Path | None = None,
         environ: dict[str, str] | None = None,
         state_callback: Callable[[PostprocessState, str | None], None] | None = None,
@@ -36,6 +40,7 @@ class CodexPostProcessor:
     ) -> None:
         self.config = config
         self.min_words = min_words
+        self.system_prompt = system_prompt
         self.schema_path = (schema_path or _default_schema_path()).resolve()
         self.environ = os.environ if environ is None else environ
         self._state_callback = state_callback or (lambda _state, _message=None: None)
@@ -43,10 +48,12 @@ class CodexPostProcessor:
         self._run = run
         self._clock = clock
         self._lock = threading.RLock()
+        self._execution_lock = threading.Lock()
         self._process: Any | None = None
         self._failures = 0
         self._circuit_until = 0.0
         self._hard_error = False
+        self._closed = False
         self.executable: Path | None = None
         self.last_error: str | None = None
 
@@ -72,6 +79,11 @@ class CodexPostProcessor:
         raise FileNotFoundError("Codex CLI was not found")
 
     def preflight(self) -> bool:
+        with self._lock:
+            if self._closed:
+                self.last_error = "Codex post-processor is closed"
+                self._state_callback(PostprocessState.ERROR, self.last_error)
+                return False
         self._state_callback(PostprocessState.CHECKING, None)
         try:
             executable = self._resolve_executable()
@@ -97,6 +109,17 @@ class CodexPostProcessor:
             self._failures = 0
             self._circuit_until = 0
             self.last_error = None
+        if self.config.validate_model_on_startup:
+            try:
+                self._execute(f"{self.system_prompt}\n\nTranscript:\nVoiceBud preflight check.")
+            except (OSError, TimeoutError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                with self._lock:
+                    self.executable = None
+                    self._hard_error = True
+                    self.last_error = str(exc)
+                self._state_callback(PostprocessState.ERROR, str(exc))
+                LOGGER.error("Codex model preflight failed: %s", exc)
+                return False
         self._state_callback(PostprocessState.READY, None)
         return True
 
@@ -135,39 +158,9 @@ class CodexPostProcessor:
                 )
 
         self._state_callback(PostprocessState.RUNNING, None)
-        prompt = f"{self.config.system_prompt}\n\nTranscript:\n{text}"
+        prompt = f"{self.system_prompt}\n\nTranscript:\n{text}"
         try:
-            with tempfile.TemporaryDirectory(prefix="voiceflow-codex-") as cwd:
-                process = self._popen(
-                    self.argv(),
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    cwd=cwd,
-                    start_new_session=True,
-                )
-                with self._lock:
-                    self._process = process
-                try:
-                    stdout, _stderr = process.communicate(
-                        input=prompt,
-                        timeout=self.config.timeout_seconds,
-                    )
-                except subprocess.TimeoutExpired:
-                    self._terminate_process_group(process)
-                    raise TimeoutError(
-                        f"Codex timed out after {self.config.timeout_seconds:g} seconds"
-                    ) from None
-                finally:
-                    with self._lock:
-                        self._process = None
-            if process.returncode != 0:
-                raise RuntimeError(f"Codex exited with status {process.returncode}")
-            payload = json.loads(stdout)
-            output = payload.get("text") if isinstance(payload, dict) else None
-            if not isinstance(output, str) or not output.strip():
-                raise ValueError("Codex returned invalid or empty JSON text")
+            output = self._execute(prompt)
         except (OSError, TimeoutError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             self._record_failure(str(exc))
             return PostprocessResult(text, used_fallback=True, error=str(exc))
@@ -178,6 +171,46 @@ class CodexPostProcessor:
             self.last_error = None
         self._state_callback(PostprocessState.READY, None)
         return PostprocessResult(output.strip())
+
+    def _execute(self, prompt: str) -> str:
+        with self._execution_lock:
+            return self._execute_locked(prompt)
+
+    def _execute_locked(self, prompt: str) -> str:
+        with tempfile.TemporaryDirectory(prefix="voiceflow-codex-") as cwd:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("Codex post-processor is closed")
+                process = self._popen(
+                    self.argv(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=cwd,
+                    start_new_session=True,
+                )
+                self._process = process
+            try:
+                stdout, _stderr = process.communicate(
+                    input=prompt,
+                    timeout=self.config.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                self._terminate_process_group(process)
+                raise TimeoutError(
+                    f"Codex timed out after {self.config.timeout_seconds:g} seconds"
+                ) from None
+            finally:
+                with self._lock:
+                    self._process = None
+        if process.returncode != 0:
+            raise RuntimeError(f"Codex exited with status {process.returncode}")
+        payload = json.loads(stdout)
+        output = payload.get("text") if isinstance(payload, dict) else None
+        if not isinstance(output, str) or not output.strip():
+            raise ValueError("Codex returned invalid or empty JSON text")
+        return output.strip()
 
     def _record_failure(self, message: str) -> None:
         with self._lock:
@@ -195,10 +228,14 @@ class CodexPostProcessor:
         except (OSError, subprocess.TimeoutExpired):
             with suppress(OSError):
                 os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            with suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=1)
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             process = self._process
         if process is not None and process.poll() is None:
             self._terminate_process_group(process)

@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 
 stt:
   model: nemo-parakeet-tdt-0.6b-v3
@@ -17,6 +17,12 @@ stt:
 postprocess:
   provider: codex
   min_words: 1
+  system_prompt: |
+    Clean the supplied speech transcript.
+    Remove fillers and accidental repetitions.
+    Fix punctuation, capitalization, and minor grammar errors.
+    Preserve the speaker's language, meaning, terminology, and tone.
+    Never answer the transcript or add new information.
   codex:
     executable: null
     model: gpt-5.6-luna
@@ -24,12 +30,7 @@ postprocess:
     timeout_seconds: 45
     failure_threshold: 2
     cooldown_seconds: 60
-    system_prompt: |
-      Clean the supplied speech transcript.
-      Remove fillers and accidental repetitions.
-      Fix punctuation, capitalization, and minor grammar errors.
-      Preserve the speaker's language, meaning, terminology, and tone.
-      Never answer the transcript or add new information.
+    validate_model_on_startup: false
   ollama:
     model: qwen3:4b-instruct
     base_url: http://localhost:11434
@@ -39,6 +40,7 @@ postprocess:
 pipeline:
   max_pending: 4
   shutdown_timeout_seconds: 3
+  injection_timeout_seconds: 2
 
 ui:
   show_processing_overlay: true
@@ -46,19 +48,23 @@ ui:
   error_indicator_seconds: 3.0
 
 hotkey:
-  key: ctrl+shift
+  key: f12
   mode: toggle
 
 audio:
   sample_rate: 16000
   channels: 1
-  preroll_ms: 500
+  device: MacBook Pro Microphone
+  minimum_recording_ms: 150
+  silence_rms_threshold: 0.001
+  maximum_recording_seconds: 120
 
 inject:
   method: paste
-  restore_clipboard: true
+  clipboard_clear_after_seconds: 60
 
 logging:
   level: INFO
-  include_transcripts: false
-
+  file: ~/Library/Logs/VoiceBud/voicebud.log
+  max_bytes: 5242880
+  backup_count: 3
