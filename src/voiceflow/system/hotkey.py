@@ -7,6 +7,26 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
+HOTKEY_LABELS = {
+    "alt": "Alt/Option",
+    "alt_r": "Right Alt/Option",
+    "ctrl": "Control",
+    "ctrl_r": "Right Control",
+    "cmd": "Command",
+    "cmd_r": "Right Command",
+    "shift": "Shift",
+    "space": "Space",
+}
+
+
+def hotkey_label(key_name: str) -> str:
+    names = (name.strip().casefold() for name in key_name.split("+"))
+    return " + ".join(
+        HOTKEY_LABELS.get(name, name.upper() if name.startswith("f") else name.title())
+        for name in names
+        if name
+    )
+
 
 class PushToTalk:
     def __init__(
@@ -32,6 +52,7 @@ class PushToTalk:
             "cmd": keyboard_module.Key.cmd,
             "cmd_r": keyboard_module.Key.cmd_r,
             "shift": keyboard_module.Key.shift,
+            "space": keyboard_module.Key.space,
         }
         key_map.update(
             {
@@ -44,8 +65,8 @@ class PushToTalk:
         unknown = [name for name in names if name not in key_map]
         if unknown:
             raise ValueError(f"Unknown hotkey(s) {unknown}. Choose from: {list(key_map)}")
-        if not any(name.startswith("f") for name in names):
-            raise ValueError("Hotkey must contain a non-modifier function key from f1 through f20")
+        if not any(name == "space" or name.startswith("f") for name in names):
+            raise ValueError("Hotkey must contain a supported non-modifier key")
         if mode not in {"hold", "toggle"}:
             raise ValueError("Hotkey mode must be 'hold' or 'toggle'")
         self.chord = {key_map[name] for name in names}

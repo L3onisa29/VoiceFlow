@@ -15,7 +15,7 @@ from voiceflow.pipeline import DictationPipeline
 from voiceflow.postprocess import create_postprocessor
 from voiceflow.state import ActivityState, ModelState, PostprocessState, SystemState
 from voiceflow.stt.parakeet import ParakeetTranscriber
-from voiceflow.system.hotkey import PushToTalk
+from voiceflow.system.hotkey import PushToTalk, hotkey_label
 from voiceflow.system.permissions import check_permissions
 from voiceflow.system.text_injector import InjectionDestination, TextInjector
 from voiceflow.ui.menu_bar import MenuBar
@@ -301,7 +301,7 @@ class VoiceBudApplication:
         LOGGER.info("Audio input ready: %s at %d Hz", recorder.device_name, recorder.sample_rate)
         LOGGER.info(
             "Hotkey ready: %s (%s mode)",
-            self.config.hotkey.key,
+            hotkey_label(self.config.hotkey.key),
             self.config.hotkey.mode,
         )
 

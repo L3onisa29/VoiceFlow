@@ -48,7 +48,7 @@ ui:
   error_indicator_seconds: 3.0
 
 hotkey:
-  key: f12
+  key: alt+space
   mode: toggle
 
 audio:

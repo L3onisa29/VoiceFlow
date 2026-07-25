@@ -10,7 +10,7 @@ import pytest
 from voiceflow.audio.quality import capture_rejection_reason
 from voiceflow.audio.recorder import Recorder, resolve_input_device
 from voiceflow.config import AppConfig
-from voiceflow.system.hotkey import PushToTalk
+from voiceflow.system.hotkey import PushToTalk, hotkey_label
 from voiceflow.system.permissions import check_permissions, microphone_is_authorized
 from voiceflow.system.text_injector import (
     FocusChangedError,
@@ -234,6 +234,7 @@ def keyboard_module() -> Any:
         cmd="cmd",
         cmd_r="cmd_r",
         shift="shift",
+        space="space",
         f12="f12",
         f13="f13",
     )
@@ -344,6 +345,20 @@ def test_function_key_with_modifiers_is_supported() -> None:
         keyboard_module=keyboard_module(),
     )
     assert hotkey.chord == {"ctrl", "shift", "f12"}
+
+
+def test_option_space_is_supported() -> None:
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: True,
+        lambda: True,
+        keyboard_module=keyboard_module(),
+    )
+    assert hotkey.chord == {"alt", "space"}
+
+
+def test_hotkey_label_uses_mac_friendly_names() -> None:
+    assert hotkey_label("alt+space") == "Alt/Option + Space"
 
 
 class Pasteboard:

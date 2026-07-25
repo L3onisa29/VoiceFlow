@@ -76,7 +76,7 @@ def test_default_input_and_clipboard_policy() -> None:
     assert config.schema_version == 2
     assert config.audio.device == "MacBook Pro Microphone"
     assert not hasattr(config.audio, "preroll_ms")
-    assert config.hotkey.key == "f12"
+    assert config.hotkey.key == "alt+space"
     assert not hasattr(config.inject, "restore_clipboard")
 
 
@@ -104,6 +104,18 @@ def test_function_key_chords_are_configurable() -> None:
     assert config.hotkey.key == "ctrl+shift+f12"
 
 
+def test_option_space_is_configurable() -> None:
+    config = AppConfig.model_validate(
+        {
+            "schema_version": 2,
+            "stt": {},
+            "postprocess": {"provider": "none"},
+            "hotkey": {"key": "alt+space"},
+        }
+    )
+    assert config.hotkey.key == "alt+space"
+
+
 def test_schema_v1_is_migrated_without_preserving_unsafe_defaults(tmp_path: Path) -> None:
     source = Path(__file__).resolve().parents[1] / "config.yaml"
     raw = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -118,7 +130,7 @@ def test_schema_v1_is_migrated_without_preserving_unsafe_defaults(tmp_path: Path
     config = load_config(destination)
 
     assert config.schema_version == 2
-    assert config.hotkey.key == "f12"
+    assert config.hotkey.key == "alt+space"
     assert config.postprocess.system_prompt.startswith("Clean the supplied")
 
 

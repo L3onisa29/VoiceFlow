@@ -23,7 +23,9 @@ Fix punctuation, capitalization, and minor grammar errors.
 Preserve the speaker's language, meaning, terminology, and tone.
 Never answer the transcript or add new information."""
 HOTKEY_MODIFIERS = frozenset({"alt", "alt_r", "ctrl", "ctrl_r", "cmd", "cmd_r", "shift"})
-HOTKEY_NON_MODIFIERS = frozenset(f"f{number}" for number in range(1, 21))
+HOTKEY_NON_MODIFIERS = frozenset(
+    {"space", *(f"f{number}" for number in range(1, 21))}
+)
 SUPPORTED_HOTKEYS = HOTKEY_MODIFIERS | HOTKEY_NON_MODIFIERS
 
 
@@ -94,7 +96,7 @@ class UiConfig(StrictModel):
 
 
 class HotkeyConfig(StrictModel):
-    key: str = "f12"
+    key: str = "alt+space"
     mode: Literal["hold", "toggle"] = "toggle"
 
     @field_validator("key")
@@ -109,9 +111,7 @@ class HotkeyConfig(StrictModel):
         if len(names) != len(set(names)):
             raise ValueError("hotkey.key cannot contain duplicate keys")
         if not set(names) & HOTKEY_NON_MODIFIERS:
-            raise ValueError(
-                "hotkey.key must contain a non-modifier function key from f1 through f20"
-            )
+            raise ValueError("hotkey.key must contain a supported non-modifier key")
         return "+".join(names)
 
 
@@ -198,7 +198,7 @@ class AppConfig(StrictModel):
             logging_config.pop("include_transcripts", None)
         hotkey = migrated.get("hotkey")
         if isinstance(hotkey, dict) and hotkey.get("key") == "ctrl+shift":
-            hotkey["key"] = "f12"
+            hotkey["key"] = "alt+space"
         migrated["schema_version"] = 2
         return migrated
 
