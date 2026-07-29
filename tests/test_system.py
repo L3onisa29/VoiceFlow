@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
@@ -308,6 +309,35 @@ def keyboard_module() -> Any:
     return SimpleNamespace(Key=keys, Listener=lambda **kwargs: FakeListener(**kwargs))
 
 
+def macos_keyboard_module() -> Any:
+    class Key:
+        def __init__(self, virtual_keycode: int) -> None:
+            self.value = SimpleNamespace(vk=virtual_keycode)
+
+    keys = SimpleNamespace(
+        alt=Key(58),
+        alt_r=Key(61),
+        ctrl=Key(59),
+        ctrl_r=Key(62),
+        cmd=Key(55),
+        cmd_r=Key(54),
+        shift=Key(56),
+        space=Key(49),
+        f12=Key(111),
+        f13=Key(105),
+    )
+    return SimpleNamespace(Key=keys, Listener=lambda **kwargs: FakeListener(**kwargs))
+
+
+def quartz_module() -> Any:
+    return SimpleNamespace(
+        kCGEventKeyDown=10,
+        kCGEventKeyUp=11,
+        kCGKeyboardEventKeycode=9,
+        CGEventGetIntegerValueField=lambda event, _field: event.virtual_keycode,
+    )
+
+
 def test_toggle_hotkey_fires_once_per_physical_chord() -> None:
     events: list[str] = []
 
@@ -422,6 +452,148 @@ def test_option_space_is_supported() -> None:
         keyboard_module=keyboard_module(),
     )
     assert hotkey.chord == {"alt", "space"}
+
+
+def test_option_space_toggle_is_consumed_without_reaching_the_frontmost_app() -> None:
+    keyboard = macos_keyboard_module()
+    quartz = quartz_module()
+    events: list[str] = []
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: events.append("start") or True,
+        lambda: events.append("stop") or True,
+        mode="toggle",
+        keyboard_module=keyboard,
+        quartz_module=quartz,
+        callback_dispatcher=lambda action: action(),
+    )
+    listener = hotkey._listener
+    intercept = listener.callbacks["darwin_intercept"]
+    space_event = SimpleNamespace(virtual_keycode=49)
+    letter_event = SimpleNamespace(virtual_keycode=0)
+
+    # First complete press starts recording and consumes Space down/up.
+    listener.callbacks["on_press"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyDown, space_event) is None
+    listener.callbacks["on_release"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyUp, space_event) is None
+    listener.callbacks["on_release"](keyboard.Key.alt)
+
+    # Recording remains active until the second complete press, which is also consumed.
+    listener.callbacks["on_press"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyDown, space_event) is None
+    listener.callbacks["on_release"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyUp, space_event) is None
+    listener.callbacks["on_release"](keyboard.Key.alt)
+
+    assert events == ["start", "stop"]
+    assert intercept(quartz.kCGEventKeyDown, letter_event) is letter_event
+
+
+def test_consumed_space_key_up_stays_consumed_if_option_is_released_first() -> None:
+    keyboard = macos_keyboard_module()
+    quartz = quartz_module()
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: True,
+        lambda: True,
+        mode="toggle",
+        keyboard_module=keyboard,
+        quartz_module=quartz,
+        callback_dispatcher=lambda action: action(),
+    )
+    listener = hotkey._listener
+    intercept = listener.callbacks["darwin_intercept"]
+    space_event = SimpleNamespace(virtual_keycode=49)
+
+    listener.callbacks["on_press"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyDown, space_event) is None
+    listener.callbacks["on_release"](keyboard.Key.alt)
+    listener.callbacks["on_release"](keyboard.Key.space)
+
+    assert intercept(quartz.kCGEventKeyUp, space_event) is None
+
+
+def test_space_without_option_is_not_consumed() -> None:
+    keyboard = macos_keyboard_module()
+    quartz = quartz_module()
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: True,
+        lambda: True,
+        mode="toggle",
+        keyboard_module=keyboard,
+        quartz_module=quartz,
+        callback_dispatcher=lambda action: action(),
+    )
+    listener = hotkey._listener
+    intercept = listener.callbacks["darwin_intercept"]
+    space_event = SimpleNamespace(virtual_keycode=49)
+
+    listener.callbacks["on_press"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyDown, space_event) is space_event
+    listener.callbacks["on_release"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyUp, space_event) is space_event
+
+
+def test_macos_hotkey_dispatches_application_work_after_consuming_the_key() -> None:
+    keyboard = macos_keyboard_module()
+    quartz = quartz_module()
+    pending: list[Callable[[], None]] = []
+    events: list[str] = []
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: events.append("start") or True,
+        lambda: events.append("stop") or True,
+        mode="toggle",
+        keyboard_module=keyboard,
+        quartz_module=quartz,
+        callback_dispatcher=pending.append,
+    )
+    listener = hotkey._listener
+    intercept = listener.callbacks["darwin_intercept"]
+    space_event = SimpleNamespace(virtual_keycode=49)
+
+    listener.callbacks["on_press"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.space)
+
+    assert events == []
+    assert len(pending) == 1
+    assert intercept(quartz.kCGEventKeyDown, space_event) is None
+
+    pending.pop()()
+
+    assert events == ["start"]
+
+
+def test_macos_hold_release_waits_for_a_pending_start() -> None:
+    keyboard = macos_keyboard_module()
+    quartz = quartz_module()
+    pending: list[Callable[[], None]] = []
+    events: list[str] = []
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: events.append("start") or True,
+        lambda: events.append("stop") or True,
+        mode="hold",
+        keyboard_module=keyboard,
+        quartz_module=quartz,
+        callback_dispatcher=pending.append,
+    )
+    listener = hotkey._listener
+
+    listener.callbacks["on_press"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    listener.callbacks["on_release"](keyboard.Key.space)
+
+    assert len(pending) == 2
+    pending.pop(0)()
+    pending.pop(0)()
+
+    assert events == ["start", "stop"]
 
 
 def test_hotkey_label_uses_mac_friendly_names() -> None:

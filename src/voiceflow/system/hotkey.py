@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -37,9 +38,12 @@ class PushToTalk:
         mode: str = "hold",
         *,
         keyboard_module: Any | None = None,
+        quartz_module: Any | None = None,
         is_recording: Callable[[], bool] | None = None,
+        callback_dispatcher: Callable[[Callable[[], None]], None] | None = None,
         listener_stop_timeout_seconds: float = 1,
     ) -> None:
+        use_native_keyboard = keyboard_module is None
         if keyboard_module is None:
             from pynput import keyboard as keyboard_module
 
@@ -74,6 +78,7 @@ class PushToTalk:
         self.on_press_cb = on_press
         self.on_release_cb = on_release
         self.is_recording_cb = is_recording
+        self.callback_dispatcher = callback_dispatcher
         self.listener_stop_timeout_seconds = listener_stop_timeout_seconds
         self._down: set[Any] = set()
         self._chord_held = False
@@ -81,9 +86,37 @@ class PushToTalk:
         self._enabled = True
         self._started = False
         self._lock = threading.RLock()
-        self._listener = keyboard_module.Listener(on_press=self._press, on_release=self._release)
+        self._action_lock = threading.Lock()
+        self._quartz: Any | None = None
+        self._trigger_virtual_keycodes = {
+            virtual_keycode
+            for name in names
+            if name == "space" or name.startswith("f")
+            if (
+                virtual_keycode := getattr(
+                    getattr(key_map[name], "value", None),
+                    "vk",
+                    None,
+                )
+            )
+            is not None
+        }
+        self._suppressed_virtual_keycodes: set[int] = set()
+
+        listener_options: dict[str, Any] = {
+            "on_press": self._press,
+            "on_release": self._release,
+        }
+        if quartz_module is not None or (use_native_keyboard and sys.platform == "darwin"):
+            if quartz_module is None:
+                import Quartz as quartz_module
+
+            self._quartz = quartz_module
+            listener_options["darwin_intercept"] = self._intercept_darwin
+        self._listener = keyboard_module.Listener(**listener_options)
 
     def _press(self, key: Any) -> None:
+        action: Callable[[], None] | None = None
         with self._lock:
             if not self._enabled or key not in self.chord:
                 return
@@ -91,6 +124,41 @@ class PushToTalk:
             if self._chord_held or self._down != self.chord:
                 return
             self._chord_held = True
+            action = self._apply_press
+        self._dispatch_action(action)
+
+    def _release(self, key: Any) -> None:
+        action: Callable[[], None] | None = None
+        with self._lock:
+            if key not in self.chord:
+                return
+            self._down.discard(key)
+            if self._chord_held and self._down != self.chord:
+                self._chord_held = False
+                if self.mode == "hold":
+                    action = self._apply_hold_release
+        if action is not None:
+            self._dispatch_action(action)
+
+    def _dispatch_action(self, action: Callable[[], None]) -> None:
+        """Keep application work outside the latency-sensitive macOS event tap."""
+        if self._quartz is None:
+            action()
+            return
+        if self.callback_dispatcher is not None:
+            self.callback_dispatcher(action)
+            return
+        threading.Thread(
+            target=action,
+            name="voiceflow-hotkey-action",
+            daemon=True,
+        ).start()
+
+    def _apply_press(self) -> None:
+        with self._action_lock:
+            with self._lock:
+                if not self._enabled:
+                    return
             try:
                 recording = (
                     self.is_recording_cb()
@@ -98,26 +166,61 @@ class PushToTalk:
                     else self._recording
                 )
                 if self.mode == "toggle" and recording:
-                    if self.on_release_cb():
-                        self._recording = False
-                elif self.on_press_cb():
-                    self._recording = True
+                    succeeded = self.on_release_cb()
+                    next_recording = False
+                else:
+                    succeeded = self.on_press_cb()
+                    next_recording = True
             except Exception:
                 LOGGER.exception("Hotkey press callback failed")
-
-    def _release(self, key: Any) -> None:
-        with self._lock:
-            if key not in self.chord:
                 return
-            self._down.discard(key)
-            if self._chord_held and self._down != self.chord:
-                self._chord_held = False
-                if self.mode == "hold" and self._recording:
-                    try:
-                        if self.on_release_cb():
-                            self._recording = False
-                    except Exception:
-                        LOGGER.exception("Hotkey release callback failed")
+            if succeeded:
+                with self._lock:
+                    self._recording = next_recording
+
+    def _apply_hold_release(self) -> None:
+        with self._action_lock:
+            with self._lock:
+                if not self._enabled or not self._recording:
+                    return
+            try:
+                succeeded = self.on_release_cb()
+            except Exception:
+                LOGGER.exception("Hotkey release callback failed")
+                return
+            if succeeded:
+                with self._lock:
+                    self._recording = False
+
+    def _intercept_darwin(self, event_type: Any, event: Any) -> Any | None:
+        """Consume the configured trigger key when it completes the hotkey chord."""
+        quartz = self._quartz
+        if quartz is None or event_type not in {
+            quartz.kCGEventKeyDown,
+            quartz.kCGEventKeyUp,
+        }:
+            return event
+
+        virtual_keycode = int(
+            quartz.CGEventGetIntegerValueField(
+                event,
+                quartz.kCGKeyboardEventKeycode,
+            )
+        )
+        if virtual_keycode not in self._trigger_virtual_keycodes:
+            return event
+
+        with self._lock:
+            if event_type == quartz.kCGEventKeyDown and self._chord_held:
+                self._suppressed_virtual_keycodes.add(virtual_keycode)
+                return None
+            if (
+                event_type == quartz.kCGEventKeyUp
+                and virtual_keycode in self._suppressed_virtual_keycodes
+            ):
+                self._suppressed_virtual_keycodes.discard(virtual_keycode)
+                return None
+        return event
 
     def start(self) -> None:
         self._listener.start()
@@ -147,6 +250,7 @@ class PushToTalk:
             self._started = False
             self._recording = False
             self._down.clear()
+            self._suppressed_virtual_keycodes.clear()
         self._listener.stop()
         join = getattr(self._listener, "join", None)
         if join is not None and threading.current_thread() is not self._listener:
