@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -7,7 +8,14 @@ from typing import Any
 import requests
 
 from voiceflow.config import OllamaConfig
-from voiceflow.postprocess.base import PostprocessResult
+from voiceflow.postprocess.base import (
+    PostprocessRequest,
+    PostprocessResult,
+    coerce_request,
+    provider_output_schema,
+    provider_prompt,
+    validate_provider_payload,
+)
 from voiceflow.state import PostprocessState
 
 
@@ -77,7 +85,9 @@ class OllamaPostProcessor:
         self._state_callback(PostprocessState.READY, None)
         return True
 
-    def process(self, text: str) -> PostprocessResult:
+    def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+        request = coerce_request(request)
+        text = request.text
         if not text or len(text.split()) < self.min_words:
             return PostprocessResult(text)
         with self._lock:
@@ -85,6 +95,7 @@ class OllamaPostProcessor:
                 return PostprocessResult(
                     text,
                     used_fallback=True,
+                    fallback_code="provider_unavailable",
                     error=self.last_error or "Ollama is unavailable",
                 )
         try:
@@ -95,6 +106,7 @@ class OllamaPostProcessor:
                         return PostprocessResult(
                             text,
                             used_fallback=True,
+                            fallback_code="provider_unavailable",
                             error=self.last_error or "Ollama is unavailable",
                         )
                 response = self.session.post(
@@ -102,8 +114,9 @@ class OllamaPostProcessor:
                     json={
                         "model": self.config.model,
                         "system": self.system_prompt,
-                        "prompt": text,
+                        "prompt": provider_prompt("", request),
                         "stream": False,
+                        "format": provider_output_schema(),
                         "options": {"temperature": self.config.temperature},
                     },
                     timeout=self.config.timeout_seconds,
@@ -113,25 +126,31 @@ class OllamaPostProcessor:
                 if not isinstance(payload, Mapping):
                     raise ValueError("Ollama returned an invalid response")
                 output = payload.get("response")
-                if not isinstance(output, str) or not output.strip():
-                    raise ValueError("Ollama returned empty text")
+                structured = json.loads(output) if isinstance(output, str) else output
+                cleaned, operations = validate_provider_payload(structured, request)
             with self._lock:
                 if self._closed:
                     return PostprocessResult(
                         text,
                         used_fallback=True,
+                        fallback_code="provider_closed",
                         error="Ollama post-processor is closed",
                     )
                 self._available = True
                 self.last_error = None
             self._state_callback(PostprocessState.READY, None)
-            return PostprocessResult(output.strip())
-        except (requests.RequestException, ValueError, TypeError) as exc:
+            return PostprocessResult(cleaned, operations=operations)
+        except (json.JSONDecodeError, requests.RequestException, ValueError, TypeError) as exc:
             with self._lock:
                 self._available = False
                 self.last_error = str(exc)
             self._state_callback(PostprocessState.DEGRADED, str(exc))
-            return PostprocessResult(text, used_fallback=True, error=str(exc))
+            return PostprocessResult(
+                text,
+                used_fallback=True,
+                fallback_code="invalid_or_failed_provider_output",
+                error=str(exc),
+            )
 
     def retry(self) -> bool:
         return self.preflight()

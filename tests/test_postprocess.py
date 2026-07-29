@@ -17,7 +17,11 @@ from voiceflow.postprocess.ollama import OllamaPostProcessor
 
 
 class FakeProcess:
-    def __init__(self, stdout: str = '{"text":"clean"}', returncode: int = 0) -> None:
+    def __init__(
+        self,
+        stdout: str = '{"text":"clean transcript","operations":[]}',
+        returncode: int = 0,
+    ) -> None:
         self.stdout = stdout
         self.returncode = returncode
         self.pid = 999999
@@ -55,8 +59,11 @@ def processor(
         json.dumps(
             {
                 "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "operations": {"type": "array"},
+                },
+                "required": ["text", "operations"],
             }
         ),
         encoding="utf-8",
@@ -101,14 +108,15 @@ def test_argv_stdin_schema_and_ephemeral_read_only(app_config: AppConfig, tmp_pa
 
     codex = processor(app_config, tmp_path, process_factory=popen)
     result = codex.process("raw transcript")
-    assert result.text == "clean"
+    assert result.text == "clean transcript"
     argv, kwargs, child = created[0]
     assert argv[1:4] == ["exec", "--ephemeral", "--ignore-user-config"]
     assert argv[argv.index("--sandbox") :][:2] == ["--sandbox", "read-only"]
     assert argv[argv.index("--model") + 1] == "gpt-5.6-luna"
     assert 'model_reasoning_effort="low"' in argv
     assert argv[-1] == "-"
-    assert child.input is not None and child.input.endswith("Transcript:\nraw transcript")
+    assert child.input is not None and "<voicebud_data>" in child.input
+    assert "raw transcript" in child.input
     assert "raw transcript" not in argv
     assert kwargs["start_new_session"] is True
     assert Path(kwargs["cwd"]).name.startswith("voiceflow-codex-")
@@ -184,7 +192,7 @@ class FakeResponse:
 class FakeSession:
     def __init__(
         self,
-        output: Any = "cleaned",
+        output: Any = '{"text":"cleaned words","operations":[]}',
         *,
         models: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -215,7 +223,7 @@ def test_ollama_success_and_short_bypass(app_config: AppConfig) -> None:
     assert provider.preflight()
     assert provider.process("short").text == "short"
     assert not session.posts
-    assert provider.process("two words").text == "cleaned"
+    assert provider.process("two words").text == "cleaned words"
     assert session.posts[0][1]["timeout"] == app_config.postprocess.ollama.timeout_seconds
     assert session.posts[0][1]["json"]["system"] == app_config.postprocess.system_prompt
 

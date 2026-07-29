@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import Any
 
 from voiceflow.config import CodexConfig
-from voiceflow.postprocess.base import PostprocessResult
+from voiceflow.postprocess.base import (
+    PostprocessRequest,
+    PostprocessResult,
+    coerce_request,
+    provider_prompt,
+    provider_schema_path,
+    validate_provider_payload,
+)
 from voiceflow.state import PostprocessState
 
 LOGGER = logging.getLogger(__name__)
@@ -41,7 +48,7 @@ class CodexPostProcessor:
         self.config = config
         self.min_words = min_words
         self.system_prompt = system_prompt
-        self.schema_path = (schema_path or _default_schema_path()).resolve()
+        self.schema_path = (schema_path or provider_schema_path()).resolve()
         self.environ = os.environ if environ is None else environ
         self._state_callback = state_callback or (lambda _state, _message=None: None)
         self._popen = popen
@@ -111,7 +118,8 @@ class CodexPostProcessor:
             self.last_error = None
         if self.config.validate_model_on_startup:
             try:
-                self._execute(f"{self.system_prompt}\n\nTranscript:\nVoiceBud preflight check.")
+                request = PostprocessRequest("VoiceBud preflight check.")
+                self._execute(provider_prompt(self.system_prompt, request), request)
             except (OSError, TimeoutError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 with self._lock:
                     self.executable = None
@@ -146,37 +154,54 @@ class CodexPostProcessor:
             "-",
         ]
 
-    def process(self, text: str) -> PostprocessResult:
+    def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+        request = coerce_request(request)
+        text = request.text
         if not text or len(text.split()) < self.min_words:
             return PostprocessResult(text)
         with self._lock:
             if self._hard_error or self.executable is None:
-                return PostprocessResult(text, used_fallback=True, error=self.last_error)
+                return PostprocessResult(
+                    text,
+                    used_fallback=True,
+                    fallback_code="provider_unavailable",
+                    error=self.last_error,
+                )
             if self._clock() < self._circuit_until:
                 return PostprocessResult(
-                    text, used_fallback=True, error="Codex circuit is cooling down"
+                    text,
+                    used_fallback=True,
+                    fallback_code="circuit_open",
+                    error="Codex circuit is cooling down",
                 )
 
         self._state_callback(PostprocessState.RUNNING, None)
-        prompt = f"{self.system_prompt}\n\nTranscript:\n{text}"
+        prompt = provider_prompt(self.system_prompt, request)
         try:
-            output = self._execute(prompt)
+            output, operations = self._execute(prompt, request)
         except (OSError, TimeoutError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             self._record_failure(str(exc))
-            return PostprocessResult(text, used_fallback=True, error=str(exc))
+            return PostprocessResult(
+                text,
+                used_fallback=True,
+                fallback_code="invalid_or_failed_provider_output",
+                error=str(exc),
+            )
 
         with self._lock:
             self._failures = 0
             self._circuit_until = 0
             self.last_error = None
         self._state_callback(PostprocessState.READY, None)
-        return PostprocessResult(output.strip())
+        return PostprocessResult(output, operations=operations)
 
-    def _execute(self, prompt: str) -> str:
+    def _execute(self, prompt: str, request: PostprocessRequest) -> tuple[str, tuple[Any, ...]]:
         with self._execution_lock:
-            return self._execute_locked(prompt)
+            return self._execute_locked(prompt, request)
 
-    def _execute_locked(self, prompt: str) -> str:
+    def _execute_locked(
+        self, prompt: str, request: PostprocessRequest
+    ) -> tuple[str, tuple[Any, ...]]:
         with tempfile.TemporaryDirectory(prefix="voiceflow-codex-") as cwd:
             with self._lock:
                 if self._closed:
@@ -207,10 +232,7 @@ class CodexPostProcessor:
         if process.returncode != 0:
             raise RuntimeError(f"Codex exited with status {process.returncode}")
         payload = json.loads(stdout)
-        output = payload.get("text") if isinstance(payload, dict) else None
-        if not isinstance(output, str) or not output.strip():
-            raise ValueError("Codex returned invalid or empty JSON text")
-        return output.strip()
+        return validate_provider_payload(payload, request)
 
     def _record_failure(self, message: str) -> None:
         with self._lock:
@@ -239,10 +261,3 @@ class CodexPostProcessor:
             process = self._process
         if process is not None and process.poll() is None:
             self._terminate_process_group(process)
-
-
-def _default_schema_path() -> Path:
-    source_schema = Path(__file__).resolve().parents[3] / "schemas/codex-postprocess.schema.json"
-    if source_schema.is_file():
-        return source_schema
-    return Path(__file__).resolve().parents[1] / "data/codex-postprocess.schema.json"
