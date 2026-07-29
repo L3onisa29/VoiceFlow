@@ -64,6 +64,7 @@ class Recorder:
         self.device, self.device_name = resolve_input_device(sounddevice_module, device)
         self._sounddevice = sounddevice_module
         self._maximum_samples = int(sample_rate * maximum_recording_seconds)
+        self._maximum_recording_seconds = maximum_recording_seconds
         self._on_max_duration = on_max_duration
         self._on_status = on_status
         self._chunks: list[np.ndarray] = []
@@ -75,6 +76,7 @@ class Recorder:
         self._closed = False
         self._stream: Any | None = None
         self._stream_token: object | None = None
+        self._duration_timer: threading.Timer | None = None
         self.level = 0.0
         self.last_rms = 0.0
         self.last_peak = 0.0
@@ -102,14 +104,27 @@ class Recorder:
             self._stream = None
             self._stream_token = None
             self._recording = False
+            timer = self._duration_timer
+            self._duration_timer = None
             self.level = 0.0
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                LOGGER.exception("Failed to close an unexpectedly stopped audio input stream")
+        if timer is not None:
+            timer.cancel()
+        self._release_stream(stream, unexpectedly_stopped=True)
         if self._on_status is not None:
             self._on_status("Audio input stream stopped unexpectedly")
+
+    def _duration_limit_reached(self, token: object) -> None:
+        with self._lock:
+            if (
+                self._closed
+                or not self._recording
+                or token is not self._stream_token
+                or self._limit_notified
+            ):
+                return
+            self._limit_notified = True
+        if self._on_max_duration is not None:
+            self._on_max_duration()
 
     def _callback(
         self,
@@ -172,6 +187,14 @@ class Recorder:
             self._stream = stream
             self._stream_token = token
             self._recording = True
+            timer = threading.Timer(
+                self._maximum_recording_seconds,
+                self._duration_limit_reached,
+                args=(token,),
+            )
+            timer.name = "voiceflow-recording-limit"
+            timer.daemon = True
+            self._duration_timer = timer
         try:
             stream.start()
         except Exception:
@@ -180,13 +203,13 @@ class Recorder:
                     self._stream = None
                     self._stream_token = None
                     self._recording = False
+                    self._duration_timer = None
                     self.level = 0.0
-            try:
-                stream.close()
-            except Exception:
-                LOGGER.exception("Failed to close audio input after start failure")
+            timer.cancel()
+            self._release_stream(stream, unexpectedly_stopped=True)
             raise
         else:
+            timer.start()
             return True
 
     def stop(self) -> np.ndarray:
@@ -197,6 +220,8 @@ class Recorder:
             stream = self._stream
             self._stream = None
             self._stream_token = None
+            timer = self._duration_timer
+            self._duration_timer = None
             self.level = 0.0
             chunks, self._chunks = self._chunks, []
             active_samples = self._active_samples
@@ -207,6 +232,8 @@ class Recorder:
                 float(np.sqrt(active_square_sum / active_samples)) if active_samples else 0.0
             )
             self.last_peak = active_peak
+        if timer is not None:
+            timer.cancel()
         self._release_stream(stream)
         if not chunks:
             return np.zeros(0, dtype=np.float32)
@@ -222,18 +249,38 @@ class Recorder:
             stream = self._stream
             self._stream = None
             self._stream_token = None
+            timer = self._duration_timer
+            self._duration_timer = None
             self.level = 0.0
+        if timer is not None:
+            timer.cancel()
         self._release_stream(stream)
 
     @staticmethod
-    def _release_stream(stream: Any | None) -> None:
+    def _release_stream(stream: Any | None, *, unexpectedly_stopped: bool = False) -> None:
         if stream is None:
             return
-        try:
-            stream.stop()
-        except Exception:
-            LOGGER.exception("Failed to stop audio input stream")
-        try:
-            stream.close()
-        except Exception:
-            LOGGER.exception("Failed to close audio input stream")
+
+        def release() -> None:
+            if not unexpectedly_stopped:
+                try:
+                    abort = getattr(stream, "abort", None)
+                    if abort is not None:
+                        abort()
+                    else:
+                        stream.stop()
+                except Exception:
+                    LOGGER.exception("Failed to abort audio input stream")
+            try:
+                stream.close()
+            except Exception:
+                LOGGER.exception("Failed to close audio input stream")
+
+        # CoreAudio/PortAudio can occasionally block forever while stopping or
+        # closing a stream. Never let that native call pin the hotkey callback,
+        # Cocoa event loop, or application shutdown.
+        threading.Thread(
+            target=release,
+            name="voiceflow-audio-release",
+            daemon=True,
+        ).start()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,7 @@ class FakeStream:
         self.started = 0
         self.stopped = 0
         self.closed = 0
+        self.closed_event = threading.Event()
         self.active = False
 
     def start(self) -> None:
@@ -39,6 +41,7 @@ class FakeStream:
 
     def close(self) -> None:
         self.closed += 1
+        self.closed_event.set()
 
 
 def test_recorder_opens_the_microphone_only_while_recording() -> None:
@@ -77,6 +80,7 @@ def test_recorder_opens_the_microphone_only_while_recording() -> None:
     assert recorder.last_rms == 1.0
     assert recorder.last_peak == 1.0
     assert not recorder.active
+    assert stream.closed_event.wait(timeout=0.5)
     assert (stream.started, stream.stopped, stream.closed) == (1, 1, 1)
 
     assert recorder.start()
@@ -88,6 +92,7 @@ def test_recorder_opens_the_microphone_only_while_recording() -> None:
     recorder.close()
     recorder.close()
     assert not recorder.active
+    assert second_stream.closed_event.wait(timeout=0.5)
     assert (second_stream.started, second_stream.stopped, second_stream.closed) == (1, 1, 1)
 
 
@@ -171,6 +176,68 @@ def test_zero_preroll_and_maximum_duration_are_enforced() -> None:
     stream.callback(np.ones((4, 1), dtype=np.float32), 4, None, None)
     assert recorder.stop().tolist() == [1.0, 1.0]
     assert limit_events == ["limit"]
+
+
+def test_wall_clock_limit_fires_when_audio_callbacks_stall() -> None:
+    limit_reached = threading.Event()
+    sounddevice = SimpleNamespace(
+        InputStream=lambda **kwargs: FakeStream(**kwargs),
+        query_devices=lambda *args, **kwargs: {"name": "Default", "max_input_channels": 1},
+    )
+    recorder = Recorder(
+        maximum_recording_seconds=0.02,
+        sounddevice_module=sounddevice,
+        on_max_duration=limit_reached.set,
+    )
+
+    assert recorder.start()
+    assert limit_reached.wait(timeout=0.5)
+    recorder.close()
+
+
+def test_stopping_recorder_never_waits_for_blocked_native_audio_release() -> None:
+    release_native_call = threading.Event()
+    native_call_started = threading.Event()
+    native_call_finished = threading.Event()
+
+    class BlockingStream(FakeStream):
+        def abort(self) -> None:
+            native_call_started.set()
+            release_native_call.wait(timeout=2)
+            self.active = False
+
+        def close(self) -> None:
+            super().close()
+            native_call_finished.set()
+
+    streams: list[BlockingStream] = []
+
+    def input_stream(**kwargs: Any) -> BlockingStream:
+        stream = BlockingStream(**kwargs)
+        streams.append(stream)
+        return stream
+
+    sounddevice = SimpleNamespace(
+        InputStream=input_stream,
+        query_devices=lambda *args, **kwargs: {"name": "Default", "max_input_channels": 1},
+    )
+    recorder = Recorder(sounddevice_module=sounddevice)
+    assert recorder.start()
+    streams[0].callback(np.ones((2, 1), dtype=np.float32), 2, None, None)
+
+    stopped_audio: list[np.ndarray] = []
+    stop_thread = threading.Thread(
+        target=lambda: stopped_audio.append(recorder.stop()),
+        daemon=True,
+    )
+    stop_thread.start()
+    stop_thread.join(timeout=0.2)
+
+    assert not stop_thread.is_alive()
+    assert stopped_audio[0].tolist() == [1.0, 1.0]
+    assert native_call_started.wait(timeout=0.5)
+    release_native_call.set()
+    assert native_call_finished.wait(timeout=0.5)
 
 
 def test_capture_quality_reports_short_and_silent_audio(app_config: AppConfig) -> None:
