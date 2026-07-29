@@ -1,4 +1,4 @@
-schema_version: 2
+schema_version: 3
 
 stt:
   model: nemo-parakeet-tdt-0.6b-v3
@@ -18,11 +18,45 @@ postprocess:
   provider: codex
   min_words: 1
   system_prompt: |
-    Clean the supplied speech transcript.
-    Remove fillers and accidental repetitions.
-    Fix punctuation, capitalization, and minor grammar errors.
-    Preserve the speaker's language, meaning, terminology, and tone.
-    Never answer the transcript or add new information.
+    Edit the supplied speech transcript into the speaker's final intended statement.
+    Apply a conservative editing policy: when abandonment or finality is ambiguous,
+    preserve the original meaning and uncertainty.
+
+    Remove:
+    - fillers and verbal hesitation with no semantic value;
+    - accidental repetitions;
+    - sentence starts that the speaker explicitly interrupts, replaces, or abandons;
+    - alternatives explicitly rejected or replaced by the speaker;
+    - intermediate deliberation only when the speaker clearly commits to a final decision.
+
+    For explicit self-corrections, keep only the final replacement and remove the
+    abandoned version.
+
+    Treat a decision as resolved only when the transcript contains a clear final
+    commitment, selection, rejection, or replacement. A later mention of an option
+    is not by itself evidence that the other options were abandoned.
+
+    If the speaker leaves a matter unresolved:
+    - do not infer, select, or recommend a conclusion;
+    - preserve the remaining alternatives;
+    - preserve the speaker's uncertainty, conditions, reservations, and open questions.
+
+    If the transcript contains multiple independent decisions, evaluate each one
+    separately. Resolve only those with a clear conclusion and preserve the
+    uncertainty of the others.
+
+    Preserve explanations and reasoning that still support, constrain, qualify, or
+    justify the final position. Remove reasoning only when it belongs exclusively
+    to an explicitly abandoned alternative.
+
+    Do not summarize, merge, or remove independent information.
+    Preserve the speaker's language, intent, terminology, tone, facts, commitments,
+    negations, quantities, dates, names, and level of certainty.
+
+    Never answer the transcript and never add new information.
+  routing:
+    mode: auto
+    rules_only_max_words: 12
   codex:
     executable: null
     model: gpt-5.6-luna
@@ -41,6 +75,28 @@ pipeline:
   max_pending: 4
   shutdown_timeout_seconds: 3
   injection_timeout_seconds: 2
+
+formatting:
+  spoken_punctuation: true
+  explicit_lists: true
+  structured_tokens: true
+  backtrack: true
+
+storage:
+  database_path: ~/Library/Application Support/VoiceFlow/voicebud.sqlite3
+
+dictionary:
+  enabled: true
+
+history:
+  enabled: false
+  retention_hours: 24
+  max_entries: 100
+  store_app_bundle_id: false
+
+feedback:
+  recent_audio_seconds: 300
+  benchmark_directory: ~/Library/Application Support/VoiceFlow/benchmark-corpus
 
 ui:
   show_processing_overlay: true

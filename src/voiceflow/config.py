@@ -17,15 +17,44 @@ from pydantic import (
 )
 
 DEFAULT_SYSTEM_PROMPT = """\
-Clean the supplied speech transcript.
-Remove fillers and accidental repetitions.
-Fix punctuation, capitalization, and minor grammar errors.
-Preserve the speaker's language, meaning, terminology, and tone.
-Never answer the transcript or add new information."""
+Edit the supplied speech transcript into the speaker's final intended statement.
+Apply a conservative editing policy: when abandonment or finality is ambiguous,
+preserve the original meaning and uncertainty.
+
+Remove:
+- fillers and verbal hesitation with no semantic value;
+- accidental repetitions;
+- sentence starts that the speaker explicitly interrupts, replaces, or abandons;
+- alternatives explicitly rejected or replaced by the speaker;
+- intermediate deliberation only when the speaker clearly commits to a final decision.
+
+For explicit self-corrections, keep only the final replacement and remove the
+abandoned version.
+
+Treat a decision as resolved only when the transcript contains a clear final
+commitment, selection, rejection, or replacement. A later mention of an option
+is not by itself evidence that the other options were abandoned.
+
+If the speaker leaves a matter unresolved:
+- do not infer, select, or recommend a conclusion;
+- preserve the remaining alternatives;
+- preserve the speaker's uncertainty, conditions, reservations, and open questions.
+
+If the transcript contains multiple independent decisions, evaluate each one
+separately. Resolve only those with a clear conclusion and preserve the
+uncertainty of the others.
+
+Preserve explanations and reasoning that still support, constrain, qualify, or
+justify the final position. Remove reasoning only when it belongs exclusively
+to an explicitly abandoned alternative.
+
+Do not summarize, merge, or remove independent information.
+Preserve the speaker's language, intent, terminology, tone, facts, commitments,
+negations, quantities, dates, names, and level of certainty.
+
+Never answer the transcript and never add new information."""
 HOTKEY_MODIFIERS = frozenset({"alt", "alt_r", "ctrl", "ctrl_r", "cmd", "cmd_r", "shift"})
-HOTKEY_NON_MODIFIERS = frozenset(
-    {"space", *(f"f{number}" for number in range(1, 21))}
-)
+HOTKEY_NON_MODIFIERS = frozenset({"space", *(f"f{number}" for number in range(1, 21))})
 SUPPORTED_HOTKEYS = HOTKEY_MODIFIERS | HOTKEY_NON_MODIFIERS
 
 
@@ -68,10 +97,16 @@ class OllamaConfig(StrictModel):
     timeout_seconds: float = Field(default=30, gt=0)
 
 
+class RoutingConfig(StrictModel):
+    mode: Literal["auto", "always", "rules_only"] = "auto"
+    rules_only_max_words: int = Field(default=12, ge=1)
+
+
 class PostprocessConfig(StrictModel):
     provider: Literal["codex", "ollama", "none"] = "codex"
     min_words: int = Field(default=1, ge=1)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
     codex: CodexConfig = Field(default_factory=CodexConfig)
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
 
@@ -81,6 +116,33 @@ class PostprocessConfig(StrictModel):
         if not value.strip():
             raise ValueError("system_prompt cannot be empty")
         return value.strip()
+
+
+class FormattingConfig(StrictModel):
+    spoken_punctuation: bool = True
+    explicit_lists: bool = True
+    structured_tokens: bool = True
+    backtrack: bool = True
+
+
+class StorageConfig(StrictModel):
+    database_path: Path = Path("~/Library/Application Support/VoiceFlow/voicebud.sqlite3")
+
+
+class DictionaryConfig(StrictModel):
+    enabled: bool = True
+
+
+class HistoryConfig(StrictModel):
+    enabled: bool = False
+    retention_hours: int = Field(default=24, ge=1)
+    max_entries: int = Field(default=100, ge=1)
+    store_app_bundle_id: bool = False
+
+
+class FeedbackConfig(StrictModel):
+    recent_audio_seconds: int = Field(default=300, ge=1)
+    benchmark_directory: Path = Path("~/Library/Application Support/VoiceFlow/benchmark-corpus")
 
 
 class PipelineConfig(StrictModel):
@@ -162,9 +224,14 @@ class LoggingConfig(StrictModel):
 
 
 class AppConfig(StrictModel):
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     stt: SttConfig
     postprocess: PostprocessConfig
+    formatting: FormattingConfig = Field(default_factory=FormattingConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    dictionary: DictionaryConfig = Field(default_factory=DictionaryConfig)
+    history: HistoryConfig = Field(default_factory=HistoryConfig)
+    feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
     hotkey: HotkeyConfig = Field(default_factory=HotkeyConfig)
@@ -179,27 +246,28 @@ class AppConfig(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def migrate_schema_v1(cls, value: Any) -> Any:
-        if not isinstance(value, dict) or value.get("schema_version") != 1:
+    def migrate_schema(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
             return value
         migrated = deepcopy(value)
-        postprocess = migrated.get("postprocess")
-        if isinstance(postprocess, dict):
-            codex = postprocess.get("codex")
-            if isinstance(codex, dict):
-                old_prompt = codex.pop("system_prompt", None)
-                if "system_prompt" not in postprocess and old_prompt is not None:
-                    postprocess["system_prompt"] = old_prompt
-        inject = migrated.get("inject")
-        if isinstance(inject, dict):
-            inject.pop("restore_clipboard", None)
-        logging_config = migrated.get("logging")
-        if isinstance(logging_config, dict):
-            logging_config.pop("include_transcripts", None)
-        hotkey = migrated.get("hotkey")
-        if isinstance(hotkey, dict) and hotkey.get("key") == "ctrl+shift":
-            hotkey["key"] = "alt+space"
-        migrated["schema_version"] = 2
+        if migrated.get("schema_version") == 1:
+            postprocess = migrated.get("postprocess")
+            if isinstance(postprocess, dict):
+                codex = postprocess.get("codex")
+                if isinstance(codex, dict):
+                    old_prompt = codex.pop("system_prompt", None)
+                    if "system_prompt" not in postprocess and old_prompt is not None:
+                        postprocess["system_prompt"] = old_prompt
+            inject = migrated.get("inject")
+            if isinstance(inject, dict):
+                inject.pop("restore_clipboard", None)
+            logging_config = migrated.get("logging")
+            if isinstance(logging_config, dict):
+                logging_config.pop("include_transcripts", None)
+            hotkey = migrated.get("hotkey")
+            if isinstance(hotkey, dict) and hotkey.get("key") == "ctrl+shift":
+                hotkey["key"] = "alt+space"
+        migrated["schema_version"] = 3
         return migrated
 
 
@@ -255,6 +323,16 @@ def load_config(
         log_file = log_file.expanduser()
         config.logging.file = (
             log_file.resolve() if log_file.is_absolute() else (base / log_file).resolve()
+        )
+    for owner, attribute in (
+        (config.storage, "database_path"),
+        (config.feedback, "benchmark_directory"),
+    ):
+        value = getattr(owner, attribute).expanduser()
+        setattr(
+            owner,
+            attribute,
+            value.resolve() if value.is_absolute() else (base / value).resolve(),
         )
     config._source_path = path
     return config

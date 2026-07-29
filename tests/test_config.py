@@ -73,7 +73,7 @@ def test_reasoning_is_limited_to_low_or_medium(tmp_path: Path) -> None:
 
 def test_default_input_and_clipboard_policy() -> None:
     config = load_config(root=Path(__file__).resolve().parents[1], environ={})
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert config.audio.device == "MacBook Pro Microphone"
     assert not hasattr(config.audio, "preroll_ms")
     assert config.hotkey.key == "alt+space"
@@ -129,9 +129,9 @@ def test_schema_v1_is_migrated_without_preserving_unsafe_defaults(tmp_path: Path
 
     config = load_config(destination)
 
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert config.hotkey.key == "alt+space"
-    assert config.postprocess.system_prompt.startswith("Clean the supplied")
+    assert config.postprocess.system_prompt.startswith("Edit the supplied")
 
 
 def test_none_provider_accepts_only_relevant_configuration() -> None:
@@ -143,6 +143,25 @@ def test_none_provider_accepts_only_relevant_configuration() -> None:
         }
     )
     assert config.postprocess.provider == "none"
+
+
+def test_schema_v2_migrates_to_privacy_first_schema_v3_defaults() -> None:
+    config = AppConfig.model_validate(
+        {
+            "schema_version": 2,
+            "stt": {},
+            "postprocess": {"provider": "none"},
+        }
+    )
+    assert config.schema_version == 3
+    assert config.dictionary.enabled
+    assert not config.history.enabled
+    assert config.history.retention_hours == 24
+    assert config.history.max_entries == 100
+    assert not config.history.store_app_bundle_id
+    assert config.feedback.recent_audio_seconds == 300
+    assert config.postprocess.routing.mode == "auto"
+    assert config.hotkey.key == "alt+space"
 
 
 @pytest.mark.parametrize(
