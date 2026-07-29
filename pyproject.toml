@@ -43,6 +43,7 @@ packages = ["src/voiceflow"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+pythonpath = ["."]
 testpaths = ["tests"]
 timeout = 10
 

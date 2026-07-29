@@ -64,14 +64,14 @@ def test_exact_model_and_cpu_provider_arguments(app_config: AppConfig, valid_mod
         )
     ]
     assert onnx.vad_calls == [("silero", {"providers": ["CPUExecutionProvider"]})]
-    assert transcriber.transcribe(np.ones(160, dtype=np.float32)) == "one two"
+    assert transcriber.transcribe(np.ones(160, dtype=np.float32)).text == "one two"
 
 
 def test_empty_audio_skips_recognition(app_config: AppConfig, valid_model: Path) -> None:
     onnx = FakeOnnx()
     transcriber = make_transcriber(app_config, valid_model, onnx)
     transcriber.load()
-    assert transcriber.transcribe(np.array([], dtype=np.float32)) == ""
+    assert transcriber.transcribe(np.array([], dtype=np.float32)).text == ""
     assert onnx.model.recognize_calls == []
 
 
@@ -82,7 +82,7 @@ def test_vad_failure_allows_short_and_rejects_long(
     onnx = FakeOnnx(vad_error=RuntimeError("offline"))
     transcriber = make_transcriber(app_config, valid_model, onnx)
     transcriber.load()
-    assert transcriber.transcribe(np.ones(80, dtype=np.float32)) == "hello"
+    assert transcriber.transcribe(np.ones(80, dtype=np.float32)).text == "hello"
     with pytest.raises(AudioTooLongError, match="without Silero VAD|Silero VAD is unavailable"):
         transcriber.transcribe(np.ones(320, dtype=np.float32))
 
