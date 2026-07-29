@@ -129,6 +129,10 @@ class TextInjector:
             raise PermissionError("Accessibility permission is required for text insertion")
         return InjectionDestination.focused(self._focus_provider())
 
+    def copy_to_clipboard(self, text: str) -> None:
+        if text:
+            self._set_clipboard(text)
+
     def _set_clipboard(self, text: str) -> int | None:
         self.pasteboard.clearContents()
         written = self.pasteboard.setString_forType_(text, self.string_type)

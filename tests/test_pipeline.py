@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any
 
 import numpy as np
+import pytest
 
+from voiceflow.integrations import BridgeResult, T3CodeDestination
 from voiceflow.pipeline import DictationPipeline
 from voiceflow.postprocess.base import PostprocessResult
+from voiceflow.processing import DeliveryStatus, PipelineOutcome, ProcessingIntent
 from voiceflow.system.text_injector import FocusTarget, InjectionDestination
 
 DESTINATION = InjectionDestination.focused(FocusTarget(1, "test-field"))
@@ -56,6 +60,32 @@ class Injector:
         self.destinations.append(destination)
 
 
+class CapturingSink:
+    def __init__(self) -> None:
+        self.outcomes: list[PipelineOutcome] = []
+
+    def consume(self, outcome: PipelineOutcome) -> None:
+        self.outcomes.append(outcome)
+
+
+class Bridge:
+    def __init__(self) -> None:
+        self.deliveries: list[tuple[str, str]] = []
+        self.abandoned: list[str] = []
+        self.results: dict[str, BridgeResult] = {}
+
+    def deliver_transcription(
+        self,
+        recording_id: str,
+        transcript: str,
+    ) -> BridgeResult:
+        self.deliveries.append((recording_id, transcript))
+        return self.results.get(recording_id, BridgeResult.accepted_result())
+
+    def abandon_recording(self, recording_id: str) -> None:
+        self.abandoned.append(recording_id)
+
+
 def wait_empty(pipeline: DictationPipeline, timeout: float = 2) -> None:
     deadline = time.monotonic() + timeout
     while pipeline.pending and time.monotonic() < deadline:
@@ -90,12 +120,12 @@ def test_fifo_even_when_inputs_have_inverted_artificial_latency() -> None:
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.array([0.04], dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.array([0.0], dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         wait_empty(pipeline)
         assert injector.values == ["clean-0.03999999910593033", "clean-0.0"]
@@ -132,7 +162,7 @@ def test_worker_recovers_after_stt_error() -> None:
             assert pipeline.try_reserve()
             pipeline.submit_reserved(
                 np.ones(1, dtype=np.float32),
-                injection_destination=DESTINATION,
+                destination=DESTINATION,
             )
         wait_empty(pipeline)
         assert injector.values == ["clean-second"]
@@ -148,13 +178,40 @@ def test_empty_transcript_is_reported() -> None:
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         wait_empty(pipeline)
         assert injector.values == []
         assert pipeline.status.messages == ["Nessuna voce riconosciuta"]
     finally:
         pipeline.shutdown()
+
+
+def test_logs_include_delivery_context_without_transcript(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transcript = "private dictation sentinel"
+    pipeline, _injector = make_pipeline(
+        type("T", (), {"transcribe": lambda *_args, **_kwargs: transcript})()
+    )
+    caplog.set_level(logging.DEBUG, logger="voiceflow.pipeline")
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1, dtype=np.float32),
+            destination=DESTINATION,
+            app_bundle_id="com.example.editor",
+        )
+        wait_empty(pipeline)
+    finally:
+        pipeline.shutdown()
+
+    assert "event=dictation.completed" in caplog.text
+    assert 'target_platform="focused_input"' in caplog.text
+    assert 'target_app="com.example.editor"' in caplog.text
+    assert 'operation="input_write"' in caplog.text
+    assert 'delivery_status="injected"' in caplog.text
+    assert transcript not in caplog.text
 
 
 def test_pipeline_leaves_postprocess_state_to_provider() -> None:
@@ -165,7 +222,7 @@ def test_pipeline_leaves_postprocess_state_to_provider() -> None:
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         wait_empty(pipeline)
         assert injector.values == ["clean-raw text"]
@@ -184,7 +241,7 @@ def test_clipboard_only_destination_is_an_expected_completion() -> None:
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
-            injection_destination=destination,
+            destination=destination,
         )
         wait_empty(pipeline)
         assert injector.values == ["clean-raw text"]
@@ -219,14 +276,14 @@ def test_successful_fallback_is_reported_only_after_original_text_is_inserted() 
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         wait_empty(pipeline)
         assert injector.values == ["original"]
         assert status.outcomes == [
             {
                 "fallback": True,
-                "detail": "fake non disponibile — usato testo originale",
+                "detail": "fake non disponibile — usato testo normalizzato",
             }
         ]
         assert all("postprocess" not in update for update in status.updates)
@@ -251,7 +308,7 @@ def test_injection_scheduler_timeout_does_not_hang_worker() -> None:
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         wait_empty(pipeline)
         assert injector.values == []
@@ -276,7 +333,7 @@ def test_shutdown_cancels_active_job_before_postprocess_or_injection() -> None:
     assert pipeline.try_reserve()
     pipeline.submit_reserved(
         np.ones(1, dtype=np.float32),
-        injection_destination=DESTINATION,
+        destination=DESTINATION,
     )
     assert entered.wait(timeout=1)
 
@@ -312,7 +369,7 @@ def test_started_injection_is_allowed_to_complete_without_false_timeout() -> Non
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
-            injection_destination=DESTINATION,
+            destination=DESTINATION,
         )
         wait_empty(pipeline)
         assert injected.is_set()
@@ -320,3 +377,312 @@ def test_started_injection_is_allowed_to_complete_without_false_timeout() -> Non
         assert "Elaborazione non riuscita" not in pipeline.status.messages
     finally:
         pipeline.shutdown()
+
+
+def test_pipeline_trace_covers_success_empty_fallback_and_injection_failure() -> None:
+    def run_case(
+        text: str,
+        *,
+        postprocessor: Any | None = None,
+        injector: Any | None = None,
+    ) -> PipelineOutcome:
+        sink = CapturingSink()
+        pipeline = DictationPipeline(
+            transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: text})(),
+            postprocessor=postprocessor or Postprocessor(),
+            injector=injector or Injector(),
+            status=Status(),
+            max_pending=1,
+            shutdown_timeout_seconds=1,
+            injection_scheduler=lambda callback: callback(),
+            result_sink=sink,
+        )
+        try:
+            assert pipeline.try_reserve()
+            pipeline.submit_reserved(
+                np.ones(160, dtype=np.float32),
+                destination=DESTINATION,
+            )
+            wait_empty(pipeline)
+            assert len(sink.outcomes) == 1
+            return sink.outcomes[0]
+        finally:
+            pipeline.shutdown()
+
+    success = run_case("raw")
+    trace = success.dictation.trace
+    assert success.delivery_status == DeliveryStatus.INJECTED
+    assert trace.queued_ns <= trace.dequeued_ns <= trace.stt_started_ns  # type: ignore[operator]
+    assert trace.stt_ended_ns is not None
+    assert trace.normalization_ended_ns is not None
+    assert trace.injection_ended_ns is not None
+    assert trace.completed_ns is not None
+
+    empty = run_case("")
+    assert empty.delivery_status == DeliveryStatus.EMPTY
+    assert empty.error_code == "empty_transcript"
+
+    class Fallback(Postprocessor):
+        def process(self, text: str) -> PostprocessResult:
+            return PostprocessResult(
+                text,
+                used_fallback=True,
+                fallback_code="provider_unavailable",
+            )
+
+    fallback = run_case("normalized", postprocessor=Fallback())
+    assert fallback.dictation.final_text == "normalized"
+    assert fallback.dictation.trace.fallback_code == "provider_unavailable"
+
+    class BrokenInjector(Injector):
+        def inject(self, text: str, *, destination: InjectionDestination) -> None:
+            raise RuntimeError("failed")
+
+    failed = run_case("raw", injector=BrokenInjector())
+    assert failed.delivery_status == DeliveryStatus.FAILED
+    assert failed.error_code == "pipeline_error"
+
+
+def test_processing_intent_is_one_shot_and_cancellation_is_traced() -> None:
+    sink = CapturingSink()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingTranscriber:
+        calls = 0
+
+        def transcribe(self, *_args: Any, **_kwargs: Any) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                entered.set()
+                release.wait(timeout=1)
+            return "text"
+
+    pipeline = DictationPipeline(
+        transcriber=BlockingTranscriber(),
+        postprocessor=Postprocessor(),
+        injector=Injector(),
+        status=Status(),
+        max_pending=2,
+        shutdown_timeout_seconds=0.05,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=sink,
+    )
+    assert pipeline.try_reserve()
+    pipeline.request_next_processing_intent(ProcessingIntent.DEEP)
+    pipeline.submit_reserved(np.ones(1), destination=DESTINATION)
+    assert entered.wait(timeout=1)
+    pipeline.shutdown()
+    release.set()
+    pipeline._worker.join(timeout=1)
+    assert sink.outcomes[0].delivery_status == DeliveryStatus.CANCELLED
+    assert sink.outcomes[0].dictation.processing_intent == ProcessingIntent.DEEP
+
+    second_sink = CapturingSink()
+    second_pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "text"})(),
+        postprocessor=Postprocessor(),
+        injector=Injector(),
+        status=Status(),
+        max_pending=2,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=second_sink,
+    )
+    try:
+        second_pipeline.request_next_processing_intent(ProcessingIntent.DEEP)
+        for _ in range(2):
+            assert second_pipeline.try_reserve()
+            second_pipeline.submit_reserved(np.ones(1), destination=DESTINATION)
+        wait_empty(second_pipeline)
+        assert [result.dictation.processing_intent for result in second_sink.outcomes] == [
+            ProcessingIntent.DEEP,
+            ProcessingIntent.AUTO,
+        ]
+    finally:
+        second_pipeline.shutdown()
+
+
+def test_result_sink_failure_does_not_stop_following_dictations() -> None:
+    class BrokenSink:
+        def consume(self, _outcome: PipelineOutcome) -> None:
+            raise OSError("storage unavailable")
+
+    injector = Injector()
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "text"})(),
+        postprocessor=Postprocessor(),
+        injector=injector,
+        status=Status(),
+        max_pending=2,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=BrokenSink(),
+    )
+    try:
+        for _ in range(2):
+            assert pipeline.try_reserve()
+            pipeline.submit_reserved(np.ones(1), destination=DESTINATION)
+        wait_empty(pipeline)
+        assert injector.values == ["clean-text", "clean-text"]
+    finally:
+        pipeline.shutdown()
+
+
+def test_t3_delivery_uses_final_text_and_never_calls_injector() -> None:
+    bridge = Bridge()
+    injector = Injector()
+    sink = CapturingSink()
+    recording_id = "4bb0832c-8f9f-4bb5-92a0-a7bb367d240c"
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "raw"})(),
+        postprocessor=Postprocessor(),
+        injector=injector,
+        status=Status(),
+        max_pending=1,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=sink,
+        t3_bridge=bridge,
+    )
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1),
+            destination=T3CodeDestination(recording_id),
+        )
+        wait_empty(pipeline)
+        assert bridge.deliveries == [(recording_id, "clean-raw")]
+        assert injector.values == []
+        assert sink.outcomes[0].delivery_status == DeliveryStatus.T3_DELIVERED
+        assert sink.outcomes[0].dictation.final_text == "clean-raw"
+    finally:
+        pipeline.shutdown()
+
+
+def test_multiple_t3_jobs_keep_ids_and_fail_independently() -> None:
+    bridge = Bridge()
+    rejected_id = "36c45265-0d77-4fa4-9687-f07a64c8bbc0"
+    accepted_id = "ae22dd5b-a6de-464c-bc05-84a24e50cc55"
+    bridge.results[rejected_id] = BridgeResult.rejected()
+    sink = CapturingSink()
+    injector = Injector()
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "text"})(),
+        postprocessor=Postprocessor(),
+        injector=injector,
+        status=Status(),
+        max_pending=2,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=sink,
+        t3_bridge=bridge,
+    )
+    try:
+        for recording_id in (rejected_id, accepted_id):
+            assert pipeline.try_reserve()
+            pipeline.submit_reserved(
+                np.ones(1),
+                destination=T3CodeDestination(recording_id),
+            )
+        wait_empty(pipeline)
+        assert [recording_id for recording_id, _text in bridge.deliveries] == [
+            rejected_id,
+            accepted_id,
+        ]
+        assert [outcome.delivery_status for outcome in sink.outcomes] == [
+            DeliveryStatus.T3_REJECTED,
+            DeliveryStatus.T3_DELIVERED,
+        ]
+        assert sink.outcomes[0].error_code == "t3_rejected"
+        assert injector.values == []
+    finally:
+        pipeline.shutdown()
+
+
+def test_ambiguous_t3_delivery_is_not_retried() -> None:
+    bridge = Bridge()
+    recording_id = "7f17c860-cd2e-4708-8dd0-18687798cd90"
+    bridge.results[recording_id] = BridgeResult.ambiguous()
+    sink = CapturingSink()
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "text"})(),
+        postprocessor=Postprocessor(),
+        injector=Injector(),
+        status=Status(),
+        max_pending=1,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=sink,
+        t3_bridge=bridge,
+    )
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1),
+            destination=T3CodeDestination(recording_id),
+        )
+        wait_empty(pipeline)
+        assert bridge.deliveries == [(recording_id, "clean-text")]
+        assert sink.outcomes[0].delivery_status == DeliveryStatus.T3_AMBIGUOUS
+        assert sink.outcomes[0].error_code == "t3_ambiguous"
+    finally:
+        pipeline.shutdown()
+
+
+def test_empty_and_cancelled_t3_jobs_abandon_reservations() -> None:
+    bridge = Bridge()
+    empty_id = "17f73d09-b22c-4b19-8963-fdf94d7312fc"
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: ""})(),
+        postprocessor=Postprocessor(),
+        injector=Injector(),
+        status=Status(),
+        max_pending=1,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        t3_bridge=bridge,
+    )
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1),
+            destination=T3CodeDestination(empty_id),
+        )
+        wait_empty(pipeline)
+        assert bridge.abandoned == [empty_id]
+        assert bridge.deliveries == []
+    finally:
+        pipeline.shutdown()
+
+    queued_bridge = Bridge()
+    queued_id = "46180495-64b0-4d53-bb54-bda7fd0e1aef"
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingTranscriber:
+        def transcribe(self, *_args: Any, **_kwargs: Any) -> str:
+            entered.set()
+            release.wait(timeout=1)
+            return "text"
+
+    queued_pipeline = DictationPipeline(
+        transcriber=BlockingTranscriber(),
+        postprocessor=Postprocessor(),
+        injector=Injector(),
+        status=Status(),
+        max_pending=1,
+        shutdown_timeout_seconds=0.01,
+        injection_scheduler=lambda callback: callback(),
+        t3_bridge=queued_bridge,
+    )
+    assert queued_pipeline.try_reserve()
+    queued_pipeline.submit_reserved(
+        np.ones(1),
+        destination=T3CodeDestination(queued_id),
+    )
+    assert entered.wait(timeout=1)
+    queued_pipeline.shutdown()
+    release.set()
+    queued_pipeline._worker.join(timeout=1)
+    assert queued_id in queued_bridge.abandoned

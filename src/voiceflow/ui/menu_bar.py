@@ -10,6 +10,12 @@ class MenuBar:
         on_retry_input: Any,
         on_retry_model: Any,
         on_retry_postprocess: Any,
+        on_copy_last: Any,
+        on_copy_raw: Any,
+        on_correct_last: Any,
+        on_add_term: Any,
+        on_clear_history: Any,
+        on_deep_next: Any,
         on_quit: Any,
     ) -> None:
         import objc
@@ -20,6 +26,12 @@ class MenuBar:
             retry_input_callback: Any = None
             retry_model_callback: Any = None
             retry_postprocess_callback: Any = None
+            copy_last_callback: Any = None
+            copy_raw_callback: Any = None
+            correct_last_callback: Any = None
+            add_term_callback: Any = None
+            clear_history_callback: Any = None
+            deep_next_callback: Any = None
             quit_callback: Any = None
 
             @objc.IBAction
@@ -35,14 +47,47 @@ class MenuBar:
                 self.retry_postprocess_callback()
 
             @objc.IBAction
+            def copyLast_(self, _sender: Any) -> None:
+                self.copy_last_callback()
+
+            @objc.IBAction
+            def copyRaw_(self, _sender: Any) -> None:
+                self.copy_raw_callback()
+
+            @objc.IBAction
+            def correctLast_(self, _sender: Any) -> None:
+                self.correct_last_callback()
+
+            @objc.IBAction
+            def addTerm_(self, _sender: Any) -> None:
+                self.add_term_callback()
+
+            @objc.IBAction
+            def clearHistory_(self, _sender: Any) -> None:
+                self.clear_history_callback()
+
+            @objc.IBAction
+            def deepNext_(self, _sender: Any) -> None:
+                self.deep_next_callback()
+
+            @objc.IBAction
             def quit_(self, _sender: Any) -> None:
                 self.quit_callback()
 
         self.actions = Actions.alloc().init()
-        self.actions.retry_input_callback = on_retry_input
-        self.actions.retry_model_callback = on_retry_model
-        self.actions.retry_postprocess_callback = on_retry_postprocess
-        self.actions.quit_callback = on_quit
+        for name, callback in (
+            ("retry_input_callback", on_retry_input),
+            ("retry_model_callback", on_retry_model),
+            ("retry_postprocess_callback", on_retry_postprocess),
+            ("copy_last_callback", on_copy_last),
+            ("copy_raw_callback", on_copy_raw),
+            ("correct_last_callback", on_correct_last),
+            ("add_term_callback", on_add_term),
+            ("clear_history_callback", on_clear_history),
+            ("deep_next_callback", on_deep_next),
+            ("quit_callback", on_quit),
+        ):
+            setattr(self.actions, name, callback)
 
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(-1)
         self.status_item.button().setTitle_("●")
@@ -93,6 +138,18 @@ class MenuBar:
         )
         retry_postprocess.setTarget_(self.actions)
         menu.addItem_(retry_postprocess)
+        menu.addItem_(NSMenuItem.separatorItem())
+        for title, action in (
+            ("Copia ultimo testo", "copyLast:"),
+            ("Copia transcript originale", "copyRaw:"),
+            ("Correggi ultima trascrizione…", "correctLast:"),
+            ("Aggiungi termine…", "addTerm:"),
+            ("Cancella cronologia", "clearHistory:"),
+            ("Pulizia approfondita alla prossima dettatura", "deepNext:"),
+        ):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+            item.setTarget_(self.actions)
+            menu.addItem_(item)
         menu.addItem_(NSMenuItem.separatorItem())
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit VoiceBud", "quit:", "q"

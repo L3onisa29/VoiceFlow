@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -8,8 +9,14 @@ from typing import Any
 import numpy as np
 import pytest
 
-from voiceflow.app import VoiceBudApplication, _single_instance_lock, run
+from voiceflow.app import VoiceBudApplication, _run_event_loop, _single_instance_lock, run
 from voiceflow.config import AppConfig
+from voiceflow.integrations import (
+    BridgeResult,
+    FrontmostApplication,
+    FrontmostApplicationKind,
+    T3CodeDestination,
+)
 from voiceflow.state import ActivityState, ModelState, SystemState
 from voiceflow.system.permissions import PermissionStatus
 from voiceflow.system.text_injector import FocusTarget, InjectionDestination
@@ -50,6 +57,7 @@ class RecordingPipeline:
         self.reservations = 0
         self.cancelled = 0
         self.submissions: list[tuple[np.ndarray, dict[str, Any]]] = []
+        self.shutdown_calls: list[dict[str, Any]] = []
 
     def try_reserve(self) -> bool:
         self.reservations += 1
@@ -58,8 +66,26 @@ class RecordingPipeline:
     def cancel_reservation(self) -> None:
         self.cancelled += 1
 
-    def submit_reserved(self, audio: np.ndarray, **kwargs: Any) -> None:
+    def submit_reserved(self, audio: np.ndarray, **kwargs: Any) -> int:
         self.submissions.append((audio, kwargs))
+        return len(self.submissions)
+
+    def shutdown(self, **kwargs: Any) -> None:
+        self.shutdown_calls.append(kwargs)
+
+
+class Bridge:
+    def __init__(self, result: BridgeResult | None = None) -> None:
+        self.result = result or BridgeResult.accepted_result()
+        self.reserved: list[str] = []
+        self.abandoned: list[str] = []
+
+    def reserve_recording(self, recording_id: str) -> BridgeResult:
+        self.reserved.append(recording_id)
+        return self.result
+
+    def abandon_recording(self, recording_id: str) -> None:
+        self.abandoned.append(recording_id)
 
 
 class RecordingRecorder:
@@ -80,6 +106,9 @@ class RecordingRecorder:
         self.recording = False
         return np.ones(160, dtype=np.float32)
 
+    def close(self) -> None:
+        pass
+
 
 def make_recording_app(app_config: AppConfig) -> VoiceBudApplication:
     app = VoiceBudApplication.__new__(VoiceBudApplication)
@@ -87,9 +116,14 @@ def make_recording_app(app_config: AppConfig) -> VoiceBudApplication:
     app._lock = threading.RLock()
     app._closing = False
     app._recording_reserved = False
+    app._recording_destination = None
     app.pipeline = RecordingPipeline()
     app.recorder = RecordingRecorder()
     app.status = Status()
+    app.t3_bridge = Bridge()
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.OTHER, "example.other")
+    )
     return app
 
 
@@ -114,7 +148,7 @@ def test_destination_is_captured_when_recording_stops(
     assert capture_calls == 1
     assert len(app.pipeline.submissions) == 1
     _audio, kwargs = app.pipeline.submissions[0]
-    assert kwargs["injection_destination"] == destination
+    assert kwargs["destination"] == destination
 
 
 def test_missing_destination_at_stop_uses_clipboard_only(
@@ -129,7 +163,156 @@ def test_missing_destination_at_stop_uses_clipboard_only(
     assert app._recording_stopped()
 
     _audio, kwargs = app.pipeline.submissions[0]
-    assert kwargs["injection_destination"].uses_clipboard_only
+    assert kwargs["destination"].uses_clipboard_only
+
+
+def test_t3_frontmost_reserves_uuid_v4_and_keeps_destination(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(
+            FrontmostApplicationKind.T3_CODE,
+            "com.t3tools.t3code",
+        )
+    )
+    capture_calls = 0
+
+    def capture_destination() -> InjectionDestination:
+        nonlocal capture_calls
+        capture_calls += 1
+        return InjectionDestination.clipboard_only()
+
+    app.injector = SimpleNamespace(capture_destination=capture_destination)
+
+    assert app._recording_started()
+    assert len(app.t3_bridge.reserved) == 1
+    recording_id = app.t3_bridge.reserved[0]
+    assert uuid.UUID(recording_id).version == 4
+    assert app._recording_destination == T3CodeDestination(recording_id)
+
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: pytest.fail("focus must not be checked at stop")
+    )
+    assert app._recording_stopped()
+    assert capture_calls == 0
+    _audio, kwargs = app.pipeline.submissions[0]
+    assert kwargs["destination"] == T3CodeDestination(recording_id)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        BridgeResult.rejected(),
+        BridgeResult.ambiguous(),
+        BridgeResult.validation_error(),
+    ],
+)
+def test_t3_reservation_failure_never_starts_recorder_or_falls_back(
+    app_config: AppConfig,
+    result: BridgeResult,
+) -> None:
+    app = make_recording_app(app_config)
+    app.t3_bridge = Bridge(result)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+    capture = pytest.fail
+    app.injector = SimpleNamespace(capture_destination=capture)
+
+    assert not app._recording_started()
+    assert not app.recorder.recording
+    assert app.pipeline.cancelled == 1
+    assert app._recording_destination is None
+
+
+def test_frontmost_detection_failure_stops_before_recording(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.UNAVAILABLE)
+    )
+
+    assert not app._recording_started()
+    assert not app.recorder.recording
+    assert app.pipeline.cancelled == 1
+    assert app.t3_bridge.reserved == []
+
+
+def test_recorder_failure_after_t3_acceptance_abandons_session(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+    app.recorder.start = lambda: False
+
+    assert not app._recording_started()
+    assert app.t3_bridge.abandoned == app.t3_bridge.reserved
+    assert app._recording_destination is None
+
+
+def test_rejected_t3_audio_abandons_session(
+    app_config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+    app.injector = SimpleNamespace(
+        capture_destination=lambda: pytest.fail("must not capture Accessibility")
+    )
+    monkeypatch.setattr(
+        "voiceflow.app.capture_rejection_reason",
+        lambda **_kwargs: "Audio rifiutato",
+    )
+
+    assert app._recording_started()
+    recording_id = app.t3_bridge.reserved[0]
+    assert app._recording_stopped()
+    assert app.t3_bridge.abandoned == [recording_id]
+    assert app.pipeline.submissions == []
+
+
+def test_t3_stop_failure_cancels_and_abandons(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+    app.recorder.stop = lambda: (_ for _ in ()).throw(RuntimeError("stop failed"))
+
+    assert app._recording_started()
+    recording_id = app.t3_bridge.reserved[0]
+    assert not app._recording_stopped()
+    assert app.pipeline.cancelled == 1
+    assert app.t3_bridge.abandoned == [recording_id]
+    assert app._recording_destination is None
+
+
+def test_shutdown_during_t3_recording_abandons_session(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+    app.hotkey = None
+    app._input_health_stop = None
+    app._input_health_thread = None
+
+    assert app._recording_started()
+    recording_id = app.t3_bridge.reserved[0]
+    pipeline = app.pipeline
+    app._deactivate_input()
+
+    assert pipeline.cancelled == 1
+    assert app.t3_bridge.abandoned == [recording_id]
+    assert app._recording_destination is None
 
 
 def test_recording_state_is_shared_independently_from_display_context(
@@ -213,6 +396,7 @@ def test_activation_rollback_does_not_publish_stopping(
     app.transcriber = object()
     app.postprocessor = object()
     app.injector = object()
+    app.t3_bridge = object()
     app.status = Status()
 
     app._activate_input()
@@ -239,6 +423,18 @@ def test_finish_quit_stops_event_loop_even_if_shutdown_raises() -> None:
     app._finish_quit()
 
     assert helper.scheduled == [(helper.stopEventLoop, ())]
+
+
+def test_event_loop_installs_mach_interrupt_for_ctrl_c() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    app_helper = SimpleNamespace(
+        installMachInterrupt=lambda: calls.append(("install", {})),
+        runEventLoop=lambda **kwargs: calls.append(("run", kwargs)),
+    )
+
+    _run_event_loop(app_helper)
+
+    assert calls == [("install", {}), ("run", {})]
 
 
 def test_single_instance_lock_rejects_second_owner(tmp_path: Path) -> None:
