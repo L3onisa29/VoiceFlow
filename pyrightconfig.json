@@ -6,6 +6,7 @@
     "src/voiceflow/state.py",
     "src/voiceflow/normalization/contracts.py",
     "src/voiceflow/transcription/contracts.py",
+    "src/voiceflow/postprocess/factory.py",
     "src/voiceflow/postprocess/router.py",
     "src/voiceflow/benchmarking.py",
     "src/voiceflow/feedback.py"

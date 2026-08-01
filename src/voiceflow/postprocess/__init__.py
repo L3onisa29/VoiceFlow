@@ -3,8 +3,8 @@ from voiceflow.postprocess.base import (
     PostprocessRequest,
     PostprocessResult,
     ProviderOperation,
-    create_postprocessor,
 )
+from voiceflow.postprocess.factory import create_postprocessor
 
 __all__ = [
     "PostProcessor",

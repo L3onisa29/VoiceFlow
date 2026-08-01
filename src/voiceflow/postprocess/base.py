@@ -7,7 +7,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
 
-from voiceflow.config import PostprocessConfig
 from voiceflow.normalization import ProtectedSpan
 from voiceflow.processing import PostprocessRoute, ProcessingIntent, RouteReason
 from voiceflow.transcription import TranscriptionResult
@@ -56,33 +55,6 @@ class PostProcessor(Protocol):
     def retry(self) -> bool: ...
 
     def close(self) -> None: ...
-
-
-def create_postprocessor(
-    config: PostprocessConfig,
-    **kwargs: object,
-) -> PostProcessor:
-    if config.provider == "codex":
-        from voiceflow.postprocess.codex import CodexPostProcessor
-
-        return CodexPostProcessor(
-            config.codex,
-            min_words=config.min_words,
-            system_prompt=config.system_prompt,
-            **kwargs,
-        )
-    if config.provider == "ollama":
-        from voiceflow.postprocess.ollama import OllamaPostProcessor
-
-        return OllamaPostProcessor(
-            config.ollama,
-            min_words=config.min_words,
-            system_prompt=config.system_prompt,
-            **kwargs,
-        )
-    from voiceflow.postprocess.none import NoPostProcessor
-
-    return NoPostProcessor(**kwargs)
 
 
 def coerce_request(request: PostprocessRequest | str) -> PostprocessRequest:
