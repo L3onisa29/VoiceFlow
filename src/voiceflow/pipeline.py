@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -298,7 +298,6 @@ class DictationPipeline:
                 text=normalized_text,
                 raw_text=raw_text,
                 transcription=transcription,
-                preferred_terms=self._preferred_terms(transcription.language, job.app_bundle_id),
                 language=transcription.language,
                 processing_intent=job.processing_intent,
                 detected_signals=normalization.detected_signals,
@@ -308,6 +307,13 @@ class DictationPipeline:
                 if self.postprocess_router is not None:
                     decision = self.postprocess_router.decide(request)
                     if decision.route == PostprocessRoute.PROVIDER:
+                        request = replace(
+                            request,
+                            preferred_terms=self._preferred_terms(
+                                transcription.language,
+                                job.app_bundle_id,
+                            ),
+                        )
                         self.status.update(activity=ActivityState.POSTPROCESSING)
                     result = self.postprocess_router.process_decision(request, decision)
                     trace.route = result.route
@@ -319,8 +325,15 @@ class DictationPipeline:
                 else:
                     trace.route = PostprocessRoute.PROVIDER
                     trace.reason = RouteReason.ALWAYS_MODE
+                    request = replace(
+                        request,
+                        preferred_terms=self._preferred_terms(
+                            transcription.language,
+                            job.app_bundle_id,
+                        ),
+                    )
                     self.status.update(activity=ActivityState.POSTPROCESSING)
-                    result = self.postprocessor.process(normalized_text)
+                    result = self.postprocessor.process(request)
             finally:
                 trace.postprocess_ended_ns = self._clock_ns()
             self._raise_if_cancelled()

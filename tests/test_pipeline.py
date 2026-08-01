@@ -49,7 +49,8 @@ class Postprocessor:
     def preflight(self) -> bool:
         return True
 
-    def process(self, text: str) -> PostprocessResult:
+    def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+        text = request.text if isinstance(request, PostprocessRequest) else request
         return PostprocessResult(f"clean-{text}")
 
     def retry(self) -> bool:
@@ -245,13 +246,18 @@ def test_pipeline_leaves_postprocess_state_to_provider() -> None:
 def test_pipeline_executes_the_single_precomputed_router_decision() -> None:
     entered = threading.Event()
     release = threading.Event()
+    preferred_term_lookups: list[tuple[str | None, str | None]] = []
 
     class BlockingPostprocessor(Postprocessor):
+        def __init__(self) -> None:
+            self.preferred_terms: list[tuple[str, ...]] = []
+
         def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+            assert isinstance(request, PostprocessRequest)
+            self.preferred_terms.append(request.preferred_terms)
             entered.set()
             release.wait(timeout=1)
-            text = request.text if isinstance(request, PostprocessRequest) else request
-            return super().process(text)
+            return super().process(request)
 
     class NonStableRouter(PostprocessRouter):
         def __init__(self, provider: Postprocessor) -> None:
@@ -278,21 +284,28 @@ def test_pipeline_executes_the_single_precomputed_router_decision() -> None:
         max_pending=1,
         shutdown_timeout_seconds=1,
         injection_scheduler=lambda callback: callback(),
+        preferred_terms=lambda language, app_bundle_id: (
+            preferred_term_lookups.append((language, app_bundle_id)) or ("VoiceBud",)
+        ),
     )
     try:
         assert pipeline.try_reserve()
         pipeline.submit_reserved(
             np.ones(1, dtype=np.float32),
             destination=DESTINATION,
+            app_bundle_id="com.example.editor",
         )
         assert entered.wait(timeout=1)
         assert router.decide_calls == 1
+        assert preferred_term_lookups == [(None, "com.example.editor")]
+        assert postprocessor.preferred_terms == [("VoiceBud",)]
         assert status.updates[-1] == {"activity": ActivityState.POSTPROCESSING}
 
         release.set()
         wait_empty(pipeline)
         assert injector.values == ["clean-raw text"]
         assert router.decide_calls == 1
+        assert preferred_term_lookups == [(None, "com.example.editor")]
     finally:
         release.set()
         pipeline.shutdown()
@@ -310,6 +323,8 @@ def test_rules_only_routes_never_publish_postprocessing(
     routing_mode: str,
     expected_reason: RouteReason,
 ) -> None:
+    preferred_term_lookups: list[tuple[str | None, str | None]] = []
+
     class RulesOnlyProvider(Postprocessor):
         def __init__(self) -> None:
             self.name = provider_name
@@ -336,6 +351,9 @@ def test_rules_only_routes_never_publish_postprocessing(
         shutdown_timeout_seconds=1,
         injection_scheduler=lambda callback: callback(),
         result_sink=sink,
+        preferred_terms=lambda language, app_bundle_id: (
+            preferred_term_lookups.append((language, app_bundle_id)) or ("unused",)
+        ),
     )
     try:
         assert pipeline.try_reserve()
@@ -348,10 +366,67 @@ def test_rules_only_routes_never_publish_postprocessing(
         pipeline.shutdown()
 
     assert postprocessor.calls == 0
+    assert preferred_term_lookups == []
     assert injector.values == ["raw text"]
     assert all(update.get("activity") != ActivityState.POSTPROCESSING for update in status.updates)
     assert sink.outcomes[0].dictation.trace.route == PostprocessRoute.RULES_ONLY
     assert sink.outcomes[0].dictation.trace.reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "expected_lookups"),
+    [
+        ("fake", [(None, "com.example.editor")]),
+        ("none", []),
+    ],
+)
+def test_legacy_postprocess_only_loads_preferred_terms_for_provider(
+    provider_name: str,
+    expected_lookups: list[tuple[str | None, str | None]],
+) -> None:
+    class CapturingPostprocessor(Postprocessor):
+        def __init__(self) -> None:
+            self.name = provider_name
+            self.requests: list[PostprocessRequest | str] = []
+
+        def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+            self.requests.append(request)
+            text = request.text if isinstance(request, PostprocessRequest) else request
+            return PostprocessResult(text)
+
+    lookups: list[tuple[str | None, str | None]] = []
+    postprocessor = CapturingPostprocessor()
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "raw text"})(),
+        postprocessor=postprocessor,
+        injector=Injector(),
+        status=Status(),
+        max_pending=1,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        preferred_terms=lambda language, app_bundle_id: (
+            lookups.append((language, app_bundle_id)) or ("VoiceBud",)
+        ),
+    )
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1, dtype=np.float32),
+            destination=DESTINATION,
+            app_bundle_id="com.example.editor",
+        )
+        wait_empty(pipeline)
+    finally:
+        pipeline.shutdown()
+
+    assert lookups == expected_lookups
+    assert len(postprocessor.requests) == 1
+    request = postprocessor.requests[0]
+    if provider_name == "fake":
+        assert isinstance(request, PostprocessRequest)
+        assert request.preferred_terms == ("VoiceBud",)
+    else:
+        assert request == "raw text"
 
 
 def test_clipboard_only_destination_is_an_expected_completion() -> None:
@@ -380,7 +455,8 @@ def test_clipboard_only_destination_is_an_expected_completion() -> None:
 
 def test_successful_fallback_is_reported_only_after_original_text_is_inserted() -> None:
     class FallbackPostprocessor(Postprocessor):
-        def process(self, text: str) -> PostprocessResult:
+        def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+            text = request.text if isinstance(request, PostprocessRequest) else request
             return PostprocessResult(text, used_fallback=True, error="provider unavailable")
 
     injector = Injector()
@@ -547,7 +623,8 @@ def test_pipeline_trace_covers_success_empty_fallback_and_injection_failure() ->
     assert empty.dictation.trace.delivery_seconds is None
 
     class Fallback(Postprocessor):
-        def process(self, text: str) -> PostprocessResult:
+        def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+            text = request.text if isinstance(request, PostprocessRequest) else request
             return PostprocessResult(
                 text,
                 used_fallback=True,
