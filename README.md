@@ -95,7 +95,10 @@ VoiceBud applies deterministic spoken punctuation, explicit-list and structured-
 ```bash
 uv lock --check
 uv run --locked ruff check .
+uv run --locked ruff format --check .
 uv run --locked pytest
+uv run --locked pyright
+uv build --wheel
 uv run --locked benchmarks/benchmark_stt.py path/to/mono-16k.wav --json-output benchmark.json
 ```
 
