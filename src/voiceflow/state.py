@@ -64,14 +64,6 @@ class StateStore:
         with self._lock:
             return self._state
 
-    def update(self, **changes: object) -> AppState:
-        with self._lock:
-            updated = replace(self._state, **changes)
-            if updated == self._state:
-                return self._state
-            self._state = updated
-            return self._state
-
     def update_if_changed(self, **changes: object) -> tuple[AppState, bool]:
         """Apply changes and report whether they produced a new state."""
         with self._lock:

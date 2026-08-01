@@ -83,6 +83,10 @@ class PipelineTrace:
         return self._elapsed_seconds(self.postprocess_started_ns, self.postprocess_ended_ns)
 
     @property
+    def delivery_seconds(self) -> float | None:
+        return self._elapsed_seconds(self.injection_started_ns, self.injection_ended_ns)
+
+    @property
     def total_seconds(self) -> float | None:
         return self._elapsed_seconds(self.queued_ns, self.completed_ns)
 

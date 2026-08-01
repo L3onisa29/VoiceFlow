@@ -8,10 +8,19 @@ from typing import Any
 import numpy as np
 import pytest
 
+from voiceflow.config import RoutingConfig
 from voiceflow.integrations import BridgeResult, T3CodeDestination
 from voiceflow.pipeline import DictationPipeline
-from voiceflow.postprocess.base import PostprocessResult
-from voiceflow.processing import DeliveryStatus, PipelineOutcome, ProcessingIntent
+from voiceflow.postprocess.base import PostprocessRequest, PostprocessResult
+from voiceflow.postprocess.router import PostprocessRouter, RoutingDecision
+from voiceflow.processing import (
+    DeliveryStatus,
+    PipelineOutcome,
+    PostprocessRoute,
+    ProcessingIntent,
+    RouteReason,
+)
+from voiceflow.state import ActivityState
 from voiceflow.system.text_injector import FocusTarget, InjectionDestination
 
 DESTINATION = InjectionDestination.focused(FocusTarget(1, "test-field"))
@@ -211,6 +220,7 @@ def test_logs_include_delivery_context_without_transcript(
     assert 'target_app="com.example.editor"' in caplog.text
     assert 'operation="input_write"' in caplog.text
     assert 'delivery_status="injected"' in caplog.text
+    assert "delivery_seconds=" in caplog.text
     assert transcript not in caplog.text
 
 
@@ -230,6 +240,118 @@ def test_pipeline_leaves_postprocess_state_to_provider() -> None:
         assert pipeline.status.outcomes == [{"fallback": False, "detail": None}]
     finally:
         pipeline.shutdown()
+
+
+def test_pipeline_executes_the_single_precomputed_router_decision() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingPostprocessor(Postprocessor):
+        def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+            entered.set()
+            release.wait(timeout=1)
+            text = request.text if isinstance(request, PostprocessRequest) else request
+            return super().process(text)
+
+    class NonStableRouter(PostprocessRouter):
+        def __init__(self, provider: Postprocessor) -> None:
+            super().__init__(provider, RoutingConfig())
+            self.decide_calls = 0
+
+        def decide(self, request: PostprocessRequest) -> RoutingDecision:
+            del request
+            self.decide_calls += 1
+            if self.decide_calls == 1:
+                return RoutingDecision(PostprocessRoute.PROVIDER, RouteReason.DEEP_REQUESTED)
+            return RoutingDecision(PostprocessRoute.RULES_ONLY, RouteReason.CLEAN_FAST_PATH)
+
+    postprocessor = BlockingPostprocessor()
+    router = NonStableRouter(postprocessor)
+    injector = Injector()
+    status = Status()
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "raw text"})(),
+        postprocessor=postprocessor,
+        postprocess_router=router,
+        injector=injector,
+        status=status,
+        max_pending=1,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+    )
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1, dtype=np.float32),
+            destination=DESTINATION,
+        )
+        assert entered.wait(timeout=1)
+        assert router.decide_calls == 1
+        assert status.updates[-1] == {"activity": ActivityState.POSTPROCESSING}
+
+        release.set()
+        wait_empty(pipeline)
+        assert injector.values == ["clean-raw text"]
+        assert router.decide_calls == 1
+    finally:
+        release.set()
+        pipeline.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "routing_mode", "expected_reason"),
+    [
+        ("fake", "rules_only", RouteReason.RULES_ONLY_MODE),
+        ("none", "always", RouteReason.PROVIDER_DISABLED),
+    ],
+)
+def test_rules_only_routes_never_publish_postprocessing(
+    provider_name: str,
+    routing_mode: str,
+    expected_reason: RouteReason,
+) -> None:
+    class RulesOnlyProvider(Postprocessor):
+        def __init__(self) -> None:
+            self.name = provider_name
+            self.calls = 0
+
+        def process(self, text: PostprocessRequest | str) -> PostprocessResult:
+            self.calls += 1
+            return super().process(text.text if isinstance(text, PostprocessRequest) else text)
+
+    postprocessor = RulesOnlyProvider()
+    status = Status()
+    sink = CapturingSink()
+    injector = Injector()
+    pipeline = DictationPipeline(
+        transcriber=type("T", (), {"transcribe": lambda *_args, **_kwargs: "raw text"})(),
+        postprocessor=postprocessor,
+        postprocess_router=PostprocessRouter(
+            postprocessor,
+            RoutingConfig(mode=routing_mode),
+        ),
+        injector=injector,
+        status=status,
+        max_pending=1,
+        shutdown_timeout_seconds=1,
+        injection_scheduler=lambda callback: callback(),
+        result_sink=sink,
+    )
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(
+            np.ones(1, dtype=np.float32),
+            destination=DESTINATION,
+        )
+        wait_empty(pipeline)
+    finally:
+        pipeline.shutdown()
+
+    assert postprocessor.calls == 0
+    assert injector.values == ["raw text"]
+    assert all(update.get("activity") != ActivityState.POSTPROCESSING for update in status.updates)
+    assert sink.outcomes[0].dictation.trace.route == PostprocessRoute.RULES_ONLY
+    assert sink.outcomes[0].dictation.trace.reason == expected_reason
 
 
 def test_clipboard_only_destination_is_an_expected_completion() -> None:
@@ -416,11 +538,13 @@ def test_pipeline_trace_covers_success_empty_fallback_and_injection_failure() ->
     assert trace.stt_ended_ns is not None
     assert trace.normalization_ended_ns is not None
     assert trace.injection_ended_ns is not None
+    assert trace.delivery_seconds is not None
     assert trace.completed_ns is not None
 
     empty = run_case("")
     assert empty.delivery_status == DeliveryStatus.EMPTY
     assert empty.error_code == "empty_transcript"
+    assert empty.dictation.trace.delivery_seconds is None
 
     class Fallback(Postprocessor):
         def process(self, text: str) -> PostprocessResult:
@@ -441,6 +565,7 @@ def test_pipeline_trace_covers_success_empty_fallback_and_injection_failure() ->
     failed = run_case("raw", injector=BrokenInjector())
     assert failed.delivery_status == DeliveryStatus.FAILED
     assert failed.error_code == "pipeline_error"
+    assert failed.dictation.trace.delivery_seconds is not None
 
 
 def test_processing_intent_is_one_shot_and_cancellation_is_traced() -> None:

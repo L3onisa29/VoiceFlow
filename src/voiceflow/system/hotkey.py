@@ -47,7 +47,6 @@ class PushToTalk:
         if keyboard_module is None:
             from pynput import keyboard as keyboard_module
 
-        self._keyboard = keyboard_module
         key_map: dict[str, Any] = {
             "alt": keyboard_module.Key.alt,
             "alt_r": keyboard_module.Key.alt_r,

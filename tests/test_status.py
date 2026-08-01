@@ -432,10 +432,8 @@ def test_stopping_overrides_transient_and_close_rejects_late_renders() -> None:
     assert len(overlay.updates) == update_count
 
 
-def test_state_store_reuses_current_object_for_identical_update() -> None:
+def test_state_store_reports_identical_update_without_replacing_object() -> None:
     store = StateStore()
-    initial = store.value
-    assert store.update(system=initial.system) is initial
     updated, changed = store.update_if_changed(model=ModelState.READY)
     assert changed and updated is store.value
     same, changed = store.update_if_changed(model=ModelState.READY)

@@ -224,7 +224,10 @@ class VoiceBudApplication:
             LOGGER.exception("Optional local storage initialization failed")
         self.history_sink = HistoryResultSink(self.storage, config.history)
         self.correction_service = CorrectionService(self.history_sink, self.dictionary)
-        self.audio_feedback = RecentAudioBuffer(config.feedback.recent_audio_seconds)
+        self.audio_feedback = RecentAudioBuffer.for_pipeline(
+            config.feedback.recent_audio_seconds,
+            max_pending=config.pipeline.max_pending,
+        )
         self.app_bundle_resolver = AppBundleResolver()
         self.normalizer = DeterministicNormalizer(self.dictionary)
         self.postprocess_router = PostprocessRouter(self.postprocessor, config.postprocess.routing)

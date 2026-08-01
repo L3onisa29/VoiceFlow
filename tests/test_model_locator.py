@@ -97,3 +97,25 @@ def test_wrong_model_type_is_rejected(valid_model: Path) -> None:
     (valid_model / "config.json").write_text('{"model_type":"whisper"}', encoding="utf-8")
     with pytest.raises(ModelValidationError, match="Unexpected model_type"):
         validate_model(valid_model)
+
+
+@pytest.mark.parametrize("config", ["[]", '"model"', "42", "null"])
+def test_non_object_model_config_is_rejected(valid_model: Path, config: str) -> None:
+    (valid_model / "config.json").write_text(config, encoding="utf-8")
+    with pytest.raises(ModelValidationError, match="expected a JSON object"):
+        validate_model(valid_model)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "{}",
+        '{"model_type": null}',
+        '{"model_type": 42}',
+        '{"model_type": {"name": "nemo-conformer-tdt"}}',
+    ],
+)
+def test_invalid_model_type_fields_are_rejected(valid_model: Path, config: str) -> None:
+    (valid_model / "config.json").write_text(config, encoding="utf-8")
+    with pytest.raises(ModelValidationError, match="Unexpected model_type"):
+        validate_model(valid_model)

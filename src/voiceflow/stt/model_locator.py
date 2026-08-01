@@ -51,6 +51,8 @@ def validate_model(path: Path) -> None:
         model_config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ModelValidationError(f"Invalid model config.json at {path}: {exc}") from exc
+    if not isinstance(model_config, dict):
+        raise ModelValidationError(f"Invalid model config.json at {path}: expected a JSON object")
     if model_config.get("model_type") != EXPECTED_MODEL_TYPE:
         raise ModelValidationError(
             f"Unexpected model_type at {path}: {model_config.get('model_type')!r}; "

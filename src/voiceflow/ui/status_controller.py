@@ -237,14 +237,6 @@ class StatusController:
             self._transient_generation += 1
             self._schedule_render_locked()
 
-    def clear_transient(self) -> None:
-        with self._lock:
-            if self._closed or self._transient is None:
-                return
-            self._transient = None
-            self._transient_generation += 1
-            self._schedule_render_locked()
-
     def _schedule_render_locked(self) -> None:
         if self._closed or self._render_pending:
             return

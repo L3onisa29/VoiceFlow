@@ -46,6 +46,13 @@ class PostprocessRouter:
 
     def process(self, request: PostprocessRequest) -> PostprocessResult:
         decision = self.decide(request)
+        return self.process_decision(request, decision)
+
+    def process_decision(
+        self,
+        request: PostprocessRequest,
+        decision: RoutingDecision,
+    ) -> PostprocessResult:
         if decision.route == PostprocessRoute.RULES_ONLY:
             return PostprocessResult(
                 request.text,

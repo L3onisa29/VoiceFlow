@@ -200,16 +200,10 @@ def test_default_production_descriptor_uses_userdata_and_t3code_home(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert (
-        Path("~/.t3").expanduser()
-        / "userdata"
-        / "integrations"
-        / "voicebud"
-        / "bridge.json"
+        Path("~/.t3").expanduser() / "userdata" / "integrations" / "voicebud" / "bridge.json"
     ) == DEFAULT_DESCRIPTOR_PATH
     t3_code_home = bridge_dir / "configured-home"
-    descriptor_directory = (
-        t3_code_home / "userdata" / "integrations" / "voicebud"
-    )
+    descriptor_directory = t3_code_home / "userdata" / "integrations" / "voicebud"
     descriptor_directory.mkdir(parents=True)
     socket_path = descriptor_directory / "bridge.sock"
     monkeypatch.setenv("T3CODE_HOME", str(t3_code_home))
@@ -348,9 +342,7 @@ def test_socket_symlink_and_traversal_are_rejected(bridge_dir: Path) -> None:
             target_path,
             overrides={"socketPath": f"{bridge_dir}/nested/../target.sock"},
         )
-        traversal_result = bridge_for(traversal_descriptor).reserve_recording(
-            RECORDING_ID
-        )
+        traversal_result = bridge_for(traversal_descriptor).reserve_recording(RECORDING_ID)
     assert symlink_result.outcome == BridgeOutcome.ERROR
     assert traversal_result.outcome == BridgeOutcome.ERROR
 
@@ -393,9 +385,9 @@ def test_explicit_server_rejections_are_terminal(
         socket_path,
         lambda request: rejected_response(request, code),
     ):
-        result = bridge_for(
-            write_descriptor(bridge_dir, socket_path)
-        ).reserve_recording(RECORDING_ID)
+        result = bridge_for(write_descriptor(bridge_dir, socket_path)).reserve_recording(
+            RECORDING_ID
+        )
     assert result.outcome == BridgeOutcome.REJECTED
     assert result.error_code == "t3_rejected"
     assert result.remote_code == code
@@ -405,34 +397,40 @@ def test_explicit_server_rejections_are_terminal(
     "response",
     [
         lambda _request: b"{bad}\n",
-        lambda request: json.dumps(
-            {
-                "version": 1,
-                "requestId": "wrong",
-                "accepted": True,
-                "code": "accepted",
-            }
-        ).encode()
-        + b"\n",
+        lambda request: (
+            json.dumps(
+                {
+                    "version": 1,
+                    "requestId": "wrong",
+                    "accepted": True,
+                    "code": "accepted",
+                }
+            ).encode()
+            + b"\n"
+        ),
         lambda _request: b"{}\n",
-        lambda request: json.dumps(
-            {
-                "version": 1,
-                "requestId": request["requestId"],
-                "accepted": True,
-                "code": "accepted",
-                "recordingId": request["recordingId"],
-            }
-        ).encode()
-        + b"\n",
-        lambda request: json.dumps(
-            {
-                "version": 1,
-                "requestId": request["requestId"],
-                "accepted": True,
-            }
-        ).encode()
-        + b"\n",
+        lambda request: (
+            json.dumps(
+                {
+                    "version": 1,
+                    "requestId": request["requestId"],
+                    "accepted": True,
+                    "code": "accepted",
+                    "recordingId": request["recordingId"],
+                }
+            ).encode()
+            + b"\n"
+        ),
+        lambda request: (
+            json.dumps(
+                {
+                    "version": 1,
+                    "requestId": request["requestId"],
+                    "accepted": True,
+                }
+            ).encode()
+            + b"\n"
+        ),
         lambda request: response_frame(
             request,
             accepted=True,
@@ -451,9 +449,9 @@ def test_malformed_or_uncorrelated_response_is_ambiguous(
 ) -> None:
     socket_path = bridge_dir / "bridge.sock"
     with server(socket_path, response):
-        result = bridge_for(
-            write_descriptor(bridge_dir, socket_path)
-        ).reserve_recording(RECORDING_ID)
+        result = bridge_for(write_descriptor(bridge_dir, socket_path)).reserve_recording(
+            RECORDING_ID
+        )
     assert result.outcome == BridgeOutcome.AMBIGUOUS
 
 
@@ -461,18 +459,18 @@ def test_oversized_response_is_ambiguous(bridge_dir: Path) -> None:
     socket_path = bridge_dir / "bridge.sock"
     oversized = b"x" * MAX_RESPONSE_FRAME_BYTES + b"\n"
     with server(socket_path, lambda _request: oversized):
-        result = bridge_for(
-            write_descriptor(bridge_dir, socket_path)
-        ).reserve_recording(RECORDING_ID)
+        result = bridge_for(write_descriptor(bridge_dir, socket_path)).reserve_recording(
+            RECORDING_ID
+        )
     assert result.outcome == BridgeOutcome.AMBIGUOUS
 
 
 def test_eof_before_newline_is_ambiguous(bridge_dir: Path) -> None:
     socket_path = bridge_dir / "bridge.sock"
     with server(socket_path, lambda request: response_frame(request, accepted=True)[:-1]):
-        result = bridge_for(
-            write_descriptor(bridge_dir, socket_path)
-        ).reserve_recording(RECORDING_ID)
+        result = bridge_for(write_descriptor(bridge_dir, socket_path)).reserve_recording(
+            RECORDING_ID
+        )
     assert result.outcome == BridgeOutcome.AMBIGUOUS
 
 
@@ -569,10 +567,7 @@ def test_request_ids_are_not_reused_after_ambiguous_error(bridge_dir: Path) -> N
 
     with server(socket_path, eof_response, accepted_response) as instance:
         bridge = bridge_for(write_descriptor(bridge_dir, socket_path))
-        assert (
-            bridge.reserve_recording(RECORDING_ID).outcome
-            == BridgeOutcome.AMBIGUOUS
-        )
+        assert bridge.reserve_recording(RECORDING_ID).outcome == BridgeOutcome.AMBIGUOUS
         assert bridge.reserve_recording(SECOND_RECORDING_ID).accepted
 
     identifiers = {
@@ -701,26 +696,24 @@ def test_frontmost_detector_uses_authoritative_bundle_identifier() -> None:
             return self.application
 
     assert (
-        MacOSFrontmostApplicationDetector(
-            lambda: Workspace(T3_CODE_BUNDLE_IDENTIFIER)
-        ).detect().kind
+        MacOSFrontmostApplicationDetector(lambda: Workspace(T3_CODE_BUNDLE_IDENTIFIER))
+        .detect()
+        .kind
         == FrontmostApplicationKind.T3_CODE
     )
     assert (
-        MacOSFrontmostApplicationDetector(
-            lambda: Workspace("example.other")
-        ).detect().kind
+        MacOSFrontmostApplicationDetector(lambda: Workspace("example.other")).detect().kind
         == FrontmostApplicationKind.OTHER
     )
     assert (
-        MacOSFrontmostApplicationDetector(
-            lambda: Workspace(None)
-        ).detect().kind
+        MacOSFrontmostApplicationDetector(lambda: Workspace(None)).detect().kind
         == FrontmostApplicationKind.UNAVAILABLE
     )
     assert (
         MacOSFrontmostApplicationDetector(
             lambda: (_ for _ in ()).throw(RuntimeError("unavailable"))
-        ).detect().kind
+        )
+        .detect()
+        .kind
         == FrontmostApplicationKind.UNAVAILABLE
     )

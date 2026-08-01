@@ -306,11 +306,12 @@ class DictationPipeline:
             )
             try:
                 if self.postprocess_router is not None:
-                    result = self.postprocess_router.process(request)
+                    decision = self.postprocess_router.decide(request)
+                    if decision.route == PostprocessRoute.PROVIDER:
+                        self.status.update(activity=ActivityState.POSTPROCESSING)
+                    result = self.postprocess_router.process_decision(request, decision)
                     trace.route = result.route
                     trace.reason = result.reason
-                    if trace.route == PostprocessRoute.PROVIDER:
-                        self.status.update(activity=ActivityState.POSTPROCESSING)
                 elif self.postprocessor.name == "none":
                     trace.route = PostprocessRoute.RULES_ONLY
                     trace.reason = RouteReason.PROVIDER_DISABLED
@@ -463,6 +464,7 @@ class DictationPipeline:
                 final_characters=len(final_text),
                 stt_seconds=trace.stt_seconds,
                 postprocess_seconds=trace.postprocess_seconds,
+                delivery_seconds=trace.delivery_seconds,
                 total_seconds=trace.total_seconds,
             )
 
