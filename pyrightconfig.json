@@ -11,6 +11,7 @@
     "src/voiceflow/recording/contracts.py",
     "src/voiceflow/recording/lease.py",
     "src/voiceflow/recording/stop_coordinator.py",
+    "src/voiceflow/audio/release.py",
     "src/voiceflow/benchmarking.py",
     "src/voiceflow/feedback.py"
   ]

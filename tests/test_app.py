@@ -668,13 +668,15 @@ def test_activation_rollback_does_not_publish_stopping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     shutdown_calls: list[dict[str, Any]] = []
+    release_coordinators: list[object] = []
 
     class Recorder:
         device_name = "Default"
         sample_rate = 16000
 
-        def __init__(self, **_kwargs: Any) -> None:
+        def __init__(self, **kwargs: Any) -> None:
             self.closed = False
+            release_coordinators.append(kwargs["release_coordinator"])
 
         def close(self) -> None:
             self.closed = True
@@ -712,6 +714,7 @@ def test_activation_rollback_does_not_publish_stopping(
     app.injector = object()
     app.t3_bridge = object()
     app.status = Status()
+    app.audio_release_coordinator = object()
 
     app._activate_input()
 
@@ -723,6 +726,7 @@ def test_activation_rollback_does_not_publish_stopping(
     ]
     assert app.status.updates[-1]["activity"] == ActivityState.IDLE
     assert app.status.updates[-1]["system"] == SystemState.ERROR
+    assert release_coordinators == [app.audio_release_coordinator]
 
 
 def test_finish_quit_stops_event_loop_even_if_shutdown_raises() -> None:
@@ -733,10 +737,15 @@ def test_finish_quit_stops_event_loop_even_if_shutdown_raises() -> None:
     )
     app.postprocessor = object()
     app._app_helper = helper
+    close_calls: list[float] = []
+    app.audio_release_coordinator = SimpleNamespace(
+        close=lambda timeout: close_calls.append(timeout)
+    )
 
     app._finish_quit()
 
     assert helper.scheduled == [(helper.stopEventLoop, ())]
+    assert close_calls == [0.2]
 
 
 def test_event_loop_installs_mach_interrupt_for_ctrl_c() -> None:

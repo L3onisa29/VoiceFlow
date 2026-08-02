@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from voiceflow.audio.recorder import Recorder
+from voiceflow.audio.release import AudioReleaseCoordinator
 from voiceflow.config import AppConfig, load_config
 from voiceflow.correction import CorrectionService, propose_replacement, word_diff
 from voiceflow.diagnostics import BackgroundLogWriter, exception_fields, log_event
@@ -54,6 +55,7 @@ from voiceflow.ui.status_controller import StatusController
 LOGGER = logging.getLogger(__name__)
 APP_NAME = "VoiceBud"
 INPUT_HEALTH_CHECK_SECONDS = 5.0
+AUDIO_RELEASE_SHUTDOWN_TIMEOUT_SECONDS = 0.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +221,9 @@ class VoiceBudApplication:
             error_indicator_seconds=config.ui.error_indicator_seconds,
             completion_indicator_seconds=config.ui.completion_indicator_seconds,
         )
+        self.audio_release_coordinator = AudioReleaseCoordinator(
+            on_saturated=self._audio_status,
+        )
         self.postprocessor = create_postprocessor(
             config.postprocess,
             state_callback=self._on_postprocess_state,
@@ -356,6 +361,10 @@ class VoiceBudApplication:
         recorder: Recorder | None = None
         pipeline: DictationPipeline | None = None
         hotkey: PushToTalk | None = None
+        release_coordinator = getattr(self, "audio_release_coordinator", None)
+        if release_coordinator is None:
+            release_coordinator = AudioReleaseCoordinator(on_saturated=self._audio_status)
+            self.audio_release_coordinator = release_coordinator
         try:
             recorder = Recorder(
                 sample_rate=self.config.audio.sample_rate,
@@ -364,6 +373,7 @@ class VoiceBudApplication:
                 maximum_recording_seconds=self.config.audio.maximum_recording_seconds,
                 on_max_duration=self._recording_limit_reached,
                 on_status=self._audio_status,
+                release_coordinator=release_coordinator,
             )
             pipeline = DictationPipeline(
                 transcriber=self.transcriber,
@@ -1086,6 +1096,10 @@ class VoiceBudApplication:
         except Exception:
             LOGGER.exception("Application shutdown failed")
         finally:
+            release_coordinator = getattr(self, "audio_release_coordinator", None)
+            if release_coordinator is not None:
+                with suppress(Exception):
+                    release_coordinator.close(timeout=AUDIO_RELEASE_SHUTDOWN_TIMEOUT_SECONDS)
             with suppress(Exception):
                 self.injector.close()
             with suppress(Exception):
