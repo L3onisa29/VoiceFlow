@@ -17,7 +17,7 @@ from voiceflow.integrations import (
     FrontmostApplicationKind,
     T3CodeDestination,
 )
-from voiceflow.recording import RecordingStopCoordinator
+from voiceflow.recording import RecordingPhase, RecordingStopCoordinator
 from voiceflow.state import ActivityState, ModelState, SystemState
 from voiceflow.system.permissions import PermissionStatus
 from voiceflow.system.text_injector import FocusTarget, InjectionDestination
@@ -31,6 +31,7 @@ class Status:
             model=ModelState.READY,
             system=SystemState.READY,
         )
+        self.closed = 0
 
     def update(self, **changes: Any) -> None:
         self.updates.append(changes)
@@ -39,6 +40,32 @@ class Status:
 
     def transient(self, text: str, **_kwargs: Any) -> None:
         self.messages.append(text)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class TrackingLock:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._owner: int | None = None
+        self._depth = 0
+
+    @property
+    def held_by_current_thread(self) -> bool:
+        return self._owner == threading.get_ident()
+
+    def __enter__(self) -> TrackingLock:
+        self._lock.acquire()
+        self._owner = threading.get_ident()
+        self._depth += 1
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+        self._lock.release()
 
 
 class Helper:
@@ -116,7 +143,7 @@ def make_recording_app(app_config: AppConfig) -> VoiceBudApplication:
     app.config = app_config
     app._lock = threading.RLock()
     app._closing = False
-    app._recording_reserved = False
+    app._recording_phase = RecordingPhase.IDLE
     app._recording_destination = None
     app._recording_lease = None
     app.pipeline = RecordingPipeline()
@@ -379,9 +406,240 @@ def test_recording_state_is_shared_independently_from_display_context(
 
     assert not app._is_recording()
     assert app._recording_started()
+    assert app._recording_phase == RecordingPhase.RECORDING
     assert app._is_recording()
     assert app._recording_stopped()
+    assert app._recording_phase == RecordingPhase.IDLE
     assert not app._is_recording()
+
+
+def test_blocking_detector_does_not_hold_lock_and_rejects_duplicate_events(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def detect() -> FrontmostApplication:
+        entered.set()
+        assert release.wait(timeout=1)
+        return FrontmostApplication(FrontmostApplicationKind.OTHER, "example.other")
+
+    app.frontmost_detector = SimpleNamespace(detect=detect)
+    started: list[bool] = []
+    worker = threading.Thread(target=lambda: started.append(app._recording_started()))
+    worker.start()
+    assert entered.wait(timeout=1)
+
+    with app._lock:
+        assert app._recording_phase == RecordingPhase.STARTING
+    assert not app._recording_started()
+    assert not app._recording_stopped()
+
+    release.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert started == [True]
+
+
+def test_deactivate_during_blocking_t3_reservation_compensates(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.hotkey = None
+    app._input_health_stop = None
+    app._input_health_thread = None
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingBridge(Bridge):
+        def reserve_recording(self, recording_id: str) -> BridgeResult:
+            self.reserved.append(recording_id)
+            entered.set()
+            assert release.wait(timeout=1)
+            return self.result
+
+    app.t3_bridge = BlockingBridge()
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+    started: list[bool] = []
+    pipeline = app.pipeline
+    worker = threading.Thread(target=lambda: started.append(app._recording_started()))
+    worker.start()
+    assert entered.wait(timeout=1)
+
+    app._deactivate_input()
+    release.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert started == [False]
+    assert pipeline.cancelled == 1
+    assert app.t3_bridge.abandoned == app.t3_bridge.reserved
+    assert app._recording_phase == RecordingPhase.IDLE
+
+
+def test_quit_during_blocking_recorder_start_compensates(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.hotkey = None
+    app._input_health_stop = None
+    app._input_health_thread = None
+    app.overlay = SimpleNamespace(close=lambda: None)
+    app._finish_quit = lambda: None
+    entered = threading.Event()
+    release = threading.Event()
+
+    def start() -> bool:
+        entered.set()
+        assert release.wait(timeout=1)
+        app.recorder.recording = True
+        return True
+
+    app.recorder.start = start
+    started: list[bool] = []
+    pipeline = app.pipeline
+    worker = threading.Thread(target=lambda: started.append(app._recording_started()))
+    worker.start()
+    assert entered.wait(timeout=1)
+
+    app.quit()
+    release.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert started == [False]
+    assert pipeline.cancelled == 1
+    assert app._closing
+    assert app._recording_phase == RecordingPhase.IDLE
+
+
+def test_deactivate_after_start_commit_prevents_stale_success_publication(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.hotkey = None
+    app._input_health_stop = None
+    app._input_health_thread = None
+    pipeline = app.pipeline
+    original_commit = app._commit_recording_start
+
+    def commit_then_deactivate(*args: Any) -> bool:
+        committed = original_commit(*args)
+        assert committed
+        app._deactivate_input()
+        return committed
+
+    app._commit_recording_start = commit_then_deactivate
+
+    assert not app._recording_started()
+    assert app._recording_phase == RecordingPhase.IDLE
+    assert app.pipeline is None
+    assert app.recorder is None
+    assert pipeline.cancelled == 1
+    assert not any(update.get("recording") is True for update in app.status.updates)
+
+
+def test_blocking_recorder_stop_does_not_hold_application_lock(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.injector = SimpleNamespace(capture_destination=InjectionDestination.clipboard_only)
+    assert app._recording_started()
+    entered = threading.Event()
+    release = threading.Event()
+    original_stop = app.recorder.stop
+
+    def stop() -> np.ndarray:
+        entered.set()
+        assert release.wait(timeout=1)
+        return original_stop()
+
+    app.recorder.stop = stop
+    stopped: list[bool] = []
+    worker = threading.Thread(target=lambda: stopped.append(app._recording_stopped()))
+    worker.start()
+    assert entered.wait(timeout=1)
+
+    with app._lock:
+        assert app._recording_phase == RecordingPhase.STOPPING
+    assert not app._recording_started()
+
+    release.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert stopped == [True]
+
+
+@pytest.mark.parametrize(
+    "frontmost_kind",
+    [FrontmostApplicationKind.OTHER, FrontmostApplicationKind.T3_CODE],
+)
+def test_native_recording_calls_never_run_under_application_lock(
+    app_config: AppConfig,
+    frontmost_kind: FrontmostApplicationKind,
+) -> None:
+    app = make_recording_app(app_config)
+    lock = TrackingLock()
+    app._lock = lock
+
+    def assert_unlocked() -> None:
+        assert not lock.held_by_current_thread
+
+    class GuardedPipeline(RecordingPipeline):
+        def try_reserve(self) -> bool:
+            assert_unlocked()
+            return super().try_reserve()
+
+        def cancel_reservation(self) -> None:
+            assert_unlocked()
+            super().cancel_reservation()
+
+        def submit_reserved(self, audio: np.ndarray, **kwargs: Any) -> int:
+            assert_unlocked()
+            return super().submit_reserved(audio, **kwargs)
+
+    class GuardedBridge(Bridge):
+        def reserve_recording(self, recording_id: str) -> BridgeResult:
+            assert_unlocked()
+            return super().reserve_recording(recording_id)
+
+        def abandon_recording(self, recording_id: str) -> None:
+            assert_unlocked()
+            super().abandon_recording(recording_id)
+
+    class GuardedRecorder(RecordingRecorder):
+        def start(self) -> bool:
+            assert_unlocked()
+            return super().start()
+
+        def stop(self) -> np.ndarray:
+            assert_unlocked()
+            return super().stop()
+
+    app.pipeline = GuardedPipeline()
+    app.t3_bridge = GuardedBridge()
+    app.recorder = GuardedRecorder()
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: assert_unlocked() or FrontmostApplication(frontmost_kind, "target.app")
+    )
+    app.injector = SimpleNamespace(
+        capture_destination=lambda: assert_unlocked() or InjectionDestination.clipboard_only()
+    )
+
+    assert app._recording_started()
+    assert app._recording_stopped()
+
+
+def test_recording_cannot_start_after_closing(app_config: AppConfig) -> None:
+    app = make_recording_app(app_config)
+    app._closing = True
+
+    assert not app._recording_started()
+    assert app._recording_phase == RecordingPhase.IDLE
+    assert app.pipeline.reservations == 0
 
 
 def test_stt_loading_is_independent_from_postprocess_preflight() -> None:

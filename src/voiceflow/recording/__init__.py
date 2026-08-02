@@ -1,6 +1,7 @@
 from voiceflow.recording.contracts import (
     AccessibilityAtStop,
     CapturedSubmission,
+    RecordingPhase,
     StopDisposition,
     StopResult,
 )
@@ -11,6 +12,7 @@ __all__ = [
     "AccessibilityAtStop",
     "CapturedSubmission",
     "RecordingLease",
+    "RecordingPhase",
     "RecordingStopCoordinator",
     "StopDisposition",
     "StopResult",

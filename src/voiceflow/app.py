@@ -6,6 +6,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO, Any
@@ -34,6 +35,7 @@ from voiceflow.recording import (
     AccessibilityAtStop,
     CapturedSubmission,
     RecordingLease,
+    RecordingPhase,
     RecordingStopCoordinator,
     StopDisposition,
     StopResult,
@@ -52,6 +54,26 @@ from voiceflow.ui.status_controller import StatusController
 LOGGER = logging.getLogger(__name__)
 APP_NAME = "VoiceBud"
 INPUT_HEALTH_CHECK_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordingStart:
+    pipeline: DictationPipeline
+    recorder: Recorder
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRecording:
+    lease: RecordingLease
+    destination: DictationDestination | AccessibilityAtStop
+    target_app: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordingStop:
+    recorder: Recorder
+    lease: RecordingLease
+    destination: DictationDestination | AccessibilityAtStop
 
 
 class AlreadyRunningError(RuntimeError):
@@ -159,7 +181,7 @@ class VoiceBudApplication:
         self._loading = False
         self._postprocess_loading = False
         self._closing = False
-        self._recording_reserved = False
+        self._recording_phase = RecordingPhase.IDLE
         self._recording_destination: DictationDestination | AccessibilityAtStop | None = None
         self._recording_lease: RecordingLease | None = None
         self._input_health_stop: threading.Event | None = None
@@ -405,14 +427,48 @@ class VoiceBudApplication:
 
     def _is_recording(self) -> bool:
         with self._lock:
-            recorder = self.recorder
-            return bool(self._recording_reserved and recorder is not None and recorder.recording)
+            return self._recording_phase == RecordingPhase.RECORDING
 
     def _recording_submission_allowed(self) -> bool:
         with self._lock:
-            return not self._closing
+            return not self._closing and self._recording_phase == RecordingPhase.STOPPING
 
     def _recording_started(self) -> bool:
+        start = self._begin_recording_start()
+        if start is None:
+            return False
+        lease = RecordingLease.try_reserve(start.pipeline, self.t3_bridge)
+        if lease is None:
+            self._cancel_recording_start(start)
+            self.status.transient("Coda piena — registrazione non avviata", error=True)
+            return False
+        prepared = self._prepare_recording_start(lease)
+        if prepared is None:
+            self._abort_recording_start(start, lease)
+            return False
+        try:
+            started = start.recorder.start()
+        except Exception as exc:
+            self._abort_recording_start(start, lease)
+            LOGGER.exception("Cannot start audio input")
+            self._audio_status(str(exc))
+            return False
+        if not started:
+            self._abort_recording_start(start, lease)
+            return False
+        if not self._commit_recording_start(start, prepared):
+            self._abort_recording_start(start, lease, stop_recorder=True)
+            return False
+        if not self._recording_start_is_current(start, prepared):
+            return False
+        self.status.update(recording=True)
+        self._log_recording_started(start.recorder, prepared)
+        if not self._recording_start_is_current(start, prepared):
+            self.status.update(recording=False)
+            return False
+        return True
+
+    def _begin_recording_start(self) -> _RecordingStart | None:
         with self._lock:
             pipeline = self.pipeline
             recorder = self.recorder
@@ -423,107 +479,173 @@ class VoiceBudApplication:
                 or recorder is None
                 or state.model != ModelState.READY
                 or state.system != SystemState.READY
-                or self._recording_reserved
+                or self._recording_phase != RecordingPhase.IDLE
             ):
-                return False
-            lease = RecordingLease.try_reserve(pipeline, self.t3_bridge)
-            if lease is None:
-                self.status.transient("Coda piena — registrazione non avviata", error=True)
-                return False
-            try:
-                frontmost = self.frontmost_detector.detect()
-            except Exception as exc:
-                log_event(
-                    LOGGER,
-                    logging.ERROR,
-                    "destination.detection_failed",
-                    "Frontmost application detection failed",
-                    host_platform="macos",
-                    operation="destination_detection",
-                    exc_info=True,
-                    **exception_fields(exc),
-                )
-                frontmost = None
-            if frontmost is None or frontmost.kind == FrontmostApplicationKind.UNAVAILABLE:
-                log_event(
-                    LOGGER,
-                    logging.WARNING,
-                    "destination.unavailable",
-                    "Recording was not started because the destination is unknown",
-                    host_platform="macos",
-                    target_platform="unknown",
-                    operation="destination_detection",
-                )
-                lease.abort()
-                self._recording_destination = None
-                self.status.transient(
-                    "Impossibile determinare in modo sicuro l’app in primo piano",
-                    error=True,
-                )
-                return False
-            if frontmost.kind == FrontmostApplicationKind.T3_CODE:
-                recording_id = str(uuid.uuid4())
-                reservation = self.t3_bridge.reserve_recording(recording_id)
-                if reservation.outcome != BridgeOutcome.ACCEPTED:
-                    log_event(
-                        LOGGER,
-                        logging.WARNING,
-                        "integration.t3.reservation_rejected",
-                        "T3 Code recording reservation failed",
-                        host_platform="macos",
-                        target_platform="t3_code",
-                        operation="integration",
-                        integration_outcome=reservation.outcome,
-                        error_code=reservation.error_code,
-                        remote_code=getattr(reservation, "remote_code", None),
-                    )
-                    lease.abort()
-                    self._recording_destination = None
-                    self.status.transient(
-                        reservation.message or "Impossibile riservare la dettatura in T3 Code",
-                        error=True,
-                    )
-                    return False
-                lease.attach_t3(recording_id)
-                destination: DictationDestination | AccessibilityAtStop = T3CodeDestination(
-                    recording_id
-                )
-            else:
-                destination = AccessibilityAtStop.REQUIRED
-            try:
-                started = recorder.start()
-            except Exception as exc:
-                lease.abort()
-                self._recording_destination = None
-                LOGGER.exception("Cannot start audio input")
-                self._audio_status(str(exc))
-                return False
-            if not started:
-                lease.abort()
-                self._recording_destination = None
-                return False
-            self._recording_reserved = True
-            self._recording_destination = destination
-            self._recording_lease = lease
-            self.status.update(recording=True)
+                return None
+            self._recording_phase = RecordingPhase.STARTING
+            return _RecordingStart(pipeline, recorder)
+
+    def _prepare_recording_start(self, lease: RecordingLease) -> _PreparedRecording | None:
+        try:
+            frontmost = self.frontmost_detector.detect()
+        except Exception as exc:
             log_event(
                 LOGGER,
-                logging.DEBUG,
-                "recording.started",
-                "Recording started",
+                logging.ERROR,
+                "destination.detection_failed",
+                "Frontmost application detection failed",
                 host_platform="macos",
-                target_platform=(
-                    "t3_code" if isinstance(destination, T3CodeDestination) else "focused_input"
-                ),
-                target_app=frontmost.bundle_identifier or "unknown",
-                operation=(
-                    "integration" if isinstance(destination, T3CodeDestination) else "input_write"
-                ),
-                input_device=recorder.device_name,
+                operation="destination_detection",
+                exc_info=True,
+                **exception_fields(exc),
             )
+            frontmost = None
+        if frontmost is None or frontmost.kind == FrontmostApplicationKind.UNAVAILABLE:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "destination.unavailable",
+                "Recording was not started because the destination is unknown",
+                host_platform="macos",
+                target_platform="unknown",
+                operation="destination_detection",
+            )
+            self.status.transient(
+                "Impossibile determinare in modo sicuro l’app in primo piano",
+                error=True,
+            )
+            return None
+        if frontmost.kind != FrontmostApplicationKind.T3_CODE:
+            return _PreparedRecording(
+                lease,
+                AccessibilityAtStop.REQUIRED,
+                frontmost.bundle_identifier or "unknown",
+            )
+        recording_id = str(uuid.uuid4())
+        reservation = self.t3_bridge.reserve_recording(recording_id)
+        if reservation.outcome != BridgeOutcome.ACCEPTED:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "integration.t3.reservation_rejected",
+                "T3 Code recording reservation failed",
+                host_platform="macos",
+                target_platform="t3_code",
+                operation="integration",
+                integration_outcome=reservation.outcome,
+                error_code=reservation.error_code,
+                remote_code=getattr(reservation, "remote_code", None),
+            )
+            self.status.transient(
+                reservation.message or "Impossibile riservare la dettatura in T3 Code",
+                error=True,
+            )
+            return None
+        lease.attach_t3(recording_id)
+        return _PreparedRecording(
+            lease,
+            T3CodeDestination(recording_id),
+            frontmost.bundle_identifier or "unknown",
+        )
+
+    def _commit_recording_start(
+        self,
+        start: _RecordingStart,
+        prepared: _PreparedRecording,
+    ) -> bool:
+        with self._lock:
+            if (
+                self._closing
+                or self._recording_phase != RecordingPhase.STARTING
+                or self.pipeline is not start.pipeline
+                or self.recorder is not start.recorder
+            ):
+                return False
+            self._recording_phase = RecordingPhase.RECORDING
+            self._recording_destination = prepared.destination
+            self._recording_lease = prepared.lease
             return True
 
+    def _abort_recording_start(
+        self,
+        start: _RecordingStart,
+        lease: RecordingLease,
+        *,
+        stop_recorder: bool = False,
+    ) -> None:
+        if stop_recorder:
+            with suppress(Exception):
+                start.recorder.stop()
+        with suppress(Exception):
+            lease.abort()
+        self._cancel_recording_start(start)
+
+    def _recording_start_is_current(
+        self,
+        start: _RecordingStart,
+        prepared: _PreparedRecording,
+    ) -> bool:
+        with self._lock:
+            return (
+                not self._closing
+                and self._recording_phase == RecordingPhase.RECORDING
+                and self.pipeline is start.pipeline
+                and self.recorder is start.recorder
+                and self._recording_lease is prepared.lease
+            )
+
+    def _cancel_recording_start(self, start: _RecordingStart) -> None:
+        with self._lock:
+            if (
+                self._recording_phase == RecordingPhase.STARTING
+                and self.pipeline is start.pipeline
+                and self.recorder is start.recorder
+            ):
+                self._recording_phase = RecordingPhase.IDLE
+
+    def _log_recording_started(
+        self,
+        recorder: Recorder,
+        prepared: _PreparedRecording,
+    ) -> None:
+        destination = prepared.destination
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "recording.started",
+            "Recording started",
+            host_platform="macos",
+            target_platform=(
+                "t3_code" if isinstance(destination, T3CodeDestination) else "focused_input"
+            ),
+            target_app=prepared.target_app,
+            operation=(
+                "integration" if isinstance(destination, T3CodeDestination) else "input_write"
+            ),
+            input_device=recorder.device_name,
+        )
+
     def _recording_stopped(self) -> bool:
+        stop = self._begin_recording_stop()
+        if stop is None:
+            return False
+        try:
+            audio = stop.recorder.stop()
+        except Exception:
+            with suppress(Exception):
+                stop.lease.abort()
+            self._finish_recording_stop(stop)
+            self.status.update(recording=False)
+            LOGGER.exception("Cannot stop audio input")
+            self.status.transient("Arresto della registrazione non riuscito", error=True)
+            return False
+        self.status.update(recording=False)
+        captured = self._captured_submission(stop, audio)
+        result = self.recording_stop_coordinator.submit(captured, stop.lease)
+        self._finish_recording_stop(stop)
+        return self._present_stop_result(result, captured)
+
+    def _begin_recording_stop(self) -> _RecordingStop | None:
         with self._lock:
             recorder = self.recorder
             lease = self._recording_lease
@@ -531,28 +653,20 @@ class VoiceBudApplication:
                 self._closing
                 or self.pipeline is None
                 or recorder is None
-                or not recorder.recording
-                or not self._recording_reserved
+                or self._recording_phase != RecordingPhase.RECORDING
                 or self._recording_destination is None
                 or lease is None
             ):
-                return False
-            recording_destination = self._recording_destination
-            try:
-                audio = recorder.stop()
-            except Exception:
-                self._recording_reserved = False
-                self._recording_destination = None
-                self._recording_lease = None
-                with suppress(Exception):
-                    lease.abort()
-                self.status.update(recording=False)
-                LOGGER.exception("Cannot stop audio input")
-                self.status.transient("Arresto della registrazione non riuscito", error=True)
-                return False
-            self._recording_reserved = False
-            self._recording_destination = None
-            self.status.update(recording=False)
+                return None
+            self._recording_phase = RecordingPhase.STOPPING
+            return _RecordingStop(recorder, lease, self._recording_destination)
+
+    def _captured_submission(
+        self,
+        stop: _RecordingStop,
+        audio: Any,
+    ) -> CapturedSubmission:
+        recorder = stop.recorder
         LOGGER.debug(
             "Captured %.2fs from %s (rms=%.5f, peak=%.5f)",
             recorder.last_duration,
@@ -560,19 +674,22 @@ class VoiceBudApplication:
             recorder.last_rms,
             recorder.last_peak,
         )
-        captured = CapturedSubmission(
+        return CapturedSubmission(
             audio=audio,
             sample_rate=recorder.sample_rate,
             duration_seconds=recorder.last_duration,
             rms=recorder.last_rms,
             peak=recorder.last_peak,
-            recording_destination=recording_destination,
+            recording_destination=stop.destination,
         )
-        result = self.recording_stop_coordinator.submit(captured, lease)
+
+    def _finish_recording_stop(self, stop: _RecordingStop) -> None:
         with self._lock:
-            if self._recording_lease is lease:
+            if self._recording_lease is stop.lease:
                 self._recording_lease = None
-        return self._present_stop_result(result, captured)
+                self._recording_destination = None
+            if self._recording_phase == RecordingPhase.STOPPING:
+                self._recording_phase = RecordingPhase.IDLE
 
     def _present_stop_result(self, result: StopResult, captured: CapturedSubmission) -> bool:
         destination = result.destination
@@ -865,7 +982,7 @@ class VoiceBudApplication:
         if self.pipeline is not None:
             if self.status.state.system != SystemState.ERROR:
                 return
-            active_jobs = self.pipeline.pending - int(self._recording_reserved)
+            active_jobs = self.pipeline.pending - int(self._recording_lease is not None)
             if active_jobs > 0:
                 self.status.transient(
                     "Attendi il completamento dell’elaborazione prima di riattivare l’ingresso",
@@ -894,21 +1011,27 @@ class VoiceBudApplication:
 
     def _deactivate_input(self) -> None:
         self._stop_input_health_monitor()
-        hotkey, recorder, pipeline = self.hotkey, self.recorder, self.pipeline
-        self.hotkey = None
-        self.recorder = None
-        self.pipeline = None
+        with self._lock:
+            hotkey, recorder, pipeline = self.hotkey, self.recorder, self.pipeline
+            lease = self._recording_lease
+            phase = self._recording_phase
+            self.hotkey = None
+            self.recorder = None
+            self.pipeline = None
+            self._recording_lease = None
+            self._recording_destination = None
+            self._recording_phase = RecordingPhase.IDLE
         if hotkey is not None:
             hotkey.stop()
         if recorder is not None:
-            if recorder.recording:
+            if phase != RecordingPhase.STOPPING and recorder.recording:
                 with suppress(Exception):
                     recorder.stop()
             with suppress(Exception):
                 recorder.close()
-        self._abort_current_recording_lease()
-        self._recording_reserved = False
-        self._recording_destination = None
+        if lease is not None:
+            with suppress(Exception):
+                lease.abort()
         if pipeline is not None:
             pipeline.shutdown(
                 close_postprocessor=False,
@@ -926,19 +1049,26 @@ class VoiceBudApplication:
             if self._closing:
                 return
             self._closing = True
+            hotkey = self.hotkey
+            recorder = self.recorder
+            lease = self._recording_lease
+            phase = self._recording_phase
+            self._recording_lease = None
+            self._recording_destination = None
+            self._recording_phase = RecordingPhase.IDLE
         self._stop_input_health_monitor()
         self.status.update(activity=ActivityState.STOPPING)
-        if self.hotkey is not None:
-            self.hotkey.stop()
-        if self.recorder is not None and self.recorder.recording:
+        if hotkey is not None:
+            hotkey.stop()
+        if recorder is not None and phase != RecordingPhase.STOPPING and recorder.recording:
             with suppress(Exception):
-                self.recorder.stop()
-        self._abort_current_recording_lease()
-        self._recording_reserved = False
-        self._recording_destination = None
-        if self.recorder is not None:
+                recorder.stop()
+        if lease is not None:
             with suppress(Exception):
-                self.recorder.close()
+                lease.abort()
+        if recorder is not None:
+            with suppress(Exception):
+                recorder.close()
         self.status.close()
         self.overlay.close()
         threading.Thread(
@@ -965,13 +1095,6 @@ class VoiceBudApplication:
                 with suppress(Exception):
                     storage.close()
             self._app_helper.callAfter(self._app_helper.stopEventLoop)
-
-    def _abort_current_recording_lease(self) -> None:
-        lease = getattr(self, "_recording_lease", None)
-        self._recording_lease = None
-        if lease is not None:
-            with suppress(Exception):
-                lease.abort()
 
 
 def run(config_path: str | None = None, *, debug: bool = False) -> int:

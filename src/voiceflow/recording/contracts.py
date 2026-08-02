@@ -12,6 +12,13 @@ class AccessibilityAtStop(StrEnum):
     REQUIRED = "accessibility_at_stop"
 
 
+class RecordingPhase(StrEnum):
+    IDLE = "idle"
+    STARTING = "starting"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+
+
 @dataclass(frozen=True, slots=True)
 class CapturedSubmission:
     audio: np.ndarray
