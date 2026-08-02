@@ -17,6 +17,7 @@
     "src/voiceflow/storage/contracts.py",
     "src/voiceflow/storage/database.py",
     "src/voiceflow/storage/history.py",
+    "src/voiceflow/dictionary/resilient.py",
     "src/voiceflow/dictionary/service.py"
   ]
 }

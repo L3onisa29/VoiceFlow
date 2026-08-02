@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Callable
 
-from voiceflow.dictionary.service import DictionaryService
+from voiceflow.dictionary.resilient import ResilientDictionary
 from voiceflow.normalization.contracts import (
     NormalizationOperation,
     NormalizationRequest,
@@ -13,7 +12,6 @@ from voiceflow.normalization.contracts import (
 )
 
 BACKTRACK_CUES = ("anzi", "no aspetta", "mi correggo", "correzione", "volevo dire")
-LOGGER = logging.getLogger(__name__)
 FILLERS = frozenset({"cioè", "ehm", "uhm", "diciamo"})
 DIGITS = {
     "zero": "0",
@@ -49,7 +47,7 @@ SMALL_NUMBERS = {
 
 
 class DeterministicNormalizer:
-    def __init__(self, dictionary: DictionaryService | None = None) -> None:
+    def __init__(self, dictionary: ResilientDictionary | None = None) -> None:
         self.dictionary = dictionary
 
     def normalize(self, request: NormalizationRequest) -> NormalizationResult:
@@ -57,27 +55,22 @@ class DeterministicNormalizer:
         operations: list[NormalizationOperation] = []
         signals = self._signals(text, backtrack=request.backtrack)
         if self.dictionary is not None:
-            try:
-                replaced, dictionary_operations = self.dictionary.replace(
-                    text,
-                    language=request.language,
-                    app_bundle_id=request.app_bundle_id,
+            replaced, dictionary_operations = self.dictionary.replace(
+                text,
+                language=request.language,
+                app_bundle_id=request.app_bundle_id,
+            )
+            operations.extend(
+                NormalizationOperation(
+                    "dictionary_replacement",
+                    operation.source,
+                    operation.replacement,
+                    operation.start,
+                    operation.end,
                 )
-            except Exception:
-                self.dictionary.enabled = False
-                LOGGER.exception("Dictionary disabled after a local storage failure")
-            else:
-                operations.extend(
-                    NormalizationOperation(
-                        "dictionary_replacement",
-                        operation.source,
-                        operation.replacement,
-                        operation.start,
-                        operation.end,
-                    )
-                    for operation in dictionary_operations
-                )
-                text = replaced
+                for operation in dictionary_operations
+            )
+            text = replaced
         if request.spoken_punctuation:
             text = self._spoken_punctuation(text, operations)
         if request.explicit_lists:

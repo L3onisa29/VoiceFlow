@@ -16,7 +16,7 @@ from voiceflow.audio.release import AudioReleaseCoordinator
 from voiceflow.config import AppConfig, load_config
 from voiceflow.correction import CorrectionService, propose_replacement, word_diff
 from voiceflow.diagnostics import BackgroundLogWriter, exception_fields, log_event
-from voiceflow.dictionary import DictionaryKind, DictionaryService
+from voiceflow.dictionary import DictionaryKind, DictionaryService, ResilientDictionary
 from voiceflow.dictionary.app_scope import AppBundleResolver
 from voiceflow.feedback import RecentAudioBuffer
 from voiceflow.integrations import (
@@ -240,6 +240,7 @@ class VoiceBudApplication:
         self.frontmost_detector = MacOSFrontmostApplicationDetector()
         self.storage: VoiceBudStorage | None = None
         self.dictionary: DictionaryService | None = None
+        self.resilient_dictionary: ResilientDictionary | None = None
         storage_failed = False
         try:
             self.storage = VoiceBudStorage(
@@ -248,6 +249,11 @@ class VoiceBudApplication:
             )
             if config.dictionary.enabled:
                 self.dictionary = DictionaryService(self.storage)
+                self.resilient_dictionary = ResilientDictionary(
+                    self.dictionary,
+                    notifier=lambda message: self.status.transient(message, error=True),
+                    logger=LOGGER,
+                )
         except Exception:
             storage_failed = True
             LOGGER.exception("Optional local storage initialization failed")
@@ -270,7 +276,7 @@ class VoiceBudApplication:
             ),
             submission_allowed=self._recording_submission_allowed,
         )
-        self.normalizer = DeterministicNormalizer(self.dictionary)
+        self.normalizer = DeterministicNormalizer(self.resilient_dictionary)
         self.postprocess_router = PostprocessRouter(self.postprocessor, config.postprocess.routing)
         self.status.update(
             system=SystemState.CHECKING,
@@ -755,21 +761,12 @@ class VoiceBudApplication:
         return True
 
     def _preferred_terms(self, language: str | None, app_bundle_id: str | None) -> tuple[str, ...]:
-        if self.dictionary is None:
+        if self.resilient_dictionary is None:
             return ()
-        try:
-            return self.dictionary.preferred_terms(
-                language=language,
-                app_bundle_id=app_bundle_id,
-            )
-        except Exception:
-            self.dictionary.enabled = False
-            LOGGER.exception("Dictionary disabled after a local storage failure")
-            self.status.transient(
-                "Dizionario non disponibile — dettatura ancora attiva",
-                error=True,
-            )
-            return ()
+        return self.resilient_dictionary.preferred_terms(
+            language=language,
+            app_bundle_id=app_bundle_id,
+        )
 
     def request_deep_cleanup(self) -> None:
         pipeline = self.pipeline
@@ -840,7 +837,7 @@ class VoiceBudApplication:
         self.status.transient("Correzione salvata")
 
     def add_term(self) -> None:
-        if self.dictionary is None or not self.dictionary.enabled:
+        if self.dictionary is None:
             self.status.transient("Dizionario non disponibile", error=True)
             return
         from voiceflow.ui.correction_panel import confirm, prompt_term

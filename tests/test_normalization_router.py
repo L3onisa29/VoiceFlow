@@ -6,6 +6,7 @@ import pytest
 
 from voiceflow.benchmarking import percentile
 from voiceflow.config import RoutingConfig
+from voiceflow.dictionary import ResilientDictionary
 from voiceflow.normalization import DeterministicNormalizer, NormalizationRequest
 from voiceflow.postprocess import PostprocessRequest, PostprocessResult
 from voiceflow.postprocess.base import validate_provider_payload
@@ -57,7 +58,8 @@ def test_dictionary_failure_degrades_to_rules_without_losing_text() -> None:
         def replace(self, *_args, **_kwargs):
             raise OSError("database unavailable")
 
-    dictionary = BrokenDictionary()
+    reader = BrokenDictionary()
+    dictionary = ResilientDictionary(reader, notifier=lambda _message: None)
     result = DeterministicNormalizer(dictionary).normalize(NormalizationRequest("ciao punto"))
     assert result.text == "ciao."
     assert not dictionary.enabled
