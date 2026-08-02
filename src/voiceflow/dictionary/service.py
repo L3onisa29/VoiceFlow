@@ -10,13 +10,13 @@ from voiceflow.dictionary.models import (
     DictionaryKind,
     DictionaryOperation,
 )
-from voiceflow.storage.database import VoiceBudStorage
+from voiceflow.storage.contracts import DictionaryEntryRecord, DictionaryRepository
 
 
 class DictionaryService:
     def __init__(
         self,
-        storage: VoiceBudStorage,
+        storage: DictionaryRepository,
         *,
         enabled: bool = True,
         clock: Callable[[], float] = time.time,
@@ -30,19 +30,19 @@ class DictionaryService:
             return ()
         return tuple(
             DictionaryEntry(
-                identifier=row["id"],
-                kind=DictionaryKind(row["kind"]),
-                spoken_form=row["spoken_form"],
-                written_form=row["written_form"],
-                language=row["language"],
-                app_bundle_id=row["app_bundle_id"],
-                priority=row["priority"],
-                enabled=bool(row["enabled"]),
-                use_count=row["use_count"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
+                identifier=record.identifier,
+                kind=record.kind,
+                spoken_form=record.spoken_form,
+                written_form=record.written_form,
+                language=record.language,
+                app_bundle_id=record.app_bundle_id,
+                priority=record.priority,
+                enabled=record.enabled,
+                use_count=record.use_count,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
             )
-            for row in self.storage.dictionary_rows()
+            for record in self.storage.dictionary_entries()
         )
 
     def add(
@@ -74,18 +74,18 @@ class DictionaryService:
             updated_at=now,
         )
         self.storage.add_dictionary_entry(
-            (
-                entry.identifier,
-                entry.kind.value,
-                entry.spoken_form,
-                entry.written_form,
-                entry.language,
-                entry.app_bundle_id,
-                entry.priority,
-                int(entry.enabled),
-                entry.use_count,
-                entry.created_at,
-                entry.updated_at,
+            DictionaryEntryRecord(
+                identifier=entry.identifier,
+                kind=entry.kind,
+                spoken_form=entry.spoken_form,
+                written_form=entry.written_form,
+                language=entry.language,
+                app_bundle_id=entry.app_bundle_id,
+                priority=entry.priority,
+                enabled=entry.enabled,
+                use_count=entry.use_count,
+                created_at=entry.created_at,
+                updated_at=entry.updated_at,
             )
         )
         return entry

@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from voiceflow.config import HistoryConfig
+from voiceflow.dictionary.models import DictionaryKind
+from voiceflow.processing import DeliveryStatus, PostprocessRoute, RouteReason
+from voiceflow.storage.contracts import DictionaryEntryRecord, TranscriptionRecord
 
 SCHEMA_VERSION = 1
 MIGRATIONS: dict[int, tuple[str, ...]] = {
@@ -142,7 +145,7 @@ class VoiceBudStorage:
                 raise RuntimeError("Storage is closed")
             return list(self._connection.execute(sql, parameters))
 
-    def add_dictionary_entry(self, values: Sequence[Any]) -> None:
+    def add_dictionary_entry(self, record: DictionaryEntryRecord) -> None:
         self.execute(
             """
             INSERT INTO dictionary_entries (
@@ -150,17 +153,45 @@ class VoiceBudStorage:
                 priority, enabled, use_count, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            values,
+            (
+                record.identifier,
+                record.kind.value,
+                record.spoken_form,
+                record.written_form,
+                record.language,
+                record.app_bundle_id,
+                record.priority,
+                int(record.enabled),
+                record.use_count,
+                record.created_at,
+                record.updated_at,
+            ),
         )
 
-    def dictionary_rows(self) -> list[sqlite3.Row]:
-        return self.query(
+    def dictionary_entries(self) -> tuple[DictionaryEntryRecord, ...]:
+        rows = self.query(
             """
             SELECT id, kind, spoken_form, written_form, language, app_bundle_id,
                    priority, enabled, use_count, created_at, updated_at
             FROM dictionary_entries
             ORDER BY created_at, id
             """
+        )
+        return tuple(
+            DictionaryEntryRecord(
+                identifier=row["id"],
+                kind=DictionaryKind(row["kind"]),
+                spoken_form=row["spoken_form"],
+                written_form=row["written_form"],
+                language=row["language"],
+                app_bundle_id=row["app_bundle_id"],
+                priority=row["priority"],
+                enabled=bool(row["enabled"]),
+                use_count=row["use_count"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
         )
 
     def increment_dictionary_usage(self, identifiers: Iterable[str]) -> None:
@@ -177,7 +208,7 @@ class VoiceBudStorage:
             (self._clock(), *ids),
         )
 
-    def save_transcription(self, values: Sequence[Any]) -> None:
+    def save_transcription(self, record: TranscriptionRecord) -> None:
         self.execute(
             """
             INSERT INTO transcriptions (
@@ -187,9 +218,67 @@ class VoiceBudStorage:
                 total_seconds, delivery_status, error_code, app_bundle_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            values,
+            (
+                record.identifier,
+                record.created_at,
+                record.raw_text,
+                record.normalized_text,
+                record.final_text,
+                record.corrected_text,
+                record.language,
+                record.route.value if record.route else None,
+                record.reason_code.value if record.reason_code else None,
+                record.fallback_code,
+                record.confidence_proxy,
+                record.audio_seconds,
+                record.stt_seconds,
+                record.normalization_seconds,
+                record.postprocess_seconds,
+                record.total_seconds,
+                record.delivery_status.value,
+                record.error_code,
+                record.app_bundle_id,
+            ),
         )
         self.prune_history()
+
+    def transcription_records(self) -> tuple[TranscriptionRecord, ...]:
+        rows = self.query(
+            """
+            SELECT id, created_at, raw_text, normalized_text, final_text, corrected_text,
+                   language, route, reason_code, fallback_code, confidence_proxy,
+                   audio_seconds, stt_seconds, normalization_seconds, postprocess_seconds,
+                   total_seconds, delivery_status, error_code, app_bundle_id
+            FROM transcriptions
+            ORDER BY created_at DESC, id DESC
+            """
+        )
+        return tuple(
+            TranscriptionRecord(
+                identifier=row["id"],
+                created_at=row["created_at"],
+                raw_text=row["raw_text"],
+                normalized_text=row["normalized_text"],
+                final_text=row["final_text"],
+                corrected_text=row["corrected_text"],
+                language=row["language"],
+                route=PostprocessRoute(row["route"]) if row["route"] is not None else None,
+                reason_code=(
+                    RouteReason(row["reason_code"]) if row["reason_code"] is not None else None
+                ),
+                fallback_code=row["fallback_code"],
+                confidence_proxy=row["confidence_proxy"],
+                audio_seconds=row["audio_seconds"],
+                stt_seconds=row["stt_seconds"],
+                normalization_seconds=row["normalization_seconds"],
+                postprocess_seconds=row["postprocess_seconds"],
+                total_seconds=row["total_seconds"],
+                delivery_status=DeliveryStatus(row["delivery_status"]),
+                error_code=row["error_code"],
+                app_bundle_id=row["app_bundle_id"],
+            )
+            for row in rows
+        )
 
     def prune_history(self) -> None:
         cutoff = self._clock() - self.history.retention_hours * 3600

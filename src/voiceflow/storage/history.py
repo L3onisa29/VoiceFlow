@@ -7,13 +7,13 @@ from uuid import uuid4
 
 from voiceflow.config import HistoryConfig
 from voiceflow.processing import PipelineOutcome
-from voiceflow.storage.database import VoiceBudStorage
+from voiceflow.storage.contracts import HistoryRepository, TranscriptionRecord
 
 
 class HistoryResultSink:
     def __init__(
         self,
-        storage: VoiceBudStorage | None,
+        storage: HistoryRepository | None,
         config: HistoryConfig,
         *,
         clock: Callable[[], float] = time.time,
@@ -37,26 +37,26 @@ class HistoryResultSink:
         trace = item.trace
         identifier = str(uuid4())
         self.storage.save_transcription(
-            (
-                identifier,
-                self._clock(),
-                item.raw_text,
-                item.normalized_text,
-                item.final_text,
-                None,
-                item.transcription.language,
-                trace.route.value if trace.route else None,
-                trace.reason.value if trace.reason else None,
-                trace.fallback_code,
-                item.transcription.confidence_proxy,
-                item.transcription.audio_duration_seconds,
-                trace.stt_seconds,
-                trace.normalization_seconds,
-                trace.postprocess_seconds,
-                trace.total_seconds,
-                outcome.delivery_status.value,
-                outcome.error_code,
-                item.app_bundle_id if self.config.store_app_bundle_id else None,
+            TranscriptionRecord(
+                identifier=identifier,
+                created_at=self._clock(),
+                raw_text=item.raw_text,
+                normalized_text=item.normalized_text,
+                final_text=item.final_text,
+                corrected_text=None,
+                language=item.transcription.language,
+                route=trace.route,
+                reason_code=trace.reason,
+                fallback_code=trace.fallback_code,
+                confidence_proxy=item.transcription.confidence_proxy,
+                audio_seconds=item.transcription.audio_duration_seconds,
+                stt_seconds=trace.stt_seconds,
+                normalization_seconds=trace.normalization_seconds,
+                postprocess_seconds=trace.postprocess_seconds,
+                total_seconds=trace.total_seconds,
+                delivery_status=outcome.delivery_status,
+                error_code=outcome.error_code,
+                app_bundle_id=(item.app_bundle_id if self.config.store_app_bundle_id else None),
             )
         )
         with self._lock:
