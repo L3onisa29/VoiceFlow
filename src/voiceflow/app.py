@@ -6,12 +6,10 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from enum import StrEnum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO, Any
 
-from voiceflow.audio.quality import capture_rejection_reason
 from voiceflow.audio.recorder import Recorder
 from voiceflow.config import AppConfig, load_config
 from voiceflow.correction import CorrectionService, propose_replacement, word_diff
@@ -20,7 +18,6 @@ from voiceflow.dictionary import DictionaryKind, DictionaryService
 from voiceflow.dictionary.app_scope import AppBundleResolver
 from voiceflow.feedback import RecentAudioBuffer
 from voiceflow.integrations import (
-    T3_CODE_BUNDLE_IDENTIFIER,
     BridgeOutcome,
     DictationDestination,
     FrontmostApplicationKind,
@@ -33,6 +30,14 @@ from voiceflow.pipeline import DictationPipeline
 from voiceflow.postprocess import create_postprocessor
 from voiceflow.postprocess.router import PostprocessRouter
 from voiceflow.processing import ProcessedDictation, ProcessingIntent
+from voiceflow.recording import (
+    AccessibilityAtStop,
+    CapturedSubmission,
+    RecordingLease,
+    RecordingStopCoordinator,
+    StopDisposition,
+    StopResult,
+)
 from voiceflow.state import ActivityState, ModelState, PostprocessState, SystemState
 from voiceflow.storage import HistoryResultSink, VoiceBudStorage
 from voiceflow.stt.parakeet import ParakeetTranscriber
@@ -47,10 +52,6 @@ from voiceflow.ui.status_controller import StatusController
 LOGGER = logging.getLogger(__name__)
 APP_NAME = "VoiceBud"
 INPUT_HEALTH_CHECK_SECONDS = 5.0
-
-
-class _RecordingDestinationState(StrEnum):
-    ACCESSIBILITY_AT_STOP = "accessibility_at_stop"
 
 
 class AlreadyRunningError(RuntimeError):
@@ -159,7 +160,8 @@ class VoiceBudApplication:
         self._postprocess_loading = False
         self._closing = False
         self._recording_reserved = False
-        self._recording_destination: DictationDestination | _RecordingDestinationState | None = None
+        self._recording_destination: DictationDestination | AccessibilityAtStop | None = None
+        self._recording_lease: RecordingLease | None = None
         self._input_health_stop: threading.Event | None = None
         self._input_health_thread: threading.Thread | None = None
         self.pipeline: DictationPipeline | None = None
@@ -229,6 +231,18 @@ class VoiceBudApplication:
             max_pending=config.pipeline.max_pending,
         )
         self.app_bundle_resolver = AppBundleResolver()
+        self.recording_stop_coordinator = RecordingStopCoordinator(
+            audio_config=config.audio,
+            device_name=lambda: self.recorder.device_name if self.recorder is not None else "audio",
+            capture_destination=lambda: self.injector.capture_destination(),
+            resolve_bundle_id=lambda pid: self.app_bundle_resolver.resolve(pid),
+            store_recent_audio=lambda identifier, audio, sample_rate: self.audio_feedback.store(
+                identifier,
+                audio,
+                sample_rate,
+            ),
+            submission_allowed=self._recording_submission_allowed,
+        )
         self.normalizer = DeterministicNormalizer(self.dictionary)
         self.postprocess_router = PostprocessRouter(self.postprocessor, config.postprocess.routing)
         self.status.update(
@@ -394,6 +408,10 @@ class VoiceBudApplication:
             recorder = self.recorder
             return bool(self._recording_reserved and recorder is not None and recorder.recording)
 
+    def _recording_submission_allowed(self) -> bool:
+        with self._lock:
+            return not self._closing
+
     def _recording_started(self) -> bool:
         with self._lock:
             pipeline = self.pipeline
@@ -408,7 +426,8 @@ class VoiceBudApplication:
                 or self._recording_reserved
             ):
                 return False
-            if not pipeline.try_reserve():
+            lease = RecordingLease.try_reserve(pipeline, self.t3_bridge)
+            if lease is None:
                 self.status.transient("Coda piena — registrazione non avviata", error=True)
                 return False
             try:
@@ -435,7 +454,7 @@ class VoiceBudApplication:
                     target_platform="unknown",
                     operation="destination_detection",
                 )
-                pipeline.cancel_reservation()
+                lease.abort()
                 self._recording_destination = None
                 self.status.transient(
                     "Impossibile determinare in modo sicuro l’app in primo piano",
@@ -458,36 +477,34 @@ class VoiceBudApplication:
                         error_code=reservation.error_code,
                         remote_code=getattr(reservation, "remote_code", None),
                     )
-                    pipeline.cancel_reservation()
+                    lease.abort()
                     self._recording_destination = None
                     self.status.transient(
                         reservation.message or "Impossibile riservare la dettatura in T3 Code",
                         error=True,
                     )
                     return False
-                destination: DictationDestination | _RecordingDestinationState = T3CodeDestination(
+                lease.attach_t3(recording_id)
+                destination: DictationDestination | AccessibilityAtStop = T3CodeDestination(
                     recording_id
                 )
             else:
-                destination = _RecordingDestinationState.ACCESSIBILITY_AT_STOP
+                destination = AccessibilityAtStop.REQUIRED
             try:
                 started = recorder.start()
             except Exception as exc:
-                pipeline.cancel_reservation()
-                if isinstance(destination, T3CodeDestination):
-                    self.t3_bridge.abandon_recording(destination.recording_id)
+                lease.abort()
                 self._recording_destination = None
                 LOGGER.exception("Cannot start audio input")
                 self._audio_status(str(exc))
                 return False
             if not started:
-                pipeline.cancel_reservation()
-                if isinstance(destination, T3CodeDestination):
-                    self.t3_bridge.abandon_recording(destination.recording_id)
+                lease.abort()
                 self._recording_destination = None
                 return False
             self._recording_reserved = True
             self._recording_destination = destination
+            self._recording_lease = lease
             self.status.update(recording=True)
             log_event(
                 LOGGER,
@@ -508,15 +525,16 @@ class VoiceBudApplication:
 
     def _recording_stopped(self) -> bool:
         with self._lock:
-            pipeline = self.pipeline
             recorder = self.recorder
+            lease = self._recording_lease
             if (
                 self._closing
-                or pipeline is None
+                or self.pipeline is None
                 or recorder is None
                 or not recorder.recording
                 or not self._recording_reserved
                 or self._recording_destination is None
+                or lease is None
             ):
                 return False
             recording_destination = self._recording_destination
@@ -525,9 +543,9 @@ class VoiceBudApplication:
             except Exception:
                 self._recording_reserved = False
                 self._recording_destination = None
-                pipeline.cancel_reservation()
-                if isinstance(recording_destination, T3CodeDestination):
-                    self.t3_bridge.abandon_recording(recording_destination.recording_id)
+                self._recording_lease = None
+                with suppress(Exception):
+                    lease.abort()
                 self.status.update(recording=False)
                 LOGGER.exception("Cannot stop audio input")
                 self.status.transient("Arresto della registrazione non riuscito", error=True)
@@ -542,13 +560,23 @@ class VoiceBudApplication:
             recorder.last_rms,
             recorder.last_peak,
         )
-        rejection = capture_rejection_reason(
+        captured = CapturedSubmission(
+            audio=audio,
+            sample_rate=recorder.sample_rate,
             duration_seconds=recorder.last_duration,
             rms=recorder.last_rms,
-            device_name=recorder.device_name,
-            config=self.config.audio,
+            peak=recorder.last_peak,
+            recording_destination=recording_destination,
         )
-        if rejection is not None:
+        result = self.recording_stop_coordinator.submit(captured, lease)
+        with self._lock:
+            if self._recording_lease is lease:
+                self._recording_lease = None
+        return self._present_stop_result(result, captured)
+
+    def _present_stop_result(self, result: StopResult, captured: CapturedSubmission) -> bool:
+        destination = result.destination
+        if result.disposition == StopDisposition.REJECTED:
             log_event(
                 LOGGER,
                 logging.WARNING,
@@ -556,101 +584,47 @@ class VoiceBudApplication:
                 "Captured audio was rejected",
                 host_platform="macos",
                 target_platform=(
-                    "t3_code"
-                    if isinstance(recording_destination, T3CodeDestination)
-                    else "focused_input"
+                    "t3_code" if isinstance(destination, T3CodeDestination) else "focused_input"
                 ),
                 operation=(
-                    "integration"
-                    if isinstance(recording_destination, T3CodeDestination)
-                    else "input_write"
+                    "integration" if isinstance(destination, T3CodeDestination) else "input_write"
                 ),
-                reason=rejection,
-                audio_seconds=recorder.last_duration,
-                rms=recorder.last_rms,
-                peak=recorder.last_peak,
+                reason=result.message,
+                audio_seconds=captured.duration_seconds,
+                rms=captured.rms,
+                peak=captured.peak,
             )
-            pipeline.cancel_reservation()
-            if isinstance(recording_destination, T3CodeDestination):
-                self.t3_bridge.abandon_recording(recording_destination.recording_id)
-            self.status.transient(rejection, error=True)
+            self.status.transient(result.message or "Registrazione rifiutata", error=True)
             return True
-        if isinstance(recording_destination, T3CodeDestination):
-            destination: DictationDestination = recording_destination
-        else:
-            try:
-                destination = self.injector.capture_destination()
-            except Exception as exc:
-                log_event(
-                    LOGGER,
-                    logging.WARNING,
-                    "destination.clipboard_fallback",
-                    "Focused input unavailable; clipboard fallback selected",
-                    host_platform="macos",
-                    target_platform="clipboard",
-                    operation="clipboard_write",
-                    **exception_fields(exc),
-                )
-                destination = InjectionDestination.clipboard_only()
-        app_bundle_id: str | None = (
-            T3_CODE_BUNDLE_IDENTIFIER if isinstance(destination, T3CodeDestination) else None
+        if result.disposition == StopDisposition.DISCARDED:
+            return False
+        if result.disposition == StopDisposition.FAILED:
+            self.status.transient(result.message or "Registrazione non accodata", error=True)
+            return True
+
+        assert destination is not None and result.sequence_id is not None
+        clipboard_only = (
+            isinstance(destination, InjectionDestination) and destination.uses_clipboard_only
         )
-        resolver = getattr(self, "app_bundle_resolver", None)
-        if (
-            isinstance(destination, InjectionDestination)
-            and destination.focus_target is not None
-            and resolver is not None
-        ):
-            try:
-                app_bundle_id = resolver.resolve(destination.focus_target.pid)
-            except Exception:
-                LOGGER.warning("Unable to resolve destination bundle identifier")
-        try:
-            with self._lock:
-                if self._closing:
-                    pipeline.cancel_reservation()
-                    if isinstance(destination, T3CodeDestination):
-                        self.t3_bridge.abandon_recording(destination.recording_id)
-                    return False
-                sequence_id = pipeline.submit_reserved(
-                    audio,
-                    destination=destination,
-                    sample_rate=recorder.sample_rate,
-                    app_bundle_id=app_bundle_id,
-                )
-                feedback = getattr(self, "audio_feedback", None)
-                if feedback is not None:
-                    feedback.store(str(sequence_id), audio, recorder.sample_rate)
-                log_event(
-                    LOGGER,
-                    logging.DEBUG,
-                    "recording.submitted",
-                    "Recording submitted for processing",
-                    job_id=sequence_id,
-                    host_platform="macos",
-                    target_platform=(
-                        "t3_code"
-                        if isinstance(destination, T3CodeDestination)
-                        else ("clipboard" if destination.uses_clipboard_only else "focused_input")
-                    ),
-                    target_app=app_bundle_id or "unknown",
-                    operation=(
-                        "integration"
-                        if isinstance(destination, T3CodeDestination)
-                        else (
-                            "clipboard_write" if destination.uses_clipboard_only else "input_write"
-                        )
-                    ),
-                )
-        except RuntimeError:
-            if isinstance(destination, T3CodeDestination):
-                self.t3_bridge.abandon_recording(destination.recording_id)
-            LOGGER.debug("Discarded recording during shutdown")
-        except Exception:
-            if isinstance(destination, T3CodeDestination):
-                self.t3_bridge.abandon_recording(destination.recording_id)
-            LOGGER.exception("Cannot enqueue captured recording")
-            self.status.transient("Registrazione non accodata", error=True)
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "recording.submitted",
+            "Recording submitted for processing",
+            job_id=result.sequence_id,
+            host_platform="macos",
+            target_platform=(
+                "t3_code"
+                if isinstance(destination, T3CodeDestination)
+                else ("clipboard" if clipboard_only else "focused_input")
+            ),
+            target_app=result.app_bundle_id or "unknown",
+            operation=(
+                "integration"
+                if isinstance(destination, T3CodeDestination)
+                else ("clipboard_write" if clipboard_only else "input_write")
+            ),
+        )
         return True
 
     def _preferred_terms(self, language: str | None, app_bundle_id: str | None) -> tuple[str, ...]:
@@ -932,9 +906,7 @@ class VoiceBudApplication:
                     recorder.stop()
             with suppress(Exception):
                 recorder.close()
-        if self._recording_reserved and pipeline is not None:
-            pipeline.cancel_reservation()
-        self._abandon_current_t3_recording()
+        self._abort_current_recording_lease()
         self._recording_reserved = False
         self._recording_destination = None
         if pipeline is not None:
@@ -961,9 +933,7 @@ class VoiceBudApplication:
         if self.recorder is not None and self.recorder.recording:
             with suppress(Exception):
                 self.recorder.stop()
-        if self._recording_reserved and self.pipeline is not None:
-            self.pipeline.cancel_reservation()
-        self._abandon_current_t3_recording()
+        self._abort_current_recording_lease()
         self._recording_reserved = False
         self._recording_destination = None
         if self.recorder is not None:
@@ -996,11 +966,12 @@ class VoiceBudApplication:
                     storage.close()
             self._app_helper.callAfter(self._app_helper.stopEventLoop)
 
-    def _abandon_current_t3_recording(self) -> None:
-        destination = getattr(self, "_recording_destination", None)
-        bridge = getattr(self, "t3_bridge", None)
-        if isinstance(destination, T3CodeDestination) and bridge is not None:
-            bridge.abandon_recording(destination.recording_id)
+    def _abort_current_recording_lease(self) -> None:
+        lease = getattr(self, "_recording_lease", None)
+        self._recording_lease = None
+        if lease is not None:
+            with suppress(Exception):
+                lease.abort()
 
 
 def run(config_path: str | None = None, *, debug: bool = False) -> int:

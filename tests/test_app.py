@@ -17,6 +17,7 @@ from voiceflow.integrations import (
     FrontmostApplicationKind,
     T3CodeDestination,
 )
+from voiceflow.recording import RecordingStopCoordinator
 from voiceflow.state import ActivityState, ModelState, SystemState
 from voiceflow.system.permissions import PermissionStatus
 from voiceflow.system.text_injector import FocusTarget, InjectionDestination
@@ -117,12 +118,20 @@ def make_recording_app(app_config: AppConfig) -> VoiceBudApplication:
     app._closing = False
     app._recording_reserved = False
     app._recording_destination = None
+    app._recording_lease = None
     app.pipeline = RecordingPipeline()
     app.recorder = RecordingRecorder()
     app.status = Status()
     app.t3_bridge = Bridge()
     app.frontmost_detector = SimpleNamespace(
         detect=lambda: FrontmostApplication(FrontmostApplicationKind.OTHER, "example.other")
+    )
+    app.recording_stop_coordinator = RecordingStopCoordinator(
+        audio_config=app_config.audio,
+        device_name=lambda: app.recorder.device_name,
+        capture_destination=lambda: app.injector.capture_destination(),
+        resolve_bundle_id=lambda pid: app.app_bundle_resolver.resolve(pid),
+        submission_allowed=lambda: not app._closing,
     )
     return app
 
@@ -266,7 +275,7 @@ def test_rejected_t3_audio_abandons_session(
         capture_destination=lambda: pytest.fail("must not capture Accessibility")
     )
     monkeypatch.setattr(
-        "voiceflow.app.capture_rejection_reason",
+        "voiceflow.recording.stop_coordinator.capture_rejection_reason",
         lambda **_kwargs: "Audio rifiutato",
     )
 
@@ -313,6 +322,53 @@ def test_shutdown_during_t3_recording_abandons_session(
     assert pipeline.cancelled == 1
     assert app.t3_bridge.abandoned == [recording_id]
     assert app._recording_destination is None
+
+
+def test_deactivate_between_submission_gate_and_commit_aborts_once(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.injector = SimpleNamespace(capture_destination=InjectionDestination.clipboard_only)
+    app.hotkey = None
+    app._input_health_stop = None
+    app._input_health_thread = None
+    assert app._recording_started()
+    owned_lease = app._recording_lease
+    assert owned_lease is not None
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+
+    class BarrierLease:
+        def __init__(self) -> None:
+            self.abort_calls = 0
+
+        def abort(self) -> None:
+            self.abort_calls += 1
+            owned_lease.abort()
+
+        def commit_submission(self, audio: np.ndarray, **kwargs: Any) -> int:
+            commit_entered.set()
+            assert release_commit.wait(timeout=1)
+            return owned_lease.commit_submission(audio, **kwargs)
+
+    barrier_lease = BarrierLease()
+    app_for_test: Any = app
+    app_for_test._recording_lease = barrier_lease
+    pipeline = app.pipeline
+    stopped: list[bool] = []
+    worker = threading.Thread(target=lambda: stopped.append(app._recording_stopped()))
+    worker.start()
+    assert commit_entered.wait(timeout=1)
+
+    app._deactivate_input()
+    release_commit.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert stopped == [False]
+    assert pipeline.submissions == []
+    assert pipeline.cancelled == 1
+    assert barrier_lease.abort_calls == 1
 
 
 def test_recording_state_is_shared_independently_from_display_context(
