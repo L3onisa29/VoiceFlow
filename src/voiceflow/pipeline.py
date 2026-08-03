@@ -82,7 +82,6 @@ class DictationPipeline:
         self.postprocessor = postprocessor
         self.injector = injector
         self.status = status
-        self.max_pending = max_pending
         self.shutdown_timeout_seconds = shutdown_timeout_seconds
         self.injection_timeout_seconds = injection_timeout_seconds
         self.result_sink = result_sink or NullPipelineResultSink()

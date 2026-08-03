@@ -9,6 +9,7 @@ import pytest
 
 from voiceflow.app import VoiceBudApplication
 from voiceflow.dictionary import (
+    DictionaryEntry,
     DictionaryKind,
     DictionaryOperation,
     DictionaryService,
@@ -16,7 +17,6 @@ from voiceflow.dictionary import (
 )
 from voiceflow.dictionary.resilient import DICTIONARY_UNAVAILABLE_MESSAGE
 from voiceflow.normalization import DeterministicNormalizer, NormalizationRequest
-from voiceflow.storage.contracts import DictionaryEntryRecord
 
 
 class Reader:
@@ -534,13 +534,13 @@ def test_normalizer_and_app_preferred_terms_share_one_resilient_boundary() -> No
 def test_dictionary_writes_remain_available_after_resilient_reads_disable() -> None:
     class Repository:
         def __init__(self) -> None:
-            self.added: list[DictionaryEntryRecord] = []
+            self.added: list[DictionaryEntry] = []
             self.read_calls = 0
 
-        def add_dictionary_entry(self, record: DictionaryEntryRecord) -> None:
+        def add_dictionary_entry(self, record: DictionaryEntry) -> None:
             self.added.append(record)
 
-        def dictionary_entries(self) -> tuple[DictionaryEntryRecord, ...]:
+        def dictionary_entries(self) -> tuple[DictionaryEntry, ...]:
             self.read_calls += 1
             raise OSError("database read failed")
 
@@ -561,7 +561,7 @@ def test_dictionary_writes_remain_available_after_resilient_reads_disable() -> N
     assert not resilient.enabled
     assert repository.read_calls == 1
     assert repository.added == [
-        DictionaryEntryRecord(
+        DictionaryEntry(
             identifier=added.identifier,
             kind=DictionaryKind.PREFERRED_TERM,
             spoken_form="voice bud",

@@ -72,11 +72,11 @@ def test_consumed_temporary_cleanup_failure_cannot_invalidate_committed_save(
     monkeypatch: pytest.MonkeyPatch,
     consumed_prefix: str,
 ) -> None:
-    import voiceflow.feedback as feedback
+    import voiceflow.storage.feedback_corpus as feedback_corpus
 
     buffer = RecentAudioBuffer()
     buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
-    original_replace = feedback.replace_private_file
+    original_replace = feedback_corpus.replace_private_file
     original_unlink = Path.unlink
     consumed: set[Path] = set()
 
@@ -90,7 +90,7 @@ def test_consumed_temporary_cleanup_failure_cannot_invalidate_committed_save(
             raise OSError("post-commit temporary cleanup failed")
         original_unlink(path, missing_ok=missing_ok)
 
-    monkeypatch.setattr(feedback, "replace_private_file", track_replacement)
+    monkeypatch.setattr(feedback_corpus, "replace_private_file", track_replacement)
     monkeypatch.setattr(Path, "unlink", fail_consumed_cleanup)
 
     output = buffer.save_confirmed(
@@ -120,7 +120,7 @@ def test_wav_permission_failure_cleans_temp_and_retains_buffer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import voiceflow.feedback as feedback
+    import voiceflow.storage.feedback_corpus as feedback_corpus
 
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"id":"existing"}\n', encoding="utf-8")
@@ -134,7 +134,7 @@ def test_wav_permission_failure_cleans_temp_and_retains_buffer(
         failed_descriptor = descriptor
         raise OSError("permission hardening failed")
 
-    monkeypatch.setattr(feedback, "restrict_open_file", fail_permission)
+    monkeypatch.setattr(feedback_corpus, "restrict_open_file", fail_permission)
 
     with pytest.raises(OSError, match="permission hardening failed"):
         buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
@@ -153,14 +153,14 @@ def test_manifest_permission_failure_rolls_back_wav_and_retains_buffer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import voiceflow.feedback as feedback
+    import voiceflow.storage.feedback_corpus as feedback_corpus
 
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text('{"id":"existing"}\n', encoding="utf-8")
     os.chmod(manifest, 0o644)
     buffer = RecentAudioBuffer()
     buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
-    original_restrict = feedback.restrict_open_file
+    original_restrict = feedback_corpus.restrict_open_file
     calls = 0
     failed_descriptor: int | None = None
 
@@ -172,7 +172,7 @@ def test_manifest_permission_failure_rolls_back_wav_and_retains_buffer(
             raise OSError("manifest hardening failed")
         original_restrict(descriptor)
 
-    monkeypatch.setattr(feedback, "restrict_open_file", fail_second_permission)
+    monkeypatch.setattr(feedback_corpus, "restrict_open_file", fail_second_permission)
 
     with pytest.raises(OSError, match="manifest hardening failed"):
         buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
@@ -370,9 +370,9 @@ def test_concurrent_confirmations_serialize_manifest_read_modify_replace(
     second_read = threading.Event()
     second_replaced = threading.Event()
     save_context = threading.local()
-    import voiceflow.feedback as feedback
+    import voiceflow.storage.feedback_corpus as feedback_corpus
 
-    original_read_text = feedback.read_managed_text_file
+    original_read_text = feedback_corpus.read_managed_text_file
     original_replace = os.replace
 
     def interleaved_read_text(path: Path) -> str:
@@ -407,7 +407,7 @@ def test_concurrent_confirmations_serialize_manifest_read_modify_replace(
         ):
             second_replaced.set()
 
-    monkeypatch.setattr(feedback, "read_managed_text_file", interleaved_read_text)
+    monkeypatch.setattr(feedback_corpus, "read_managed_text_file", interleaved_read_text)
     monkeypatch.setattr(os, "replace", tracked_replace)
 
     def save(name: str) -> Path | None:

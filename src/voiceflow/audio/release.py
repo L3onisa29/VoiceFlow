@@ -24,7 +24,6 @@ class AudioReleaseCoordinator:
         self._condition = threading.Condition()
         self._slots: set[object] = set()
         self._releasing: set[object] = set()
-        self._threads: set[threading.Thread] = set()
         self._closed = False
 
     @property
@@ -91,18 +90,16 @@ class AudioReleaseCoordinator:
                     except Exception:
                         LOGGER.exception("Failed to close audio input stream")
                 finally:
-                    self._finish_release(slot, threading.current_thread())
+                    self._finish_release(slot)
 
             thread = threading.Thread(
                 target=release_native,
                 name="voiceflow-audio-release",
                 daemon=True,
             )
-            self._threads.add(thread)
             try:
                 thread.start()
             except Exception:
-                self._threads.remove(thread)
                 self._releasing.remove(slot)
                 self._slots.remove(slot)
                 self._condition.notify_all()
@@ -121,9 +118,8 @@ class AudioReleaseCoordinator:
                     return
                 self._condition.wait(remaining)
 
-    def _finish_release(self, slot: object, thread: threading.Thread) -> None:
+    def _finish_release(self, slot: object) -> None:
         with self._condition:
-            self._threads.discard(thread)
             self._releasing.discard(slot)
             self._slots.discard(slot)
             self._condition.notify_all()

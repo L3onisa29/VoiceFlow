@@ -14,6 +14,7 @@
     "src/voiceflow/audio/release.py",
     "src/voiceflow/benchmarking.py",
     "src/voiceflow/feedback.py",
+    "src/voiceflow/storage/feedback_corpus.py",
     "src/voiceflow/storage/contracts.py",
     "src/voiceflow/storage/database.py",
     "src/voiceflow/storage/history.py",

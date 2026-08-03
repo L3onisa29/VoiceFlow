@@ -79,7 +79,7 @@ def test_normal_native_release_is_ordered_and_tracked() -> None:
     assert stream.calls == ["abort", "close"]
     assert coordinator.pending == 0
     assert not coordinator.saturated
-    assert coordinator._threads == set()
+    assert coordinator._releasing == set()
 
 
 def test_release_falls_back_to_stop_and_still_closes() -> None:
@@ -95,7 +95,7 @@ def test_release_falls_back_to_stop_and_still_closes() -> None:
     assert calls == ["stop", "close"]
 
 
-def test_blocked_abort_and_close_keep_exactly_two_slots_and_threads() -> None:
+def test_blocked_abort_and_close_keep_exactly_two_release_slots() -> None:
     abort_gate = threading.Event()
     close_gate = threading.Event()
     streams = [
@@ -114,8 +114,7 @@ def test_blocked_abort_and_close_keep_exactly_two_slots_and_threads() -> None:
 
     assert coordinator.pending == 2
     assert coordinator.saturated
-    assert len(coordinator._threads) == 2
-    assert all(thread.daemon for thread in coordinator._threads)
+    assert len(coordinator._releasing) == 2
 
     abort_gate.set()
     close_gate.set()
@@ -144,13 +143,13 @@ def test_saturation_rejects_third_recording_without_stream_or_thread() -> None:
     assert recorder.start()
     recorder.stop()
     assert streams[1].abort_entered.wait(timeout=1)
-    release_threads = set(coordinator._threads)
+    releasing = set(coordinator._releasing)
 
     assert not recorder.start()
 
     assert len(streams) == 2
-    assert coordinator._threads == release_threads
-    assert len(release_threads) == 2
+    assert coordinator._releasing == releasing
+    assert len(releasing) == 2
     assert coordinator.pending == 2
     assert coordinator.saturated
     assert messages == [SATURATION_MESSAGE]
@@ -190,7 +189,7 @@ def test_input_stream_construction_failure_immediately_returns_slot() -> None:
         recorder.start()
 
     assert coordinator.pending == 0
-    assert coordinator._threads == set()
+    assert coordinator._releasing == set()
 
 
 def test_stream_start_failure_releases_slot_after_native_cleanup() -> None:
@@ -287,7 +286,7 @@ def test_close_waits_for_a_release_only_until_it_completes() -> None:
     assert coordinator.pending == 0
 
 
-def test_duplicate_or_stale_release_requests_do_not_spawn_threads() -> None:
+def test_duplicate_or_stale_release_requests_are_ignored() -> None:
     gate = threading.Event()
     stream = NativeStream(abort_gate=gate)
     coordinator = AudioReleaseCoordinator()
@@ -295,14 +294,14 @@ def test_duplicate_or_stale_release_requests_do_not_spawn_threads() -> None:
     assert slot is not None
     coordinator.release(slot, stream)
     assert stream.abort_entered.wait(timeout=1)
-    threads = set(coordinator._threads)
+    releasing = set(coordinator._releasing)
 
     coordinator.release(slot, stream)
     coordinator.release(object(), NativeStream())
     coordinator.discard(object())
 
-    assert coordinator._threads == threads
-    assert len(threads) == 1
+    assert coordinator._releasing == releasing
+    assert len(releasing) == 1
     gate.set()
     coordinator.close(timeout=1)
 
@@ -348,7 +347,7 @@ def test_thread_start_failure_returns_the_slot(
         coordinator.release(slot, NativeStream())
 
     assert coordinator.pending == 0
-    assert coordinator._threads == set()
+    assert coordinator._releasing == set()
 
 
 def test_saturation_callback_failure_is_isolated(caplog: pytest.LogCaptureFixture) -> None:

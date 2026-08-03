@@ -10,7 +10,7 @@ from voiceflow.dictionary.models import (
     DictionaryKind,
     DictionaryOperation,
 )
-from voiceflow.storage.contracts import DictionaryEntryRecord, DictionaryRepository
+from voiceflow.storage.contracts import DictionaryRepository
 
 
 class DictionaryService:
@@ -28,22 +28,7 @@ class DictionaryService:
     def entries(self) -> tuple[DictionaryEntry, ...]:
         if not self.enabled:
             return ()
-        return tuple(
-            DictionaryEntry(
-                identifier=record.identifier,
-                kind=record.kind,
-                spoken_form=record.spoken_form,
-                written_form=record.written_form,
-                language=record.language,
-                app_bundle_id=record.app_bundle_id,
-                priority=record.priority,
-                enabled=record.enabled,
-                use_count=record.use_count,
-                created_at=record.created_at,
-                updated_at=record.updated_at,
-            )
-            for record in self.storage.dictionary_entries()
-        )
+        return self.storage.dictionary_entries()
 
     def add(
         self,
@@ -73,21 +58,7 @@ class DictionaryService:
             created_at=now,
             updated_at=now,
         )
-        self.storage.add_dictionary_entry(
-            DictionaryEntryRecord(
-                identifier=entry.identifier,
-                kind=entry.kind,
-                spoken_form=entry.spoken_form,
-                written_form=entry.written_form,
-                language=entry.language,
-                app_bundle_id=entry.app_bundle_id,
-                priority=entry.priority,
-                enabled=entry.enabled,
-                use_count=entry.use_count,
-                created_at=entry.created_at,
-                updated_at=entry.updated_at,
-            )
-        )
+        self.storage.add_dictionary_entry(entry)
         return entry
 
     @staticmethod

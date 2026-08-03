@@ -19,10 +19,7 @@ from voiceflow.processing import (
     RouteReason,
 )
 from voiceflow.storage import HistoryResultSink, VoiceBudStorage
-from voiceflow.storage.contracts import (
-    DictionaryEntryRecord,
-    TranscriptionRecord,
-)
+from voiceflow.storage.contracts import TranscriptionRecord
 from voiceflow.transcription import TranscriptionResult
 
 
@@ -83,7 +80,7 @@ def _history_outcome() -> PipelineOutcome:
 
 def test_dictionary_record_round_trips_every_field(tmp_path: Path) -> None:
     storage = VoiceBudStorage(tmp_path / "voicebud.sqlite3", history=HistoryConfig())
-    record = DictionaryEntryRecord(
+    record = DictionaryEntry(
         identifier="dictionary-id",
         kind=DictionaryKind.REPLACEMENT,
         spoken_form="voice bud",
@@ -141,7 +138,7 @@ def test_storage_reads_an_existing_version_one_database(tmp_path: Path) -> None:
     path = tmp_path / "voicebud.sqlite3"
     bootstrap = VoiceBudStorage(path, history=HistoryConfig())
     bootstrap.add_dictionary_entry(
-        DictionaryEntryRecord(
+        DictionaryEntry(
             identifier="existing",
             kind=DictionaryKind.PREFERRED_TERM,
             spoken_form="codex",
@@ -171,13 +168,13 @@ def test_storage_reads_an_existing_version_one_database(tmp_path: Path) -> None:
 
 class FakeDictionaryRepository:
     def __init__(self) -> None:
-        self.records: list[DictionaryEntryRecord] = []
+        self.records: list[DictionaryEntry] = []
         self.incremented: tuple[str, ...] = ()
 
-    def add_dictionary_entry(self, record: DictionaryEntryRecord) -> None:
+    def add_dictionary_entry(self, record: DictionaryEntry) -> None:
         self.records.append(record)
 
-    def dictionary_entries(self) -> tuple[DictionaryEntryRecord, ...]:
+    def dictionary_entries(self) -> tuple[DictionaryEntry, ...]:
         return tuple(self.records)
 
     def increment_dictionary_usage(self, identifiers: Iterable[str]) -> None:
@@ -204,7 +201,7 @@ def test_dictionary_service_uses_records_through_repository_boundary() -> None:
     )
 
     assert repository.records == [
-        DictionaryEntryRecord(
+        DictionaryEntry(
             identifier=created.identifier,
             kind=DictionaryKind.REPLACEMENT,
             spoken_form="voice bud",
@@ -261,9 +258,9 @@ def test_history_sink_uses_record_through_repository_boundary() -> None:
 
 def test_dictionary_service_reads_typed_records_without_row_or_tuple_behavior() -> None:
     class AttributeOnlyRepository(FakeDictionaryRepository):
-        def dictionary_entries(self) -> tuple[DictionaryEntryRecord, ...]:
+        def dictionary_entries(self) -> tuple[DictionaryEntry, ...]:
             return (
-                DictionaryEntryRecord(
+                DictionaryEntry(
                     identifier="attribute-only",
                     kind=DictionaryKind.PREFERRED_TERM,
                     spoken_form="codex",

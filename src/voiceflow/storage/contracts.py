@@ -5,23 +5,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from voiceflow.dictionary.models import DictionaryKind
+    from voiceflow.dictionary.models import DictionaryEntry
     from voiceflow.processing import DeliveryStatus, PostprocessRoute, RouteReason
-
-
-@dataclass(frozen=True, slots=True)
-class DictionaryEntryRecord:
-    identifier: str
-    kind: DictionaryKind
-    spoken_form: str
-    written_form: str
-    language: str | None
-    app_bundle_id: str | None
-    priority: int
-    enabled: bool
-    use_count: int
-    created_at: float
-    updated_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,9 +33,9 @@ class TranscriptionRecord:
 
 
 class DictionaryRepository(Protocol):
-    def add_dictionary_entry(self, record: DictionaryEntryRecord) -> None: ...
+    def add_dictionary_entry(self, entry: DictionaryEntry) -> None: ...
 
-    def dictionary_entries(self) -> tuple[DictionaryEntryRecord, ...]: ...
+    def dictionary_entries(self) -> tuple[DictionaryEntry, ...]: ...
 
     def increment_dictionary_usage(self, identifiers: Iterable[str]) -> None: ...
 

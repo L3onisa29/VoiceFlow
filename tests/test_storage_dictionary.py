@@ -248,7 +248,7 @@ def test_history_disabled_writes_no_transcript_and_enabled_obeys_limits(
     assert storage.transcription_count() == 2
     assert storage.query("SELECT app_bundle_id FROM transcriptions")[0][0] is None
     now[0] += 3601
-    storage.prune_history()
+    storage.apply_retention_policy()
     assert storage.transcription_count() == 0
     storage.close()
 

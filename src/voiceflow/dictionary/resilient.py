@@ -15,11 +15,6 @@ DICTIONARY_UNAVAILABLE_MESSAGE = "Dizionario non disponibile — dettatura ancor
 _Result = TypeVar("_Result")
 
 
-class _ReadContext(threading.local):
-    def __init__(self) -> None:
-        self.depth = 0
-
-
 class DictionaryReader(Protocol):
     enabled: bool
 
@@ -60,10 +55,9 @@ class ResilientDictionary:
         self._notifier = notifier
         self._logger = logger
         self._lock = threading.RLock()
-        self._read_context = _ReadContext()
+        self._read_depth = 0
         self._enabled = reader.enabled
         self._pending_failure: Exception | None = None
-        self._failure_report_claimed = False
 
     @property
     def enabled(self) -> bool:
@@ -104,7 +98,7 @@ class ResilientDictionary:
     def _read(self, operation: Callable[[], _Result], fallback: _Result) -> _Result:
         failure_to_report: Exception | None = None
         self._lock.acquire()
-        self._read_context.depth += 1
+        self._read_depth += 1
         try:
             if not self._enabled:
                 return fallback
@@ -117,15 +111,10 @@ class ResilientDictionary:
                     self._reader.enabled = False
                 return fallback
         finally:
-            self._read_context.depth -= 1
-            if (
-                self._read_context.depth == 0
-                and self._pending_failure is not None
-                and not self._failure_report_claimed
-            ):
+            self._read_depth -= 1
+            if self._read_depth == 0 and self._pending_failure is not None:
                 failure_to_report = self._pending_failure
                 self._pending_failure = None
-                self._failure_report_claimed = True
             self._lock.release()
             if failure_to_report is not None:
                 self._report_failure(failure_to_report)

@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 import threading
 import time
-import wave
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
 
 import numpy as np
 
-from voiceflow.storage.permissions import (
-    ensure_private_directory,
-    read_managed_text_file,
-    replace_private_file,
-    restrict_file_permissions,
-    restrict_open_file,
+from voiceflow.storage.feedback_corpus import (
+    FeedbackCorpusRepository,
+    FeedbackSample,
+    FileFeedbackCorpusRepository,
 )
 
 
@@ -51,14 +44,15 @@ class RecentAudioBuffer:
         *,
         capacity: int = 4,
         clock: Callable[[], float] = time.monotonic,
+        repository: FeedbackCorpusRepository | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
         self.ttl_seconds = ttl_seconds
         self.capacity = capacity
         self._clock = clock
+        self._repository = repository if repository is not None else FileFeedbackCorpusRepository()
         self._lock = threading.RLock()
-        self._manifest_lock = threading.Lock()
         self._entries: OrderedDict[str, tuple[RecentAudio, np.ndarray]] = OrderedDict()
 
     def store(self, identifier: str, audio: np.ndarray, sample_rate: int) -> None:
@@ -126,78 +120,18 @@ class RecentAudioBuffer:
                 raise ValueError("Recent audio is missing or expired")
             metadata, buffered_audio = entry
             audio = buffered_audio.copy()
-            sample_rate = metadata.sample_rate
-        ensure_private_directory(directory)
-        output = directory / f"{identifier or uuid4()}.wav"
-        if restrict_file_permissions(output):
-            output = directory / f"{identifier}-{uuid4()}.wav"
-        pcm = (np.clip(audio, -1, 1) * np.iinfo(np.int16).max).astype(np.int16).tobytes()
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".voicebud-audio-", suffix=".wav", dir=directory
+        output = self._repository.save(
+            FeedbackSample(
+                identifier=identifier,
+                audio=audio,
+                sample_rate=metadata.sample_rate,
+                reference=reference,
+                required_terms=required_terms,
+            ),
+            directory,
         )
-        temporary = Path(temporary_name)
-        temporary_owned = True
-        try:
-            try:
-                restrict_open_file(descriptor)
-                with (
-                    os.fdopen(descriptor, "w+b", closefd=False) as temporary_file,
-                    wave.open(temporary_file, "wb") as wav,
-                ):
-                    wav.setnchannels(1)
-                    wav.setsampwidth(2)
-                    wav.setframerate(sample_rate)
-                    wav.writeframes(pcm)
-            finally:
-                os.close(descriptor)
-            replace_private_file(temporary, output)
-            temporary_owned = False
-            try:
-                self._append_manifest(
-                    directory / "manifest.jsonl",
-                    {
-                        "id": identifier,
-                        "audio": output.name,
-                        "reference": reference,
-                        "required_terms": required_terms,
-                    },
-                )
-            except Exception:
-                output.unlink(missing_ok=True)
-                raise
-        finally:
-            if temporary_owned:
-                temporary.unlink(missing_ok=True)
         with self._lock:
             current = self._entries.get(identifier)
             if current is not None and current[0] is metadata:
                 self._discard(identifier)
         return output
-
-    def _append_manifest(self, path: Path, record: dict[str, object]) -> None:
-        # This lock owns the complete filesystem read-modify-replace transaction.
-        # save_confirmed never holds the in-memory buffer lock while acquiring it.
-        with self._manifest_lock:
-            existing = read_managed_text_file(path)
-            descriptor, temporary_name = tempfile.mkstemp(prefix=".manifest-", dir=path.parent)
-            temporary = Path(temporary_name)
-            temporary_owned = True
-            try:
-                try:
-                    restrict_open_file(descriptor)
-                    with os.fdopen(
-                        descriptor,
-                        "w",
-                        encoding="utf-8",
-                        closefd=False,
-                    ) as temporary_file:
-                        temporary_file.write(
-                            existing + json.dumps(record, ensure_ascii=False) + "\n"
-                        )
-                finally:
-                    os.close(descriptor)
-                replace_private_file(temporary, path)
-                temporary_owned = False
-            finally:
-                if temporary_owned:
-                    temporary.unlink(missing_ok=True)

@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from voiceflow.config import HistoryConfig
-from voiceflow.dictionary.models import DictionaryKind
+from voiceflow.dictionary.models import DictionaryEntry, DictionaryKind
 from voiceflow.processing import DeliveryStatus, PostprocessRoute, RouteReason
-from voiceflow.storage.contracts import DictionaryEntryRecord, TranscriptionRecord
+from voiceflow.storage.contracts import TranscriptionRecord
 from voiceflow.storage.permissions import (
     ensure_private_directory,
     ensure_private_file,
@@ -156,7 +156,7 @@ class VoiceBudStorage:
             finally:
                 self._restrict_files()
 
-    def add_dictionary_entry(self, record: DictionaryEntryRecord) -> None:
+    def add_dictionary_entry(self, entry: DictionaryEntry) -> None:
         self.execute(
             """
             INSERT INTO dictionary_entries (
@@ -165,21 +165,21 @@ class VoiceBudStorage:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                record.identifier,
-                record.kind.value,
-                record.spoken_form,
-                record.written_form,
-                record.language,
-                record.app_bundle_id,
-                record.priority,
-                int(record.enabled),
-                record.use_count,
-                record.created_at,
-                record.updated_at,
+                entry.identifier,
+                entry.kind.value,
+                entry.spoken_form,
+                entry.written_form,
+                entry.language,
+                entry.app_bundle_id,
+                entry.priority,
+                int(entry.enabled),
+                entry.use_count,
+                entry.created_at,
+                entry.updated_at,
             ),
         )
 
-    def dictionary_entries(self) -> tuple[DictionaryEntryRecord, ...]:
+    def dictionary_entries(self) -> tuple[DictionaryEntry, ...]:
         rows = self.query(
             """
             SELECT id, kind, spoken_form, written_form, language, app_bundle_id,
@@ -189,7 +189,7 @@ class VoiceBudStorage:
             """
         )
         return tuple(
-            DictionaryEntryRecord(
+            DictionaryEntry(
                 identifier=row["id"],
                 kind=DictionaryKind(row["kind"]),
                 spoken_form=row["spoken_form"],
@@ -318,10 +318,6 @@ class VoiceBudStorage:
                 self._connection.execute("COMMIT")
             finally:
                 self._restrict_files()
-
-    def prune_history(self) -> None:
-        """Compatibility alias for the explicit retention policy boundary."""
-        self.apply_retention_policy()
 
     def save_correction(self, identifier: str, corrected_text: str) -> bool:
         cursor = self.execute(
