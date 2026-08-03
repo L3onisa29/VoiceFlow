@@ -20,6 +20,8 @@
     "src/voiceflow/storage/history.py",
     "src/voiceflow/storage/permissions.py",
     "src/voiceflow/dictionary/resilient.py",
-    "src/voiceflow/dictionary/service.py"
+    "src/voiceflow/dictionary/service.py",
+    "src/voiceflow/system/text_ports.py",
+    "src/voiceflow/system/text_injector.py"
   ]
 }
