@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from voiceflow.config import FormattingConfig
+from voiceflow.integrations import BridgeOutcome, BridgeResult, T3CodeDestination
 from voiceflow.normalization import (
     DeterministicNormalizer,
     NormalizationOperation,
@@ -15,6 +16,8 @@ from voiceflow.normalization import (
     ProtectedSpan,
 )
 from voiceflow.pipeline_stages import (
+    DeliveryStage,
+    DeliveryStageResult,
     NormalizationStage,
     NormalizationStageResult,
     PostprocessStage,
@@ -29,10 +32,16 @@ from voiceflow.postprocess.base import (
 )
 from voiceflow.postprocess.router import RoutingDecision
 from voiceflow.processing import (
+    DeliveryStatus,
     PipelineTrace,
     PostprocessRoute,
     ProcessingIntent,
     RouteReason,
+)
+from voiceflow.system.text_injector import (
+    FocusChangedError,
+    FocusTarget,
+    InjectionDestination,
 )
 from voiceflow.transcription import TranscriptionResult, TranscriptSegment
 
@@ -634,4 +643,317 @@ def test_postprocess_stage_result_is_frozen_and_slotted() -> None:
 
     with pytest.raises(FrozenInstanceError):
         result.final_text = "changed"  # type: ignore[misc]
+    assert not hasattr(result, "__dict__")
+
+
+class CapturingDeliveryStatus:
+    def __init__(self) -> None:
+        self.transients: list[tuple[str, bool]] = []
+        self.completions: list[tuple[bool, str | None]] = []
+
+    def transient(self, text: str, *, error: bool = False) -> None:
+        self.transients.append((text, error))
+
+    def complete(self, *, fallback: bool, detail: str | None) -> None:
+        self.completions.append((fallback, detail))
+
+
+class CapturingDeliveryInjector:
+    def __init__(self, failure: BaseException | None = None) -> None:
+        self.failure = failure
+        self.calls: list[tuple[str, InjectionDestination]] = []
+
+    def inject(self, text: str, *, destination: InjectionDestination) -> None:
+        self.calls.append((text, destination))
+        if self.failure is not None:
+            raise self.failure
+
+
+class CapturingDeliveryBridge:
+    def __init__(self, result: BridgeResult | BaseException) -> None:
+        self.result = result
+        self.calls: list[tuple[str, str]] = []
+
+    def deliver_transcription(self, recording_id: str, transcript: str) -> BridgeResult:
+        self.calls.append((recording_id, transcript))
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+FOCUSED_DESTINATION = InjectionDestination.focused(FocusTarget(1, "field"))
+
+
+@pytest.mark.parametrize(
+    ("destination", "expected_delivery", "expected_detail"),
+    [
+        (FOCUSED_DESTINATION, DeliveryStatus.INJECTED, None),
+        (
+            InjectionDestination.clipboard_only(),
+            DeliveryStatus.CLIPBOARD_ONLY,
+            "Nessuna destinazione — testo lasciato negli appunti; "
+            "provider non disponibile — usato testo normalizzato",
+        ),
+    ],
+)
+def test_delivery_stage_injects_once_and_preserves_destination_timing_and_completion(
+    destination: InjectionDestination,
+    expected_delivery: DeliveryStatus,
+    expected_detail: str | None,
+) -> None:
+    injector = CapturingDeliveryInjector()
+    status = CapturingDeliveryStatus()
+    trace = PipelineTrace(queued_ns=10)
+    stage = DeliveryStage(
+        injector,
+        status,
+        injection_scheduler=lambda callback: callback(),
+        injection_timeout_seconds=2,
+        clock_ns=StepClock(30, 40),
+    )
+
+    result = stage.run(
+        "final text",
+        destination=destination,
+        used_fallback=destination.uses_clipboard_only,
+        fallback_provider="provider",
+        trace=trace,
+        log_context={"job_id": 7},
+    )
+
+    assert result == DeliveryStageResult(expected_delivery, None, destination)
+    assert result.destination is destination
+    assert injector.calls == [("final text", destination)]
+    assert status.completions == [(destination.uses_clipboard_only, expected_detail)]
+    assert status.transients == []
+    assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [FocusChangedError("focus moved"), PermissionError("permission denied")],
+)
+def test_delivery_stage_preserves_injector_exception_identity_and_completed_timing(
+    failure: BaseException,
+) -> None:
+    injector = CapturingDeliveryInjector(failure)
+    status = CapturingDeliveryStatus()
+    trace = PipelineTrace(queued_ns=10)
+    stage = DeliveryStage(
+        injector,
+        status,
+        injection_scheduler=lambda callback: callback(),
+        injection_timeout_seconds=2,
+        clock_ns=StepClock(30, 40),
+    )
+
+    with pytest.raises(type(failure)) as raised:
+        stage.run(
+            "final text",
+            destination=FOCUSED_DESTINATION,
+            used_fallback=False,
+            fallback_provider="provider",
+            trace=trace,
+        )
+
+    assert raised.value is failure
+    assert injector.calls == [("final text", FOCUSED_DESTINATION)]
+    assert status.completions == []
+    assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
+
+
+def test_delivery_stage_dispatch_timeout_cancels_late_callback_without_injection() -> None:
+    injector = CapturingDeliveryInjector()
+    scheduled: list[Any] = []
+    cancellation_checks: list[str] = []
+    trace = PipelineTrace(queued_ns=10)
+    stage = DeliveryStage(
+        injector,
+        CapturingDeliveryStatus(),
+        injection_scheduler=scheduled.append,
+        injection_timeout_seconds=0,
+        raise_if_cancelled=lambda: cancellation_checks.append("checked"),
+        clock_ns=StepClock(30, 40),
+    )
+
+    with pytest.raises(TimeoutError, match="did not start within 0 seconds"):
+        stage.run(
+            "final text",
+            destination=FOCUSED_DESTINATION,
+            used_fallback=False,
+            fallback_provider="provider",
+            trace=trace,
+        )
+
+    assert cancellation_checks == ["checked"]
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert injector.calls == []
+    assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
+
+
+def test_delivery_stage_checks_cancellation_after_delivery_before_completion() -> None:
+    failure = RuntimeError("cancelled after delivery")
+
+    def raise_cancelled() -> None:
+        raise failure
+
+    injector = CapturingDeliveryInjector()
+    status = CapturingDeliveryStatus()
+    trace = PipelineTrace(queued_ns=10)
+    stage = DeliveryStage(
+        injector,
+        status,
+        injection_scheduler=lambda callback: callback(),
+        injection_timeout_seconds=2,
+        raise_if_cancelled=raise_cancelled,
+        clock_ns=StepClock(30, 40),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        stage.run(
+            "final text",
+            destination=FOCUSED_DESTINATION,
+            used_fallback=False,
+            fallback_provider="provider",
+            trace=trace,
+        )
+
+    assert raised.value is failure
+    assert injector.calls == [("final text", FOCUSED_DESTINATION)]
+    assert status.completions == []
+    assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
+
+
+@pytest.mark.parametrize(
+    ("bridge_result", "expected_delivery", "expected_code", "expected_message"),
+    [
+        (BridgeResult.accepted_result(), DeliveryStatus.T3_DELIVERED, None, None),
+        (
+            BridgeResult.rejected("busy"),
+            DeliveryStatus.T3_REJECTED,
+            "t3_rejected",
+            "T3 Code ha rifiutato la trascrizione",
+        ),
+        (
+            BridgeResult.ambiguous(),
+            DeliveryStatus.T3_AMBIGUOUS,
+            "t3_ambiguous",
+            "Consegna a T3 Code non verificabile — nessun nuovo tentativo",
+        ),
+        (
+            BridgeResult(BridgeOutcome.ERROR, message="bridge offline"),
+            DeliveryStatus.T3_FAILED,
+            "t3_validation_error",
+            "bridge offline",
+        ),
+    ],
+)
+def test_delivery_stage_maps_each_t3_outcome_once_without_injector_fallback(
+    bridge_result: BridgeResult,
+    expected_delivery: DeliveryStatus,
+    expected_code: str | None,
+    expected_message: str | None,
+) -> None:
+    injector = CapturingDeliveryInjector()
+    status = CapturingDeliveryStatus()
+    bridge = CapturingDeliveryBridge(bridge_result)
+    destination = T3CodeDestination("recording-id")
+    trace = PipelineTrace(queued_ns=10)
+    stage = DeliveryStage(
+        injector,
+        status,
+        injection_scheduler=lambda callback: callback(),
+        injection_timeout_seconds=2,
+        t3_bridge=bridge,
+        clock_ns=StepClock(30, 40),
+    )
+
+    result = stage.run(
+        "final text",
+        destination=destination,
+        used_fallback=False,
+        fallback_provider="provider",
+        trace=trace,
+        log_context={"job_id": 7},
+    )
+
+    assert result == DeliveryStageResult(expected_delivery, expected_code, destination)
+    assert result.destination is destination
+    assert bridge.calls == [("recording-id", "final text")]
+    assert injector.calls == []
+    assert status.transients == ([] if expected_message is None else [(expected_message, True)])
+    assert status.completions == (
+        [(False, "Consegnato a T3 Code")]
+        if expected_delivery == DeliveryStatus.T3_DELIVERED
+        else []
+    )
+    assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
+
+
+def test_delivery_stage_missing_t3_bridge_fails_without_retry_or_fallback() -> None:
+    injector = CapturingDeliveryInjector()
+    status = CapturingDeliveryStatus()
+    destination = T3CodeDestination("recording-id")
+
+    result = DeliveryStage(
+        injector,
+        status,
+        injection_scheduler=lambda callback: callback(),
+        injection_timeout_seconds=2,
+        clock_ns=StepClock(30, 40),
+    ).run(
+        "final text",
+        destination=destination,
+        used_fallback=False,
+        fallback_provider="provider",
+        trace=PipelineTrace(queued_ns=10),
+    )
+
+    assert result == DeliveryStageResult(
+        DeliveryStatus.T3_FAILED,
+        "t3_validation_error",
+        destination,
+    )
+    assert injector.calls == []
+    assert status.transients == [("Bridge T3 Code non disponibile", True)]
+    assert status.completions == []
+
+
+def test_delivery_stage_preserves_t3_exception_identity_and_completed_timing() -> None:
+    failure = RuntimeError("bridge failed")
+    bridge = CapturingDeliveryBridge(failure)
+    trace = PipelineTrace(queued_ns=10)
+    stage = DeliveryStage(
+        CapturingDeliveryInjector(),
+        CapturingDeliveryStatus(),
+        injection_scheduler=lambda callback: callback(),
+        injection_timeout_seconds=2,
+        t3_bridge=bridge,
+        clock_ns=StepClock(30, 40),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        stage.run(
+            "final text",
+            destination=T3CodeDestination("recording-id"),
+            used_fallback=False,
+            fallback_provider="provider",
+            trace=trace,
+        )
+
+    assert raised.value is failure
+    assert bridge.calls == [("recording-id", "final text")]
+    assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
+
+
+def test_delivery_stage_result_is_frozen_and_slotted() -> None:
+    result = DeliveryStageResult(
+        DeliveryStatus.INJECTED,
+        None,
+        FOCUSED_DESTINATION,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        result.error_code = "changed"  # type: ignore[misc]
     assert not hasattr(result, "__dict__")

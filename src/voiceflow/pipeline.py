@@ -13,18 +13,18 @@ import numpy as np
 from voiceflow.config import FormattingConfig
 from voiceflow.diagnostics import exception_fields, log_event
 from voiceflow.integrations import (
-    BridgeOutcome,
     DictationDestination,
     T3CodeBridge,
     T3CodeDestination,
 )
 from voiceflow.normalization import DeterministicNormalizer
 from voiceflow.pipeline_stages import (
+    DeliveryStage,
     NormalizationStage,
     PostprocessStage,
     TranscriptionStage,
 )
-from voiceflow.postprocess.base import PostProcessor
+from voiceflow.postprocess.base import PostProcessor, PostprocessResult
 from voiceflow.postprocess.router import PostprocessRouter
 from voiceflow.processing import (
     DeliveryStatus,
@@ -36,7 +36,7 @@ from voiceflow.processing import (
     ProcessingIntent,
 )
 from voiceflow.state import ActivityState, SystemState
-from voiceflow.system.text_injector import FocusChangedError, InjectionDestination
+from voiceflow.system.text_injector import FocusChangedError
 from voiceflow.transcription import TranscriptionResult
 
 LOGGER = logging.getLogger(__name__)
@@ -117,6 +117,16 @@ class DictationPipeline:
         self._sequence = 0
         self._pending = 0
         self._next_processing_intent = ProcessingIntent.AUTO
+        self.delivery_stage = DeliveryStage(
+            self.injector,
+            self.status,
+            injection_scheduler=self._schedule_injection,
+            injection_timeout_seconds=self.injection_timeout_seconds,
+            t3_bridge=self.t3_bridge,
+            is_cancelled=self._cancelled.is_set,
+            raise_if_cancelled=self._raise_if_cancelled,
+            clock_ns=clock_ns,
+        )
         self._worker = threading.Thread(target=self._run, name="voiceflow-pipeline", daemon=True)
         self._worker.start()
 
@@ -310,72 +320,21 @@ class DictationPipeline:
             )
             result = postprocess_result.postprocess
             self._raise_if_cancelled()
-            if result.used_fallback:
-                trace.fallback_code = result.fallback_code or "provider_error"
-            log_event(
-                LOGGER,
-                logging.DEBUG,
-                "postprocess.completed",
-                "Post-processing route completed",
-                context=self._job_context(job),
-                provider=self.postprocessor.name,
-                route=trace.route,
-                route_reason=trace.reason,
-                fallback=result.used_fallback,
-                fallback_code=trace.fallback_code,
-                postprocess_seconds=trace.postprocess_seconds,
-            )
-            if result.used_fallback:
-                log_event(
-                    LOGGER,
-                    logging.WARNING,
-                    "postprocess.fallback",
-                    "Post-processor unavailable; normalized text will be used",
-                    context=self._job_context(job),
-                    provider=self.postprocessor.name,
-                    fallback_code=trace.fallback_code,
-                    provider_error=result.error,
-                )
+            self._record_postprocess_completion(job, result, trace)
             final_text = postprocess_result.final_text
             self.status.update(activity=ActivityState.INJECTING)
             self._raise_if_cancelled()
             stage = "delivery"
-            trace.injection_started_ns = self._clock_ns()
-            try:
-                if isinstance(job.destination, T3CodeDestination):
-                    delivery, error_code = self._deliver_to_t3(job, final_text)
-                else:
-                    self._inject_on_main_thread(final_text, destination=job.destination)
-            finally:
-                trace.injection_ended_ns = self._clock_ns()
-            self._raise_if_cancelled()
-            if not isinstance(job.destination, T3CodeDestination):
-                delivery = (
-                    DeliveryStatus.CLIPBOARD_ONLY
-                    if job.destination.uses_clipboard_only
-                    else DeliveryStatus.INJECTED
-                )
-            completion_details: list[str] = []
-            if (
-                isinstance(job.destination, InjectionDestination)
-                and job.destination.uses_clipboard_only
-            ):
-                completion_details.append("Nessuna destinazione — testo lasciato negli appunti")
-            if result.used_fallback:
-                completion_details.append(
-                    f"{self.postprocessor.name} non disponibile — usato testo normalizzato"
-                )
-            if delivery == DeliveryStatus.T3_DELIVERED:
-                completion_details.insert(0, "Consegnato a T3 Code")
-            if delivery in {
-                DeliveryStatus.INJECTED,
-                DeliveryStatus.CLIPBOARD_ONLY,
-                DeliveryStatus.T3_DELIVERED,
-            }:
-                self.status.complete(
-                    fallback=result.used_fallback,
-                    detail="; ".join(completion_details) or None,
-                )
+            delivery_result = self.delivery_stage.run(
+                final_text,
+                destination=job.destination,
+                used_fallback=result.used_fallback,
+                fallback_provider=self.postprocessor.name,
+                trace=trace,
+                log_context=self._job_context(job),
+            )
+            delivery = delivery_result.delivery_status
+            error_code = delivery_result.error_code
         except PipelineCancelled:
             delivery = DeliveryStatus.CANCELLED
             error_code = "cancelled"
@@ -454,47 +413,38 @@ class DictationPipeline:
                 total_seconds=trace.total_seconds,
             )
 
-    def _deliver_to_t3(
+    def _record_postprocess_completion(
         self,
         job: AudioJob,
-        final_text: str,
-    ) -> tuple[DeliveryStatus, str | None]:
-        destination = job.destination
-        if not isinstance(destination, T3CodeDestination):
-            raise TypeError("T3 destination required")
-        if self.t3_bridge is None:
-            self.status.transient("Bridge T3 Code non disponibile", error=True)
-            return DeliveryStatus.T3_FAILED, "t3_validation_error"
-        result = self.t3_bridge.deliver_transcription(
-            recording_id=destination.recording_id,
-            transcript=final_text,
-        )
+        result: PostprocessResult,
+        trace: PipelineTrace,
+    ) -> None:
+        if result.used_fallback:
+            trace.fallback_code = result.fallback_code or "provider_error"
         log_event(
             LOGGER,
-            logging.DEBUG if result.outcome == BridgeOutcome.ACCEPTED else logging.WARNING,
-            "integration.t3.delivery",
-            "T3 Code delivery returned",
+            logging.DEBUG,
+            "postprocess.completed",
+            "Post-processing route completed",
             context=self._job_context(job),
-            integration_outcome=result.outcome,
-            error_code=result.error_code,
-            remote_code=getattr(result, "remote_code", None),
+            provider=self.postprocessor.name,
+            route=trace.route,
+            route_reason=trace.reason,
+            fallback=result.used_fallback,
+            fallback_code=trace.fallback_code,
+            postprocess_seconds=trace.postprocess_seconds,
         )
-        if result.outcome == BridgeOutcome.ACCEPTED:
-            return DeliveryStatus.T3_DELIVERED, None
-        if result.outcome == BridgeOutcome.REJECTED:
-            self.status.transient("T3 Code ha rifiutato la trascrizione", error=True)
-            return DeliveryStatus.T3_REJECTED, result.error_code or "t3_rejected"
-        if result.outcome == BridgeOutcome.AMBIGUOUS:
-            self.status.transient(
-                "Consegna a T3 Code non verificabile — nessun nuovo tentativo",
-                error=True,
+        if result.used_fallback:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "postprocess.fallback",
+                "Post-processor unavailable; normalized text will be used",
+                context=self._job_context(job),
+                provider=self.postprocessor.name,
+                fallback_code=trace.fallback_code,
+                provider_error=result.error,
             )
-            return DeliveryStatus.T3_AMBIGUOUS, result.error_code or "t3_ambiguous"
-        self.status.transient(
-            result.message or "Consegna a T3 Code non riuscita",
-            error=True,
-        )
-        return DeliveryStatus.T3_FAILED, result.error_code or "t3_validation_error"
 
     def _abandon_t3(self, job: AudioJob) -> None:
         if isinstance(job.destination, T3CodeDestination) and self.t3_bridge is not None:
@@ -513,52 +463,6 @@ class DictationPipeline:
                 self.injector,
             ),
         }
-
-    def _inject_on_main_thread(
-        self,
-        text: str,
-        *,
-        destination: InjectionDestination,
-    ) -> None:
-        started = threading.Event()
-        completed = threading.Event()
-        callback_lock = threading.Lock()
-        callback_state = "pending"
-        error: list[BaseException] = []
-
-        def inject() -> None:
-            nonlocal callback_state
-            with callback_lock:
-                if callback_state != "pending" or self._cancelled.is_set():
-                    callback_state = "cancelled"
-                    completed.set()
-                    return
-                callback_state = "started"
-                started.set()
-            try:
-                self.injector.inject(text, destination=destination)
-            except BaseException as exc:
-                error.append(exc)
-            finally:
-                completed.set()
-
-        self._schedule_injection(inject)
-        if not started.wait(timeout=self.injection_timeout_seconds):
-            with callback_lock:
-                if callback_state == "pending":
-                    callback_state = "cancelled"
-                    timed_out = True
-                else:
-                    timed_out = False
-            if timed_out:
-                self._raise_if_cancelled()
-                raise TimeoutError(
-                    "Text insertion did not start within "
-                    f"{self.injection_timeout_seconds:g} seconds"
-                )
-        completed.wait()
-        if error:
-            raise error[0]
 
     def _finish_job(self) -> None:
         with self._lock:
