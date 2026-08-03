@@ -18,8 +18,8 @@ from voiceflow.integrations import (
     T3CodeBridge,
     T3CodeDestination,
 )
-from voiceflow.normalization import DeterministicNormalizer, NormalizationRequest
-from voiceflow.pipeline_stages import TranscriptionStage
+from voiceflow.normalization import DeterministicNormalizer
+from voiceflow.pipeline_stages import NormalizationStage, TranscriptionStage
 from voiceflow.postprocess.base import PostProcessor, PostprocessRequest
 from voiceflow.postprocess.router import PostprocessRouter
 from voiceflow.processing import (
@@ -91,6 +91,11 @@ class DictationPipeline:
         self.normalizer = normalizer or DeterministicNormalizer()
         self.postprocess_router = postprocess_router
         self.formatting = formatting or FormattingConfig()
+        self.normalization_stage = NormalizationStage(
+            self.normalizer,
+            self.formatting,
+            clock_ns=clock_ns,
+        )
         self._preferred_terms = preferred_terms or (lambda _language, _app: ())
         self.t3_bridge = t3_bridge
         self._schedule_injection = injection_scheduler
@@ -277,20 +282,14 @@ class DictationPipeline:
                 return
 
             stage = "normalization"
-            trace.normalization_started_ns = self._clock_ns()
-            normalization = self.normalizer.normalize(
-                NormalizationRequest(
-                    raw_text,
-                    language=transcription.language,
-                    app_bundle_id=job.app_bundle_id,
-                    spoken_punctuation=self.formatting.spoken_punctuation,
-                    explicit_lists=self.formatting.explicit_lists,
-                    structured_tokens=self.formatting.structured_tokens,
-                    backtrack=self.formatting.backtrack,
-                )
+            normalization_result = self.normalization_stage.run(
+                raw_text,
+                language=transcription.language,
+                app_bundle_id=job.app_bundle_id,
+                trace=trace,
             )
-            normalized_text = normalization.text
-            trace.normalization_ended_ns = self._clock_ns()
+            normalization = normalization_result.normalization
+            normalized_text = normalization_result.normalized_text
             stage = "postprocess"
             trace.postprocess_started_ns = self._clock_ns()
             request = PostprocessRequest(

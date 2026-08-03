@@ -7,12 +7,21 @@ from typing import Protocol
 
 import numpy as np
 
+from voiceflow.config import FormattingConfig
+from voiceflow.normalization import (
+    NormalizationRequest,
+    NormalizationResult,
+)
 from voiceflow.processing import PipelineTrace
 from voiceflow.transcription import TranscriptionResult, TranscriptSegment
 
 
 class Transcriber(Protocol):
     def transcribe(self, audio: np.ndarray, *, sample_rate: int) -> object: ...
+
+
+class Normalizer(Protocol):
+    def normalize(self, request: NormalizationRequest) -> NormalizationResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +58,51 @@ class TranscriptionStage:
         return TranscriptionStageResult(
             transcription=transcription,
             raw_text=transcription.text,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizationStageResult:
+    normalization: NormalizationResult
+    normalized_text: str
+
+
+class NormalizationStage:
+    def __init__(
+        self,
+        normalizer: Normalizer,
+        formatting: FormattingConfig,
+        *,
+        clock_ns: Callable[[], int] = time.perf_counter_ns,
+    ) -> None:
+        self._normalizer = normalizer
+        self._formatting = formatting
+        self._clock_ns = clock_ns
+
+    def run(
+        self,
+        raw_text: str,
+        *,
+        language: str | None,
+        app_bundle_id: str | None,
+        trace: PipelineTrace,
+    ) -> NormalizationStageResult:
+        trace.normalization_started_ns = self._clock_ns()
+        normalization = self._normalizer.normalize(
+            NormalizationRequest(
+                raw_text,
+                language=language,
+                app_bundle_id=app_bundle_id,
+                spoken_punctuation=self._formatting.spoken_punctuation,
+                explicit_lists=self._formatting.explicit_lists,
+                structured_tokens=self._formatting.structured_tokens,
+                backtrack=self._formatting.backtrack,
+            )
+        )
+        trace.normalization_ended_ns = self._clock_ns()
+        return NormalizationStageResult(
+            normalization=normalization,
+            normalized_text=normalization.text,
         )
 
 

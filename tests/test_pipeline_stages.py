@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 
 import numpy as np
 import pytest
 
-from voiceflow.pipeline_stages import TranscriptionStage, TranscriptionStageResult
+from voiceflow.config import FormattingConfig
+from voiceflow.normalization import (
+    DeterministicNormalizer,
+    NormalizationOperation,
+    NormalizationRequest,
+    NormalizationResult,
+    ProtectedSpan,
+)
+from voiceflow.pipeline_stages import (
+    NormalizationStage,
+    NormalizationStageResult,
+    TranscriptionStage,
+    TranscriptionStageResult,
+)
 from voiceflow.processing import PipelineTrace
 from voiceflow.transcription import TranscriptionResult, TranscriptSegment
 
@@ -25,6 +39,16 @@ class CapturingTranscriber:
 
     def transcribe(self, audio: np.ndarray, *, sample_rate: int) -> object:
         self.calls.append((audio, sample_rate))
+        return self.result
+
+
+class CapturingNormalizer:
+    def __init__(self, result: NormalizationResult) -> None:
+        self.result = result
+        self.requests: list[NormalizationRequest] = []
+
+    def normalize(self, request: NormalizationRequest) -> NormalizationResult:
+        self.requests.append(request)
         return self.result
 
 
@@ -115,3 +139,137 @@ def test_transcription_stage_preserves_transcriber_error_and_partial_timing() ->
 
     assert raised.value is failure
     assert (trace.stt_started_ns, trace.stt_ended_ns) == (30, None)
+
+
+def test_normalization_stage_preserves_result_metadata_operations_and_timing() -> None:
+    normalization = NormalizationResult(
+        text="VoiceFlow.",
+        operations=(
+            NormalizationOperation(
+                "dictionary_replacement",
+                "voice flow",
+                "VoiceFlow",
+                0,
+                10,
+            ),
+            NormalizationOperation("spoken_punctuation", "punto", ".", 11, 16),
+        ),
+        detected_signals=frozenset({"backtrack"}),
+        protected_spans=(ProtectedSpan("VoiceFlow", "dictionary", 0, 9),),
+    )
+    normalizer = CapturingNormalizer(normalization)
+    trace = PipelineTrace(queued_ns=10)
+
+    result = NormalizationStage(
+        normalizer,
+        FormattingConfig(),
+        clock_ns=StepClock(30, 40),
+    ).run(
+        "voice flow punto",
+        language="it",
+        app_bundle_id="com.example.editor",
+        trace=trace,
+    )
+
+    assert result == NormalizationStageResult(normalization, "VoiceFlow.")
+    assert result.normalization is normalization
+    assert normalizer.requests == [
+        NormalizationRequest(
+            "voice flow punto",
+            language="it",
+            app_bundle_id="com.example.editor",
+            spoken_punctuation=True,
+            explicit_lists=True,
+            structured_tokens=True,
+            backtrack=True,
+        )
+    ]
+    assert (trace.normalization_started_ns, trace.normalization_ended_ns) == (30, 40)
+
+
+def test_normalization_stage_no_op_preserves_exact_result() -> None:
+    trace = PipelineTrace(queued_ns=10)
+
+    result = NormalizationStage(
+        DeterministicNormalizer(),
+        FormattingConfig(),
+        clock_ns=StepClock(30, 40),
+    ).run(
+        "frase breve pulita",
+        language=None,
+        app_bundle_id=None,
+        trace=trace,
+    )
+
+    assert result == NormalizationStageResult(
+        NormalizationResult(text="frase breve pulita"),
+        "frase breve pulita",
+    )
+    assert (trace.normalization_started_ns, trace.normalization_ended_ns) == (30, 40)
+
+
+def test_normalization_stage_forwards_disabled_formatting_flags() -> None:
+    normalizer = CapturingNormalizer(NormalizationResult("unchanged"))
+
+    NormalizationStage(
+        normalizer,
+        FormattingConfig(
+            spoken_punctuation=False,
+            explicit_lists=False,
+            structured_tokens=False,
+            backtrack=False,
+        ),
+        clock_ns=StepClock(30, 40),
+    ).run(
+        "unchanged",
+        language="en",
+        app_bundle_id="com.example.notes",
+        trace=PipelineTrace(queued_ns=10),
+    )
+
+    assert normalizer.requests == [
+        NormalizationRequest(
+            "unchanged",
+            language="en",
+            app_bundle_id="com.example.notes",
+            spoken_punctuation=False,
+            explicit_lists=False,
+            structured_tokens=False,
+            backtrack=False,
+        )
+    ]
+
+
+def test_normalization_stage_preserves_normalizer_error_and_partial_timing() -> None:
+    failure = RuntimeError("dictionary unavailable")
+
+    class FailingNormalizer:
+        def normalize(self, request: NormalizationRequest) -> NormalizationResult:
+            assert request.text == "raw text"
+            raise failure
+
+    trace = PipelineTrace(queued_ns=10)
+    stage = NormalizationStage(
+        FailingNormalizer(),
+        FormattingConfig(),
+        clock_ns=StepClock(30, 40),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        stage.run(
+            "raw text",
+            language="it",
+            app_bundle_id=None,
+            trace=trace,
+        )
+
+    assert raised.value is failure
+    assert (trace.normalization_started_ns, trace.normalization_ended_ns) == (30, None)
+
+
+def test_normalization_stage_result_is_frozen_and_slotted() -> None:
+    result = NormalizationStageResult(NormalizationResult("text"), "text")
+
+    with pytest.raises(FrozenInstanceError):
+        result.normalized_text = "changed"  # type: ignore[misc]
+    assert not hasattr(result, "__dict__")
