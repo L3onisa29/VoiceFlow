@@ -78,6 +78,7 @@ def test_default_input_and_clipboard_policy() -> None:
     assert not hasattr(config.audio, "preroll_ms")
     assert config.hotkey.key == "alt+space"
     assert not hasattr(config.inject, "restore_clipboard")
+    assert config.postprocess.codex.reasoning_effort == "medium"
 
 
 def test_legacy_preroll_is_ignored_to_keep_the_microphone_closed() -> None:

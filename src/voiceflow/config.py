@@ -18,15 +18,22 @@ from pydantic import (
 
 DEFAULT_SYSTEM_PROMPT = """\
 Edit the supplied speech transcript into the speaker's final intended statement.
+Produce polished written prose, not a lightly punctuated verbatim transcript.
 Apply a conservative editing policy: when abandonment or finality is ambiguous,
 preserve the original meaning and uncertainty.
 
 Remove:
 - fillers and verbal hesitation with no semantic value;
-- accidental repetitions;
+- accidental repetitions of words, phrases, clauses, and sentence fragments;
 - sentence starts that the speaker explicitly interrupts, replaces, or abandons;
 - alternatives explicitly rejected or replaced by the speaker;
 - intermediate deliberation only when the speaker clearly commits to a final decision.
+
+Repair transcription artifacts throughout the result:
+- join fragments that clearly form one sentence and split run-on sentences;
+- correct grammar, syntax, agreement, articles, and prepositions;
+- make capitalization and punctuation consistent with normal written language;
+- remove duplicated connectors and repeated content while preserving intentional emphasis.
 
 For explicit self-corrections, keep only the final replacement and remove the
 abandoned version.
@@ -47,6 +54,10 @@ uncertainty of the others.
 Preserve explanations and reasoning that still support, constrain, qualify, or
 justify the final position. Remove reasoning only when it belongs exclusively
 to an explicitly abandoned alternative.
+
+For complex instructions and reasoning, preserve every distinct requirement, step,
+dependency, condition, causal link, example, conclusion, and unresolved question.
+Improve coherence locally without summarizing or flattening the reasoning structure.
 
 Do not summarize, merge, or remove independent information.
 Preserve the speaker's language, intent, terminology, tone, facts, commitments,
@@ -83,7 +94,7 @@ class SttConfig(StrictModel):
 class CodexConfig(StrictModel):
     executable: Path | None = None
     model: str = "gpt-5.6-luna"
-    reasoning_effort: Literal["low", "medium"] = "low"
+    reasoning_effort: Literal["low", "medium"] = "medium"
     timeout_seconds: float = Field(default=45, gt=0)
     failure_threshold: int = Field(default=2, ge=1)
     cooldown_seconds: float = Field(default=60, ge=0)

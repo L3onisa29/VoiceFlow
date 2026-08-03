@@ -13,7 +13,16 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "type": {"type": "string"},
+          "type": {
+            "type": "string",
+            "enum": [
+              "backtrack",
+              "remove_filler",
+              "remove_repetition",
+              "punctuation",
+              "grammar"
+            ]
+          },
           "source": {"type": "string"},
           "replacement": {"type": "string"}
         },

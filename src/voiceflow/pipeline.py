@@ -19,6 +19,7 @@ from voiceflow.integrations import (
     T3CodeDestination,
 )
 from voiceflow.normalization import DeterministicNormalizer, NormalizationRequest
+from voiceflow.pipeline_stages import TranscriptionStage
 from voiceflow.postprocess.base import PostProcessor, PostprocessRequest
 from voiceflow.postprocess.router import PostprocessRouter
 from voiceflow.processing import (
@@ -34,7 +35,7 @@ from voiceflow.processing import (
 )
 from voiceflow.state import ActivityState, SystemState
 from voiceflow.system.text_injector import FocusChangedError, InjectionDestination
-from voiceflow.transcription import TranscriptionResult, TranscriptSegment
+from voiceflow.transcription import TranscriptionResult
 
 LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ class DictationPipeline:
 
             injection_scheduler = AppHelper.callAfter
         self.transcriber = transcriber
+        self.transcription_stage = TranscriptionStage(transcriber, clock_ns=clock_ns)
         self.postprocessor = postprocessor
         self.injector = injector
         self.status = status
@@ -251,15 +253,13 @@ class DictationPipeline:
             )
             self.status.update(activity=ActivityState.TRANSCRIBING)
             stage = "transcription"
-            trace.stt_started_ns = self._clock_ns()
-            transcribed = self.transcriber.transcribe(job.audio, sample_rate=job.sample_rate)
-            trace.stt_ended_ns = self._clock_ns()
-            transcription = _coerce_transcription(
-                transcribed,
-                audio_duration_seconds=len(job.audio) / job.sample_rate,
-                inference_seconds=trace.stt_seconds or 0,
+            transcription_result = self.transcription_stage.run(
+                job.audio,
+                sample_rate=job.sample_rate,
+                trace=trace,
             )
-            raw_text = transcription.text
+            transcription = transcription_result.transcription
+            raw_text = transcription_result.raw_text
             self._raise_if_cancelled()
             if not raw_text:
                 delivery = DeliveryStatus.EMPTY
@@ -638,33 +638,6 @@ class DictationPipeline:
                 "Pipeline worker did not stop within %.1f seconds",
                 self.shutdown_timeout_seconds,
             )
-
-
-def _coerce_transcription(
-    result: Any,
-    *,
-    audio_duration_seconds: float,
-    inference_seconds: float,
-) -> TranscriptionResult:
-    if isinstance(result, TranscriptionResult):
-        return result
-    text = "" if result is None else str(result).strip()
-    segments = (
-        TranscriptSegment(
-            text=text,
-            start_seconds=0,
-            end_seconds=audio_duration_seconds,
-        )
-        if text
-        else None
-    )
-    segments = (segments,) if segments is not None else ()
-    return TranscriptionResult(
-        text=text,
-        segments=segments,
-        audio_duration_seconds=audio_duration_seconds,
-        inference_seconds=inference_seconds,
-    )
 
 
 def _error_code(exc: BaseException) -> str:

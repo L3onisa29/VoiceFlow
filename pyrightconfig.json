@@ -3,6 +3,7 @@
   "typeCheckingMode": "standard",
   "include": [
     "src/voiceflow/processing.py",
+    "src/voiceflow/pipeline_stages.py",
     "src/voiceflow/state.py",
     "src/voiceflow/normalization/contracts.py",
     "src/voiceflow/transcription/contracts.py",
