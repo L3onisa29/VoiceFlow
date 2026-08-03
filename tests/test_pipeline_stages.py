@@ -17,10 +17,23 @@ from voiceflow.normalization import (
 from voiceflow.pipeline_stages import (
     NormalizationStage,
     NormalizationStageResult,
+    PostprocessStage,
+    PostprocessStageResult,
     TranscriptionStage,
     TranscriptionStageResult,
 )
-from voiceflow.processing import PipelineTrace
+from voiceflow.postprocess.base import (
+    PostprocessRequest,
+    PostprocessResult,
+    ProviderOperation,
+)
+from voiceflow.postprocess.router import RoutingDecision
+from voiceflow.processing import (
+    PipelineTrace,
+    PostprocessRoute,
+    ProcessingIntent,
+    RouteReason,
+)
 from voiceflow.transcription import TranscriptionResult, TranscriptSegment
 
 
@@ -30,6 +43,21 @@ class StepClock:
 
     def __call__(self) -> int:
         return next(self._values)
+
+
+def transcription_result(
+    text: str = "raw",
+    *,
+    language: str | None = None,
+) -> TranscriptionResult:
+    return TranscriptionResult(
+        text=text,
+        segments=(),
+        audio_duration_seconds=0,
+        inference_seconds=0,
+        language=language,
+        language_source="configured" if language else "automatic_unknown",
+    )
 
 
 class CapturingTranscriber:
@@ -272,4 +300,338 @@ def test_normalization_stage_result_is_frozen_and_slotted() -> None:
 
     with pytest.raises(FrozenInstanceError):
         result.normalized_text = "changed"  # type: ignore[misc]
+    assert not hasattr(result, "__dict__")
+
+
+class CapturingPostprocessor:
+    name = "provider"
+
+    def __init__(self, result: PostprocessResult) -> None:
+        self.result = result
+        self.requests: list[PostprocessRequest | str] = []
+
+    def preflight(self) -> bool:
+        return True
+
+    def process(self, request: PostprocessRequest | str) -> PostprocessResult:
+        self.requests.append(request)
+        return self.result
+
+    def retry(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+class CapturingRouter:
+    def __init__(
+        self,
+        decision: RoutingDecision,
+        result: PostprocessResult,
+    ) -> None:
+        self.decision = decision
+        self.result = result
+        self.decide_requests: list[PostprocessRequest] = []
+        self.process_calls: list[tuple[PostprocessRequest, RoutingDecision]] = []
+
+    def decide(self, request: PostprocessRequest) -> RoutingDecision:
+        self.decide_requests.append(request)
+        return self.decision
+
+    def process_decision(
+        self,
+        request: PostprocessRequest,
+        decision: RoutingDecision,
+    ) -> PostprocessResult:
+        self.process_calls.append((request, decision))
+        return self.result
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "reason"),
+    [
+        ("provider", RouteReason.RULES_ONLY_MODE),
+        ("none", RouteReason.PROVIDER_DISABLED),
+    ],
+)
+def test_postprocess_stage_rules_routes_do_not_load_terms_or_publish_provider_state(
+    provider_name: str,
+    reason: RouteReason,
+) -> None:
+    provider = CapturingPostprocessor(PostprocessResult("must not run"))
+    provider.name = provider_name
+    decision = RoutingDecision(PostprocessRoute.RULES_ONLY, reason)
+    routed_result = PostprocessResult(
+        "normalized",
+        route=PostprocessRoute.RULES_ONLY,
+        reason=reason,
+    )
+    router = CapturingRouter(decision, routed_result)
+    term_lookups: list[tuple[str | None, str | None]] = []
+    provider_routes: list[str] = []
+    trace = PipelineTrace(queued_ns=10)
+
+    result = PostprocessStage(
+        provider,
+        postprocess_router=router,
+        preferred_terms=lambda language, app: term_lookups.append((language, app)) or ("unused",),
+        on_provider_route=lambda: provider_routes.append("provider"),
+        clock_ns=StepClock(30, 40),
+    ).run(
+        NormalizationResult(
+            "normalized",
+            detected_signals=frozenset({"filler"}),
+            protected_spans=(ProtectedSpan("VoiceFlow", "dictionary", 0, 9),),
+        ),
+        raw_text="raw",
+        transcription=transcription_result(language="it"),
+        processing_intent=ProcessingIntent.AUTO,
+        app_bundle_id="com.example.editor",
+        trace=trace,
+    )
+
+    assert result == PostprocessStageResult(
+        postprocess=routed_result,
+        final_text="normalized",
+        route=PostprocessRoute.RULES_ONLY,
+        reason=reason,
+    )
+    assert router.decide_requests == [
+        PostprocessRequest(
+            text="normalized",
+            raw_text="raw",
+            transcription=transcription_result(language="it"),
+            language="it",
+            detected_signals=frozenset({"filler"}),
+            protected_spans=(ProtectedSpan("VoiceFlow", "dictionary", 0, 9),),
+        )
+    ]
+    assert router.process_calls == [(router.decide_requests[0], decision)]
+    assert provider.requests == []
+    assert term_lookups == []
+    assert provider_routes == []
+    assert (trace.route, trace.reason) == (PostprocessRoute.RULES_ONLY, reason)
+    assert (trace.postprocess_started_ns, trace.postprocess_ended_ns) == (30, 40)
+
+
+def test_postprocess_stage_provider_route_uses_one_decision_and_one_term_lookup() -> None:
+    transcription = transcription_result(language="it")
+    operation = ProviderOperation("grammar", "normalized", "polished")
+    provider_result = PostprocessResult(
+        "polished",
+        operations=(operation,),
+        route=PostprocessRoute.PROVIDER,
+        reason=RouteReason.SEMANTIC_CLEANUP,
+    )
+    decision = RoutingDecision(
+        PostprocessRoute.PROVIDER,
+        RouteReason.SEMANTIC_CLEANUP,
+    )
+    router = CapturingRouter(decision, provider_result)
+    provider = CapturingPostprocessor(provider_result)
+    term_lookups: list[tuple[str | None, str | None]] = []
+    provider_routes: list[str] = []
+    trace = PipelineTrace(queued_ns=10)
+
+    result = PostprocessStage(
+        provider,
+        postprocess_router=router,
+        preferred_terms=lambda language, app: (
+            term_lookups.append((language, app)) or ("VoiceFlow",)
+        ),
+        on_provider_route=lambda: provider_routes.append("provider"),
+        clock_ns=StepClock(30, 40),
+    ).run(
+        NormalizationResult("normalized", detected_signals=frozenset({"filler"})),
+        raw_text="raw",
+        transcription=transcription,
+        processing_intent=ProcessingIntent.DEEP,
+        app_bundle_id="com.example.editor",
+        trace=trace,
+    )
+
+    assert result == PostprocessStageResult(
+        postprocess=provider_result,
+        final_text="polished",
+        route=PostprocessRoute.PROVIDER,
+        reason=RouteReason.SEMANTIC_CLEANUP,
+    )
+    assert result.postprocess is provider_result
+    assert result.postprocess.operations == (operation,)
+    assert len(router.decide_requests) == 1
+    assert len(router.process_calls) == 1
+    routed_request, routed_decision = router.process_calls[0]
+    assert routed_decision is decision
+    assert routed_request == PostprocessRequest(
+        text="normalized",
+        raw_text="raw",
+        transcription=transcription,
+        preferred_terms=("VoiceFlow",),
+        language="it",
+        processing_intent=ProcessingIntent.DEEP,
+        detected_signals=frozenset({"filler"}),
+    )
+    assert term_lookups == [("it", "com.example.editor")]
+    assert provider_routes == ["provider"]
+    assert (trace.route, trace.reason) == (
+        PostprocessRoute.PROVIDER,
+        RouteReason.SEMANTIC_CLEANUP,
+    )
+
+
+def test_postprocess_stage_preserves_provider_fallback_metadata() -> None:
+    fallback = PostprocessResult(
+        "normalized",
+        operations=(ProviderOperation("grammar", "bad", "good"),),
+        route=PostprocessRoute.PROVIDER,
+        reason=RouteReason.ALWAYS_MODE,
+        used_fallback=True,
+        fallback_code="provider_unavailable",
+        error="provider offline",
+    )
+    router = CapturingRouter(
+        RoutingDecision(PostprocessRoute.PROVIDER, RouteReason.ALWAYS_MODE),
+        fallback,
+    )
+
+    result = PostprocessStage(
+        CapturingPostprocessor(fallback),
+        postprocess_router=router,
+        clock_ns=StepClock(30, 40),
+    ).run(
+        NormalizationResult("normalized"),
+        raw_text="raw",
+        transcription=transcription_result(),
+        processing_intent=ProcessingIntent.AUTO,
+        app_bundle_id=None,
+        trace=PipelineTrace(queued_ns=10),
+    )
+
+    assert result.postprocess is fallback
+    assert result.final_text == "normalized"
+    assert result.postprocess.used_fallback
+    assert result.postprocess.fallback_code == "provider_unavailable"
+    assert result.postprocess.error == "provider offline"
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "expected_request", "route", "reason", "expected_lookups"),
+    [
+        (
+            "none",
+            "normalized",
+            PostprocessRoute.RULES_ONLY,
+            RouteReason.PROVIDER_DISABLED,
+            [],
+        ),
+        (
+            "provider",
+            PostprocessRequest(
+                text="normalized",
+                raw_text="raw",
+                transcription=transcription_result(language="en"),
+                preferred_terms=("VoiceFlow",),
+                language="en",
+            ),
+            PostprocessRoute.PROVIDER,
+            RouteReason.ALWAYS_MODE,
+            [("en", "com.example.editor")],
+        ),
+    ],
+)
+def test_postprocess_stage_preserves_legacy_routes(
+    provider_name: str,
+    expected_request: PostprocessRequest | str,
+    route: PostprocessRoute,
+    reason: RouteReason,
+    expected_lookups: list[tuple[str | None, str | None]],
+) -> None:
+    provider_result = PostprocessResult("legacy-result")
+    provider = CapturingPostprocessor(provider_result)
+    provider.name = provider_name
+    lookups: list[tuple[str | None, str | None]] = []
+    trace = PipelineTrace(queued_ns=10)
+
+    result = PostprocessStage(
+        provider,
+        preferred_terms=lambda language, app: lookups.append((language, app)) or ("VoiceFlow",),
+        clock_ns=StepClock(30, 40),
+    ).run(
+        NormalizationResult("normalized"),
+        raw_text="raw",
+        transcription=transcription_result(language="en"),
+        processing_intent=ProcessingIntent.AUTO,
+        app_bundle_id="com.example.editor",
+        trace=trace,
+    )
+
+    assert provider.requests == [expected_request]
+    assert lookups == expected_lookups
+    assert result == PostprocessStageResult(provider_result, "legacy-result", route, reason)
+    assert (trace.route, trace.reason) == (route, reason)
+
+
+@pytest.mark.parametrize("failure_point", ["decide", "process"])
+def test_postprocess_stage_preserves_errors_and_records_completed_timing(
+    failure_point: str,
+) -> None:
+    failure = RuntimeError(f"{failure_point} failed")
+
+    class FailingRouter(CapturingRouter):
+        def decide(self, request: PostprocessRequest) -> RoutingDecision:
+            if failure_point == "decide":
+                raise failure
+            return super().decide(request)
+
+        def process_decision(
+            self,
+            request: PostprocessRequest,
+            decision: RoutingDecision,
+        ) -> PostprocessResult:
+            if failure_point == "process":
+                raise failure
+            return super().process_decision(request, decision)
+
+    fallback = PostprocessResult(
+        "unused",
+        route=PostprocessRoute.PROVIDER,
+        reason=RouteReason.ALWAYS_MODE,
+    )
+    router = FailingRouter(
+        RoutingDecision(PostprocessRoute.PROVIDER, RouteReason.ALWAYS_MODE),
+        fallback,
+    )
+    trace = PipelineTrace(queued_ns=10)
+    stage = PostprocessStage(
+        CapturingPostprocessor(fallback),
+        postprocess_router=router,
+        clock_ns=StepClock(30, 40),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        stage.run(
+            NormalizationResult("normalized"),
+            raw_text="raw",
+            transcription=transcription_result(),
+            processing_intent=ProcessingIntent.AUTO,
+            app_bundle_id=None,
+            trace=trace,
+        )
+
+    assert raised.value is failure
+    assert (trace.postprocess_started_ns, trace.postprocess_ended_ns) == (30, 40)
+    assert (trace.route, trace.reason) == (None, None)
+
+
+def test_postprocess_stage_result_is_frozen_and_slotted() -> None:
+    result = PostprocessStageResult(
+        PostprocessResult("text"),
+        "text",
+        PostprocessRoute.RULES_ONLY,
+        RouteReason.CLEAN_FAST_PATH,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        result.final_text = "changed"  # type: ignore[misc]
     assert not hasattr(result, "__dict__")

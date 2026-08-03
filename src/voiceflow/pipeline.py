@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -19,8 +19,12 @@ from voiceflow.integrations import (
     T3CodeDestination,
 )
 from voiceflow.normalization import DeterministicNormalizer
-from voiceflow.pipeline_stages import NormalizationStage, TranscriptionStage
-from voiceflow.postprocess.base import PostProcessor, PostprocessRequest
+from voiceflow.pipeline_stages import (
+    NormalizationStage,
+    PostprocessStage,
+    TranscriptionStage,
+)
+from voiceflow.postprocess.base import PostProcessor
 from voiceflow.postprocess.router import PostprocessRouter
 from voiceflow.processing import (
     DeliveryStatus,
@@ -28,10 +32,8 @@ from voiceflow.processing import (
     PipelineOutcome,
     PipelineResultSink,
     PipelineTrace,
-    PostprocessRoute,
     ProcessedDictation,
     ProcessingIntent,
-    RouteReason,
 )
 from voiceflow.state import ActivityState, SystemState
 from voiceflow.system.text_injector import FocusChangedError, InjectionDestination
@@ -97,6 +99,13 @@ class DictationPipeline:
             clock_ns=clock_ns,
         )
         self._preferred_terms = preferred_terms or (lambda _language, _app: ())
+        self.postprocess_stage = PostprocessStage(
+            self.postprocessor,
+            postprocess_router=self.postprocess_router,
+            preferred_terms=self._preferred_terms,
+            on_provider_route=lambda: self.status.update(activity=ActivityState.POSTPROCESSING),
+            clock_ns=clock_ns,
+        )
         self.t3_bridge = t3_bridge
         self._schedule_injection = injection_scheduler
         self._slots = threading.BoundedSemaphore(max_pending)
@@ -291,49 +300,15 @@ class DictationPipeline:
             normalization = normalization_result.normalization
             normalized_text = normalization_result.normalized_text
             stage = "postprocess"
-            trace.postprocess_started_ns = self._clock_ns()
-            request = PostprocessRequest(
-                text=normalized_text,
+            postprocess_result = self.postprocess_stage.run(
+                normalization,
                 raw_text=raw_text,
                 transcription=transcription,
-                language=transcription.language,
                 processing_intent=job.processing_intent,
-                detected_signals=normalization.detected_signals,
-                protected_spans=normalization.protected_spans,
+                app_bundle_id=job.app_bundle_id,
+                trace=trace,
             )
-            try:
-                if self.postprocess_router is not None:
-                    decision = self.postprocess_router.decide(request)
-                    if decision.route == PostprocessRoute.PROVIDER:
-                        request = replace(
-                            request,
-                            preferred_terms=self._preferred_terms(
-                                transcription.language,
-                                job.app_bundle_id,
-                            ),
-                        )
-                        self.status.update(activity=ActivityState.POSTPROCESSING)
-                    result = self.postprocess_router.process_decision(request, decision)
-                    trace.route = result.route
-                    trace.reason = result.reason
-                elif self.postprocessor.name == "none":
-                    trace.route = PostprocessRoute.RULES_ONLY
-                    trace.reason = RouteReason.PROVIDER_DISABLED
-                    result = self.postprocessor.process(normalized_text)
-                else:
-                    trace.route = PostprocessRoute.PROVIDER
-                    trace.reason = RouteReason.ALWAYS_MODE
-                    request = replace(
-                        request,
-                        preferred_terms=self._preferred_terms(
-                            transcription.language,
-                            job.app_bundle_id,
-                        ),
-                    )
-                    self.status.update(activity=ActivityState.POSTPROCESSING)
-                    result = self.postprocessor.process(request)
-            finally:
-                trace.postprocess_ended_ns = self._clock_ns()
+            result = postprocess_result.postprocess
             self._raise_if_cancelled()
             if result.used_fallback:
                 trace.fallback_code = result.fallback_code or "provider_error"
@@ -361,7 +336,7 @@ class DictationPipeline:
                     fallback_code=trace.fallback_code,
                     provider_error=result.error,
                 )
-            final_text = result.text
+            final_text = postprocess_result.final_text
             self.status.update(activity=ActivityState.INJECTING)
             self._raise_if_cancelled()
             stage = "delivery"
