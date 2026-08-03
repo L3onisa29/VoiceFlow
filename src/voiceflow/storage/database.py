@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 import time
@@ -12,6 +11,11 @@ from voiceflow.config import HistoryConfig
 from voiceflow.dictionary.models import DictionaryKind
 from voiceflow.processing import DeliveryStatus, PostprocessRoute, RouteReason
 from voiceflow.storage.contracts import DictionaryEntryRecord, TranscriptionRecord
+from voiceflow.storage.permissions import (
+    ensure_private_directory,
+    ensure_private_file,
+    restrict_file_permissions,
+)
 
 SCHEMA_VERSION = 1
 MIGRATIONS: dict[int, tuple[str, ...]] = {
@@ -78,8 +82,12 @@ class VoiceBudStorage:
         self._lock = threading.RLock()
         self._closed = False
         self._migrations = MIGRATIONS if migrations is None else migrations
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
+        ensure_private_directory(self.path.parent)
+        ensure_private_file(self.path)
+        self._restrict_files()
+        # Python's sqlite3 API does not expose SQLITE_OPEN_NOFOLLOW. The descriptor-bound
+        # checks above reject every state observable immediately before this pathname open;
+        # a concurrent filesystem actor can still replace the entry in the final VFS interval.
         self._connection = sqlite3.connect(
             self.path,
             timeout=5,
@@ -91,7 +99,7 @@ class VoiceBudStorage:
             self._restrict_files()
             self._configure()
             self._migrate()
-            self.prune_history()
+            self.apply_retention_policy()
             self._restrict_files()
         except Exception:
             self._connection.close()
@@ -128,22 +136,25 @@ class VoiceBudStorage:
     def _restrict_files(self) -> None:
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.path}{suffix}")
-            if candidate.exists():
-                os.chmod(candidate, 0o600)
+            restrict_file_permissions(candidate)
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Storage is closed")
-            cursor = self._connection.execute(sql, parameters)
-            self._restrict_files()
-            return cursor
+            try:
+                return self._connection.execute(sql, parameters)
+            finally:
+                self._restrict_files()
 
     def query(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Storage is closed")
-            return list(self._connection.execute(sql, parameters))
+            try:
+                return list(self._connection.execute(sql, parameters))
+            finally:
+                self._restrict_files()
 
     def add_dictionary_entry(self, record: DictionaryEntryRecord) -> None:
         self.execute(
@@ -240,7 +251,7 @@ class VoiceBudStorage:
                 record.app_bundle_id,
             ),
         )
-        self.prune_history()
+        self.apply_retention_policy()
 
     def transcription_records(self) -> tuple[TranscriptionRecord, ...]:
         rows = self.query(
@@ -280,7 +291,8 @@ class VoiceBudStorage:
             for row in rows
         )
 
-    def prune_history(self) -> None:
+    def apply_retention_policy(self) -> None:
+        """Delete expired/excess records regardless of whether new writes are enabled."""
         cutoff = self._clock() - self.history.retention_hours * 3600
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -304,6 +316,12 @@ class VoiceBudStorage:
                 raise
             else:
                 self._connection.execute("COMMIT")
+            finally:
+                self._restrict_files()
+
+    def prune_history(self) -> None:
+        """Compatibility alias for the explicit retention policy boundary."""
+        self.apply_retention_policy()
 
     def save_correction(self, identifier: str, corrected_text: str) -> bool:
         cursor = self.execute(
@@ -323,4 +341,7 @@ class VoiceBudStorage:
             if self._closed:
                 return
             self._closed = True
-            self._connection.close()
+            try:
+                self._connection.close()
+            finally:
+                self._restrict_files()

@@ -66,6 +66,219 @@ def test_confirmed_audio_and_manifest_are_written_atomically(tmp_path: Path) -> 
     assert buffer.get("sample") is None
 
 
+@pytest.mark.parametrize("consumed_prefix", [".voicebud-audio-", ".manifest-"])
+def test_consumed_temporary_cleanup_failure_cannot_invalidate_committed_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    consumed_prefix: str,
+) -> None:
+    import voiceflow.feedback as feedback
+
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+    original_replace = feedback.replace_private_file
+    original_unlink = Path.unlink
+    consumed: set[Path] = set()
+
+    def track_replacement(source: Path, destination: Path) -> None:
+        original_replace(source, destination)
+        if source.name.startswith(consumed_prefix):
+            consumed.add(source)
+
+    def fail_consumed_cleanup(path: Path, missing_ok: bool = False) -> None:
+        if path in consumed:
+            raise OSError("post-commit temporary cleanup failed")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(feedback, "replace_private_file", track_replacement)
+    monkeypatch.setattr(Path, "unlink", fail_consumed_cleanup)
+
+    output = buffer.save_confirmed(
+        "sample",
+        tmp_path,
+        reference="sample",
+        confirmed=True,
+    )
+
+    assert output == tmp_path / "sample.wav"
+    assert output.is_file()
+    manifest = (tmp_path / "manifest.jsonl").read_text(encoding="utf-8")
+    assert [json.loads(line) for line in manifest.splitlines()] == [
+        {
+            "id": "sample",
+            "audio": "sample.wav",
+            "reference": "sample",
+            "required_terms": [],
+        }
+    ]
+    assert not list(tmp_path.glob(".voicebud-audio-*"))
+    assert not list(tmp_path.glob(".manifest-*"))
+    assert buffer.get("sample") is None
+
+
+def test_wav_permission_failure_cleans_temp_and_retains_buffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import voiceflow.feedback as feedback
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"id":"existing"}\n', encoding="utf-8")
+    os.chmod(manifest, 0o644)
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+    failed_descriptor: int | None = None
+
+    def fail_permission(descriptor: int) -> None:
+        nonlocal failed_descriptor
+        failed_descriptor = descriptor
+        raise OSError("permission hardening failed")
+
+    monkeypatch.setattr(feedback, "restrict_open_file", fail_permission)
+
+    with pytest.raises(OSError, match="permission hardening failed"):
+        buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
+
+    assert not list(tmp_path.glob(".voicebud-audio-*"))
+    assert not (tmp_path / "sample.wav").exists()
+    assert manifest.read_text(encoding="utf-8") == '{"id":"existing"}\n'
+    assert os.stat(manifest).st_mode & 0o777 == 0o644
+    assert buffer.get("sample") is not None
+    assert failed_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(failed_descriptor)
+
+
+def test_manifest_permission_failure_rolls_back_wav_and_retains_buffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import voiceflow.feedback as feedback
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"id":"existing"}\n', encoding="utf-8")
+    os.chmod(manifest, 0o644)
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+    original_restrict = feedback.restrict_open_file
+    calls = 0
+    failed_descriptor: int | None = None
+
+    def fail_second_permission(descriptor: int) -> None:
+        nonlocal calls, failed_descriptor
+        calls += 1
+        if calls == 2:
+            failed_descriptor = descriptor
+            raise OSError("manifest hardening failed")
+        original_restrict(descriptor)
+
+    monkeypatch.setattr(feedback, "restrict_open_file", fail_second_permission)
+
+    with pytest.raises(OSError, match="manifest hardening failed"):
+        buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
+
+    assert calls == 2
+    assert not list(tmp_path.glob(".manifest-*"))
+    assert not list(tmp_path.glob(".voicebud-audio-*"))
+    assert not (tmp_path / "sample.wav").exists()
+    assert manifest.read_text(encoding="utf-8") == '{"id":"existing"}\n'
+    assert os.stat(manifest).st_mode & 0o777 == 0o644
+    assert buffer.get("sample") is not None
+    assert failed_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(failed_descriptor)
+
+
+def test_successful_manifest_replacement_hardens_broad_existing_file(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"id":"existing"}\n', encoding="utf-8")
+    os.chmod(manifest, 0o644)
+    previous_inode = os.stat(manifest).st_ino
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+
+    buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
+
+    assert os.stat(manifest).st_mode & 0o777 == 0o600
+    assert os.stat(manifest).st_ino != previous_inode
+    assert [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()] == [
+        {"id": "existing"},
+        {
+            "id": "sample",
+            "audio": "sample.wav",
+            "reference": "sample",
+            "required_terms": [],
+        },
+    ]
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_feedback_rejects_manifest_symlink_and_rolls_back_wav(
+    tmp_path: Path,
+    dangling: bool,
+) -> None:
+    external = tmp_path / "external-manifest"
+    if not dangling:
+        external.write_text('{"id":"external"}\n', encoding="utf-8")
+        os.chmod(external, 0o644)
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.symlink_to(external)
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+
+    with pytest.raises(OSError):
+        buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
+
+    assert manifest.is_symlink()
+    assert not (tmp_path / "sample.wav").exists()
+    assert buffer.get("sample") is not None
+    if dangling:
+        assert not external.exists()
+    else:
+        assert external.read_text(encoding="utf-8") == '{"id":"external"}\n'
+        assert os.stat(external).st_mode & 0o777 == 0o644
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_feedback_rejects_output_symlink_without_touching_referent(
+    tmp_path: Path,
+    dangling: bool,
+) -> None:
+    external = tmp_path / "external-audio"
+    if not dangling:
+        external.write_bytes(b"external")
+        os.chmod(external, 0o644)
+    output = tmp_path / "sample.wav"
+    output.symlink_to(external)
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+
+    with pytest.raises(OSError):
+        buffer.save_confirmed("sample", tmp_path, reference="sample", confirmed=True)
+
+    assert output.is_symlink()
+    assert buffer.get("sample") is not None
+    if dangling:
+        assert not external.exists()
+    else:
+        assert external.read_bytes() == b"external"
+        assert os.stat(external).st_mode & 0o777 == 0o644
+
+
+def test_feedback_preserves_preexisting_custom_directory_mode(tmp_path: Path) -> None:
+    directory = tmp_path / "custom"
+    directory.mkdir(mode=0o755)
+    os.chmod(directory, 0o755)
+    buffer = RecentAudioBuffer()
+    buffer.store("sample", np.array([0.25], dtype=np.float32), 16000)
+
+    buffer.save_confirmed("sample", directory, reference="sample", confirmed=True)
+
+    assert os.stat(directory).st_mode & 0o777 == 0o755
+
+
 def test_multiple_jobs_remain_available_after_later_submissions() -> None:
     buffer = RecentAudioBuffer(capacity=3)
     for sequence_id in range(1, 4):
@@ -157,11 +370,13 @@ def test_concurrent_confirmations_serialize_manifest_read_modify_replace(
     second_read = threading.Event()
     second_replaced = threading.Event()
     save_context = threading.local()
-    original_read_text = Path.read_text
+    import voiceflow.feedback as feedback
+
+    original_read_text = feedback.read_managed_text_file
     original_replace = os.replace
 
-    def interleaved_read_text(path: Path, *args: object, **kwargs: object) -> str:
-        contents = original_read_text(path, *args, **kwargs)
+    def interleaved_read_text(path: Path) -> str:
+        contents = original_read_text(path)
         if path != manifest:
             return contents
         save_name = getattr(save_context, "name", None)
@@ -173,12 +388,26 @@ def test_concurrent_confirmations_serialize_manifest_read_modify_replace(
             second_read.set()
         return contents
 
-    def tracked_replace(source: str | Path, destination: str | Path) -> None:
-        original_replace(source, destination)
-        if Path(destination) == manifest and getattr(save_context, "name", None) == "second":
+    def tracked_replace(
+        source: str | Path,
+        destination: str | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        original_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if (
+            Path(destination).name == manifest.name
+            and getattr(save_context, "name", None) == "second"
+        ):
             second_replaced.set()
 
-    monkeypatch.setattr(Path, "read_text", interleaved_read_text)
+    monkeypatch.setattr(feedback, "read_managed_text_file", interleaved_read_text)
     monkeypatch.setattr(os, "replace", tracked_replace)
 
     def save(name: str) -> Path | None:

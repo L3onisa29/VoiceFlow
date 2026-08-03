@@ -22,6 +22,7 @@ from voiceflow.processing import (
     RouteReason,
 )
 from voiceflow.storage import HistoryResultSink, VoiceBudStorage
+from voiceflow.storage.contracts import TranscriptionRecord
 from voiceflow.transcription import TranscriptionResult
 
 
@@ -110,6 +111,112 @@ def test_storage_migration_is_idempotent_private_and_rolls_back(tmp_path: Path) 
         == 0
     )
     connection.close()
+
+
+def test_storage_preserves_preexisting_custom_directory_mode(tmp_path: Path) -> None:
+    directory = tmp_path / "custom"
+    directory.mkdir(mode=0o755)
+    os.chmod(directory, 0o755)
+
+    storage = VoiceBudStorage(directory / "voicebud.sqlite3", history=HistoryConfig())
+
+    assert os.stat(directory).st_mode & 0o777 == 0o755
+    storage.close()
+
+
+def test_explicit_retention_applies_when_new_history_writes_are_disabled(
+    tmp_path: Path,
+) -> None:
+    now = [1_000.0]
+    storage = make_storage(
+        tmp_path,
+        enabled=False,
+        max_entries=100,
+        retention_hours=24,
+        clock=lambda: now[0],
+    )
+    for index, created_at in enumerate((900.0, 950.0, 999.0)):
+        storage.save_transcription(
+            TranscriptionRecord(
+                identifier=f"record-{index}",
+                created_at=created_at,
+                raw_text="raw",
+                normalized_text="normalized",
+                final_text="final",
+                corrected_text=None,
+                language=None,
+                route=None,
+                reason_code=None,
+                fallback_code=None,
+                confidence_proxy=None,
+                audio_seconds=1,
+                stt_seconds=None,
+                normalization_seconds=None,
+                postprocess_seconds=None,
+                total_seconds=None,
+                delivery_status=DeliveryStatus.INJECTED,
+                error_code=None,
+                app_bundle_id=None,
+            )
+        )
+    storage.history = HistoryConfig(enabled=False, max_entries=2, retention_hours=1)
+    storage.apply_retention_policy()
+    assert [record.identifier for record in storage.transcription_records()] == [
+        "record-2",
+        "record-1",
+    ]
+
+    now[0] += 3_601
+    storage.apply_retention_policy()
+    assert storage.transcription_count() == 0
+
+    disabled = HistoryResultSink(storage, HistoryConfig(enabled=False))
+    disabled.consume(outcome("must not be written"))
+    assert storage.transcription_count() == 0
+    storage.close()
+
+
+def test_storage_bootstrap_applies_retention_when_history_writes_are_disabled(
+    tmp_path: Path,
+) -> None:
+    storage = make_storage(
+        tmp_path,
+        enabled=True,
+        max_entries=100,
+        retention_hours=24,
+        clock=lambda: 1_000,
+    )
+    for index, created_at in enumerate((900.0, 950.0, 999.0)):
+        storage.execute(
+            """
+            INSERT INTO transcriptions (
+                id, created_at, raw_text, normalized_text, final_text,
+                audio_seconds, delivery_status
+            ) VALUES (?, ?, 'raw', 'normalized', 'final', 1, 'injected')
+            """,
+            (f"record-{index}", created_at),
+        )
+    path = storage.path
+    storage.close()
+
+    retained = VoiceBudStorage(
+        path,
+        history=HistoryConfig(enabled=False, max_entries=2, retention_hours=1),
+        clock=lambda: 1_000,
+    )
+    assert [record.identifier for record in retained.transcription_records()] == [
+        "record-2",
+        "record-1",
+    ]
+    retained.close()
+
+    expired = VoiceBudStorage(
+        path,
+        history=HistoryConfig(enabled=False, max_entries=2, retention_hours=1),
+        clock=lambda: 5_000,
+    )
+    assert expired.transcription_count() == 0
+    expired.close()
 
 
 def test_history_disabled_writes_no_transcript_and_enabled_obeys_limits(

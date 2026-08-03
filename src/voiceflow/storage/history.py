@@ -11,6 +11,8 @@ from voiceflow.storage.contracts import HistoryRepository, TranscriptionRecord
 
 
 class HistoryResultSink:
+    """Record new history only when enabled; retention remains a storage policy."""
+
     def __init__(
         self,
         storage: HistoryRepository | None,

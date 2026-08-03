@@ -14,6 +14,14 @@ from uuid import uuid4
 
 import numpy as np
 
+from voiceflow.storage.permissions import (
+    ensure_private_directory,
+    read_managed_text_file,
+    replace_private_file,
+    restrict_file_permissions,
+    restrict_open_file,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RecentAudio:
@@ -119,25 +127,31 @@ class RecentAudioBuffer:
             metadata, buffered_audio = entry
             audio = buffered_audio.copy()
             sample_rate = metadata.sample_rate
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(directory, 0o700)
+        ensure_private_directory(directory)
         output = directory / f"{identifier or uuid4()}.wav"
-        if output.exists():
+        if restrict_file_permissions(output):
             output = directory / f"{identifier}-{uuid4()}.wav"
         pcm = (np.clip(audio, -1, 1) * np.iinfo(np.int16).max).astype(np.int16).tobytes()
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".voicebud-audio-", suffix=".wav", dir=directory
         )
-        os.close(descriptor)
         temporary = Path(temporary_name)
+        temporary_owned = True
         try:
-            with wave.open(str(temporary), "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(sample_rate)
-                wav.writeframes(pcm)
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, output)
+            try:
+                restrict_open_file(descriptor)
+                with (
+                    os.fdopen(descriptor, "w+b", closefd=False) as temporary_file,
+                    wave.open(temporary_file, "wb") as wav,
+                ):
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(sample_rate)
+                    wav.writeframes(pcm)
+            finally:
+                os.close(descriptor)
+            replace_private_file(temporary, output)
+            temporary_owned = False
             try:
                 self._append_manifest(
                     directory / "manifest.jsonl",
@@ -152,7 +166,8 @@ class RecentAudioBuffer:
                 output.unlink(missing_ok=True)
                 raise
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary_owned:
+                temporary.unlink(missing_ok=True)
         with self._lock:
             current = self._entries.get(identifier)
             if current is not None and current[0] is metadata:
@@ -163,16 +178,26 @@ class RecentAudioBuffer:
         # This lock owns the complete filesystem read-modify-replace transaction.
         # save_confirmed never holds the in-memory buffer lock while acquiring it.
         with self._manifest_lock:
-            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            existing = read_managed_text_file(path)
             descriptor, temporary_name = tempfile.mkstemp(prefix=".manifest-", dir=path.parent)
-            os.close(descriptor)
             temporary = Path(temporary_name)
+            temporary_owned = True
             try:
-                temporary.write_text(
-                    existing + json.dumps(record, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, path)
+                try:
+                    restrict_open_file(descriptor)
+                    with os.fdopen(
+                        descriptor,
+                        "w",
+                        encoding="utf-8",
+                        closefd=False,
+                    ) as temporary_file:
+                        temporary_file.write(
+                            existing + json.dumps(record, ensure_ascii=False) + "\n"
+                        )
+                finally:
+                    os.close(descriptor)
+                replace_private_file(temporary, path)
+                temporary_owned = False
             finally:
-                temporary.unlink(missing_ok=True)
+                if temporary_owned:
+                    temporary.unlink(missing_ok=True)

@@ -134,7 +134,10 @@ class DictionaryConfig(StrictModel):
 
 
 class HistoryConfig(StrictModel):
-    enabled: bool = False
+    enabled: bool = Field(
+        default=False,
+        description="Controls new history writes only; retention still deletes existing records.",
+    )
     retention_hours: int = Field(default=24, ge=1)
     max_entries: int = Field(default=100, ge=1)
     store_app_bundle_id: bool = False
