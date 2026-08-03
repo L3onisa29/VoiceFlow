@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
+import select
+import signal
 import socket
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
@@ -14,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import voiceflow.integrations.t3_code_bridge as t3_bridge_module
 from voiceflow.integrations import (
     BridgeOutcome,
     FrontmostApplicationKind,
@@ -25,6 +30,8 @@ from voiceflow.integrations.t3_code_bridge import (
     MAX_DESCRIPTOR_BYTES,
     MAX_RESPONSE_FRAME_BYTES,
     T3_CODE_BUNDLE_IDENTIFIER,
+    _LocalValidationError,
+    _ProcessRequestIdentifiers,
 )
 
 ResponseFactory = Callable[[dict[str, Any]], bytes | None]
@@ -559,6 +566,308 @@ def test_request_ids_and_nonces_are_new_for_every_request(bridge_dir: Path) -> N
     assert len(set(identifiers)) == 4
 
 
+def test_process_request_ids_are_monotonic_and_concurrency_safe() -> None:
+    prefix_calls = 0
+
+    def prefix_factory() -> str:
+        nonlocal prefix_calls
+        prefix_calls += 1
+        return "process-prefix"
+
+    identifiers = _ProcessRequestIdentifiers(prefix_factory)
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        generated = list(executor.map(lambda _index: identifiers.next(), range(4_000)))
+
+    assert prefix_calls == 1
+    assert len(set(generated)) == 4_000
+    assert {value.rsplit(":", 1)[0] for value in generated} == {"process-prefix"}
+    assert sorted(int(value.rsplit(":", 1)[1]) for value in generated) == list(range(1, 4_001))
+
+
+def test_process_request_prefix_is_regenerated_after_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_pid = 100
+    prefixes = iter(("parent-prefix", "child-prefix"))
+    monkeypatch.setattr(t3_bridge_module.os, "getpid", lambda: current_pid)
+    identifiers = _ProcessRequestIdentifiers(lambda: next(prefixes))
+
+    assert identifiers.next() == "parent-prefix:1"
+    current_pid = 101
+    assert identifiers.next() == "child-prefix:1"
+    assert identifiers.next() == "child-prefix:2"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+def test_process_request_ids_reset_an_inherited_locked_lock_after_fork() -> None:
+    prefixes = iter(("parent-prefix", "child-prefix"))
+    identifiers = _ProcessRequestIdentifiers(lambda: next(prefixes))
+    assert identifiers.next() == "parent-prefix:1"
+    read_fd, write_fd = os.pipe()
+
+    identifiers._lock.acquire()
+    try:
+        child_pid = os.fork()
+    except BaseException:
+        identifiers._lock.release()
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+    if child_pid != 0:
+        identifiers._lock.release()
+
+    if child_pid == 0:
+        os.close(read_fd)
+
+        def exit_on_timeout(_signum: int, _frame: Any) -> None:
+            os._exit(42)
+
+        signal.signal(signal.SIGALRM, exit_on_timeout)
+        signal.alarm(2)
+        try:
+            request_id = identifiers.next()
+            os.write(write_fd, request_id.encode())
+        except BaseException:
+            os._exit(43)
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        readable, _writable, _exceptional = select.select([read_fd], [], [], 3)
+        if not readable:
+            with suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
+            pytest.fail("forked identifier generation did not terminate")
+        _waited_pid, status = os.waitpid(child_pid, 0)
+        payload = os.read(read_fd, 256).decode()
+    finally:
+        os.close(read_fd)
+
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert payload == "child-prefix:1"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+def test_at_fork_reset_isolates_base_exception_and_prioritizes_global_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_prefixes = iter(("global-parent", "global-child"))
+    trailing_prefixes = iter(("trailing-parent", "trailing-child"))
+    global_identifiers = _ProcessRequestIdentifiers(lambda: next(global_prefixes))
+    trailing_identifiers = _ProcessRequestIdentifiers(lambda: next(trailing_prefixes))
+    failing_identifiers = _ProcessRequestIdentifiers(lambda: "failing-prefix")
+    assert global_identifiers.next() == "global-parent:1"
+    assert trailing_identifiers.next() == "trailing-parent:1"
+
+    failure_calls = 0
+
+    def fail_reset() -> None:
+        nonlocal failure_calls
+        failure_calls += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(failing_identifiers, "_reset_lock_after_fork", fail_reset)
+    monkeypatch.setattr(
+        t3_bridge_module,
+        "_PROCESS_REQUEST_IDENTIFIERS",
+        global_identifiers,
+    )
+    # Make the adversarial order deterministic: the shared generator is listed last,
+    # while another locked instance follows the entry that raises BaseException.
+    monkeypatch.setattr(
+        t3_bridge_module,
+        "_PROCESS_REQUEST_IDENTIFIER_INSTANCES",
+        (failing_identifiers, trailing_identifiers, global_identifiers),
+    )
+    read_fd, write_fd = os.pipe()
+
+    global_identifiers._lock.acquire()
+    trailing_identifiers._lock.acquire()
+    try:
+        child_pid = os.fork()
+    except BaseException:
+        global_identifiers._lock.release()
+        trailing_identifiers._lock.release()
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+    if child_pid != 0:
+        global_identifiers._lock.release()
+        trailing_identifiers._lock.release()
+
+    if child_pid == 0:
+        os.close(read_fd)
+
+        def exit_on_timeout(_signum: int, _frame: Any) -> None:
+            os._exit(42)
+
+        signal.signal(signal.SIGALRM, exit_on_timeout)
+        signal.alarm(2)
+        try:
+            payload = "|".join(
+                (
+                    global_identifiers.next(),
+                    trailing_identifiers.next(),
+                    str(failure_calls),
+                )
+            )
+            os.write(write_fd, payload.encode())
+        except BaseException:
+            os._exit(43)
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        readable, _writable, _exceptional = select.select([read_fd], [], [], 3)
+        if not readable:
+            with suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
+            pytest.fail("forked identifier reset did not isolate the failing entry")
+        _waited_pid, status = os.waitpid(child_pid, 0)
+        payload = os.read(read_fd, 256).decode()
+    finally:
+        os.close(read_fd)
+
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert payload == "global-child:1|trailing-child:1|1"
+
+
+def test_process_request_identifier_registry_does_not_retain_dead_instances() -> None:
+    registry = t3_bridge_module._PROCESS_REQUEST_IDENTIFIER_INSTANCES
+    gc.collect()
+    size_before = len(registry)
+    identifiers = _ProcessRequestIdentifiers(lambda: "temporary-prefix")
+    reference = weakref.ref(identifiers)
+
+    assert len(registry) == size_before + 1
+    del identifiers
+    gc.collect()
+
+    assert reference() is None
+    assert len(registry) == size_before
+
+
+def test_request_generation_does_not_retain_identifier_history(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_identifiers = _ProcessRequestIdentifiers(lambda: "bounded-prefix")
+    monkeypatch.setattr(
+        t3_bridge_module,
+        "_PROCESS_REQUEST_IDENTIFIERS",
+        request_identifiers,
+    )
+    nonce_counter = iter(range(10_000))
+    bridge = bridge_for(
+        bridge_dir / "unused.json",
+        id_factory=lambda: f"nonce-{next(nonce_counter)}",
+    )
+    collections_before = {
+        name: len(value)
+        for name, value in vars(bridge).items()
+        if isinstance(value, (dict, list, set))
+    }
+
+    requests = [
+        bridge._new_request(
+            request_type="recording.started",
+            recording_id=RECORDING_ID,
+            secret=SECRET,
+        )
+        for _index in range(10_000)
+    ]
+
+    collections_after = {
+        name: len(value)
+        for name, value in vars(bridge).items()
+        if isinstance(value, (dict, list, set))
+    }
+    assert collections_after == collections_before
+    assert "_used_request_identifiers" not in vars(bridge)
+    assert len({request["requestId"] for request in requests}) == 10_000
+    assert len({request["nonce"] for request in requests}) == 10_000
+
+
+def test_nonce_generation_is_independent_from_request_counter(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        t3_bridge_module,
+        "_PROCESS_REQUEST_IDENTIFIERS",
+        _ProcessRequestIdentifiers(lambda: "independent-prefix"),
+    )
+    nonces = iter(("random-nonce-a", "random-nonce-b"))
+    bridge = bridge_for(bridge_dir / "unused.json", id_factory=lambda: next(nonces))
+
+    first = bridge._new_request(
+        request_type="recording.started",
+        recording_id=RECORDING_ID,
+        secret=SECRET,
+    )
+    second = bridge._new_request(
+        request_type="recording.started",
+        recording_id=SECOND_RECORDING_ID,
+        secret=SECRET,
+    )
+
+    assert first["requestId"] == "independent-prefix:1"
+    assert second["requestId"] == "independent-prefix:2"
+    assert first["nonce"] == "random-nonce-a"
+    assert second["nonce"] == "random-nonce-b"
+
+
+def test_request_identifier_and_nonce_respect_128_character_limit(
+    bridge_dir: Path,
+) -> None:
+    assert len(_ProcessRequestIdentifiers(lambda: "p" * 126).next()) == 128
+    with pytest.raises(_LocalValidationError):
+        _ProcessRequestIdentifiers(lambda: "p" * 127).next()
+
+    bridge = bridge_for(bridge_dir / "unused.json", id_factory=lambda: "n" * 129)
+    with pytest.raises(_LocalValidationError):
+        bridge._new_request(
+            request_type="recording.started",
+            recording_id=RECORDING_ID,
+            secret=SECRET,
+        )
+
+
+def test_request_wire_encoding_is_unchanged(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        t3_bridge_module,
+        "_PROCESS_REQUEST_IDENTIFIERS",
+        _ProcessRequestIdentifiers(lambda: "wire-prefix"),
+    )
+    socket_path = bridge_dir / "bridge.sock"
+    with server(socket_path, accepted_response) as instance:
+        bridge = bridge_for(
+            write_descriptor(bridge_dir, socket_path),
+            wall_clock=lambda: 1_234.5,
+            id_factory=lambda: "wire-nonce",
+        )
+        assert bridge.reserve_recording(RECORDING_ID).accepted
+
+    assert instance.raw_requests == [
+        (
+            '{"version":1,"type":"recording.started",'
+            '"requestId":"wire-prefix:1",'
+            f'"recordingId":"{RECORDING_ID}",'
+            '"nonce":"wire-nonce","sentAt":1234500,'
+            f'"auth":"{SECRET}"}}\n'
+        ).encode()
+    ]
+
+
 def test_request_ids_are_not_reused_after_ambiguous_error(bridge_dir: Path) -> None:
     socket_path = bridge_dir / "bridge.sock"
 
@@ -577,6 +886,10 @@ def test_request_ids_are_not_reused_after_ambiguous_error(bridge_dir: Path) -> N
         instance.requests[1]["nonce"],
     }
     assert len(identifiers) == 4
+    first_prefix, first_counter = instance.requests[0]["requestId"].rsplit(":", 1)
+    second_prefix, second_counter = instance.requests[1]["requestId"].rsplit(":", 1)
+    assert first_prefix == second_prefix
+    assert int(second_counter) > int(first_counter)
 
 
 def test_socket_replacement_after_reservation_is_fail_closed(

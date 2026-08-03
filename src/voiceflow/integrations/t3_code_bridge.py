@@ -10,6 +10,7 @@ import stat
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -177,6 +178,64 @@ class _AmbiguousResponseError(Exception):
     pass
 
 
+_PROCESS_REQUEST_IDENTIFIER_INSTANCES: weakref.WeakSet[_ProcessRequestIdentifiers] = (
+    weakref.WeakSet()
+)
+
+
+def _reset_process_request_identifier_locks_after_fork() -> None:
+    # Reset the process-global generator first: request generation must not depend on
+    # WeakSet iteration order, and one broken auxiliary instance must not leave the
+    # shared generator with a lock inherited from a vanished parent thread.
+    global_identifiers = _PROCESS_REQUEST_IDENTIFIERS
+    try:  # noqa: SIM105 - avoid allocating a suppress context after fork
+        global_identifiers._reset_lock_after_fork()
+    except BaseException:
+        pass
+
+    # A post-fork callback cannot safely report failures. Isolate every entry so a
+    # faulty test/custom generator cannot prevent later instances from being reset.
+    for identifiers in _PROCESS_REQUEST_IDENTIFIER_INSTANCES:
+        if identifiers is global_identifiers:
+            continue
+        try:  # noqa: SIM105 - isolate entries without a post-fork context object
+            identifiers._reset_lock_after_fork()
+        except BaseException:
+            pass
+
+
+class _ProcessRequestIdentifiers:
+    """Generate bounded request identifiers without retaining request history."""
+
+    def __init__(self, prefix_factory: Callable[[], str] | None = None) -> None:
+        self._prefix_factory = prefix_factory or (lambda: uuid.uuid4().hex)
+        self._lock = threading.Lock()
+        self._pid = os.getpid()
+        self._prefix = self._new_prefix()
+        self._counter = 0
+        _PROCESS_REQUEST_IDENTIFIER_INSTANCES.add(self)
+
+    def next(self) -> str:
+        with self._lock:
+            current_pid = os.getpid()
+            if current_pid != self._pid:
+                self._pid = current_pid
+                self._prefix = self._new_prefix()
+                self._counter = 0
+            self._counter += 1
+            request_id = f"{self._prefix}:{self._counter}"
+            _validate_identifier(request_id)
+            return request_id
+
+    def _new_prefix(self) -> str:
+        prefix = self._prefix_factory()
+        _validate_identifier(prefix)
+        return prefix
+
+    def _reset_lock_after_fork(self) -> None:
+        self._lock = threading.Lock()
+
+
 class T3CodeBridge:
     def __init__(
         self,
@@ -204,12 +263,11 @@ class T3CodeBridge:
         )
         self._monotonic = monotonic
         self._wall_clock = wall_clock
-        self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
+        self._nonce_factory = id_factory or (lambda: str(uuid.uuid4()))
         self._current_uid = current_uid
         self._lock = threading.RLock()
         self._sessions: dict[str, _Session] = {}
         self._reservations_in_progress: set[str] = set()
-        self._used_request_identifiers: set[str] = set()
 
     def reserve_recording(self, recording_id: str) -> BridgeResult:
         registered = False
@@ -494,19 +552,12 @@ class T3CodeBridge:
         secret: str,
         transcript: str | None = None,
     ) -> dict[str, object]:
-        request_id = self._id_factory()
-        nonce = self._id_factory()
+        request_id = _PROCESS_REQUEST_IDENTIFIERS.next()
+        nonce = self._nonce_factory()
         _validate_identifier(request_id)
         _validate_identifier(nonce)
         if request_id == nonce:
             raise _LocalValidationError
-        with self._lock:
-            if (
-                request_id in self._used_request_identifiers
-                or nonce in self._used_request_identifiers
-            ):
-                raise _LocalValidationError
-            self._used_request_identifiers.update((request_id, nonce))
         request: dict[str, object] = {
             "version": PROTOCOL_VERSION,
             "type": request_type,
@@ -665,6 +716,11 @@ def _decode_json_object(data: bytes) -> dict[str, Any]:
 def _validate_identifier(value: str) -> None:
     if not isinstance(value, str) or _ID_PATTERN.fullmatch(value) is None:
         raise _LocalValidationError
+
+
+_PROCESS_REQUEST_IDENTIFIERS = _ProcessRequestIdentifiers()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_process_request_identifier_locks_after_fork)
 
 
 def _validate_recording_id(recording_id: str) -> None:
