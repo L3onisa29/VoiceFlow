@@ -29,40 +29,156 @@ def _not_regular_file_error(path: Path) -> OSError:
     return OSError(errno.EINVAL, "managed file is not a regular file", path)
 
 
-def _validate_directory(path: Path) -> None:
+def _validate_directory(path: Path) -> os.stat_result:
     state = path.lstat()
     if stat.S_ISLNK(state.st_mode):
         raise _symlink_error(path)
     if not stat.S_ISDIR(state.st_mode):
         raise _not_directory_error(path)
+    return state
+
+
+def _identity(state: os.stat_result) -> tuple[int, int]:
+    return state.st_dev, state.st_ino
+
+
+def _stale_directory_error(path: Path) -> OSError:
+    return OSError(errno.ESTALE, "managed directory changed during validation", path)
+
+
+def _private_directory_mode_error(path: Path) -> PermissionError:
+    return PermissionError(
+        errno.EACCES,
+        "app-created directory does not have mode 0700",
+        path,
+    )
+
+
+def _validate_created_directory_mode(path: Path, state: os.stat_result) -> None:
+    if stat.S_IMODE(state.st_mode) != PRIVATE_DIRECTORY_MODE:
+        raise _private_directory_mode_error(path)
+
+
+def _open_directory_component(
+    parent_descriptor: int,
+    name: str,
+    path: Path,
+    expected: os.stat_result,
+) -> int:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _CLOSE_ON_EXEC | _DIRECTORY | _NO_FOLLOW,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise _symlink_error(path) from error
+        if error.errno == errno.ENOTDIR:
+            raise _not_directory_error(path) from error
+        raise
+
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise _not_directory_error(path)
+        if _identity(opened) != _identity(expected):
+            raise _stale_directory_error(path)
+
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            raise _symlink_error(path)
+        if not stat.S_ISDIR(entry.st_mode):
+            raise _not_directory_error(path)
+        if _identity(entry) != _identity(opened):
+            raise _stale_directory_error(path)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _verify_directory_chain(
+    absolute: Path,
+    descriptors: list[int],
+    components: list[tuple[str, Path, bool]],
+) -> None:
+    for index, (name, path, created_by_app) in enumerate(components):
+        parent_descriptor = descriptors[index]
+        child = os.fstat(descriptors[index + 1])
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(entry.st_mode):
+            raise _symlink_error(path)
+        if not stat.S_ISDIR(entry.st_mode):
+            raise _not_directory_error(path)
+        if _identity(entry) != _identity(child):
+            raise _stale_directory_error(path)
+        if created_by_app:
+            _validate_created_directory_mode(path, child)
+            _validate_created_directory_mode(path, entry)
+
+    pinned = os.fstat(descriptors[-1])
+    final = _validate_directory(absolute)
+    if _identity(final) != _identity(pinned):
+        raise _stale_directory_error(absolute)
+    if components and components[-1][2]:
+        _validate_created_directory_mode(absolute, pinned)
+        _validate_created_directory_mode(absolute, final)
 
 
 def ensure_private_directory(directory: Path) -> None:
-    """Create and restrict an app-managed directory without accepting symlinks."""
+    """Create private components and reject path replacement during validation.
+
+    No later path-based chmod is performed because Python's mkdir API cannot
+    atomically return the inode it created.  If an unusual process umask removes
+    owner permissions, or the entry is replaced before it can be pinned, the
+    function fails safely instead of reporting a non-0700 directory as private.
+    """
     absolute = _absolute(directory)
     current = Path(absolute.anchor)
-    created_target = False
-    for name in absolute.parts[1:]:
-        current /= name
-        try:
-            _validate_directory(current)
-        except FileNotFoundError:
-            os.mkdir(current, PRIVATE_DIRECTORY_MODE)
-            _validate_directory(current)
-            os.chmod(current, PRIVATE_DIRECTORY_MODE, follow_symlinks=False)
-            created_target = current == absolute
-
-    descriptor = os.open(
-        absolute,
+    root_descriptor = os.open(
+        absolute.anchor,
         os.O_RDONLY | _CLOSE_ON_EXEC | _DIRECTORY | _NO_FOLLOW,
     )
+    descriptors = [root_descriptor]
+    components: list[tuple[str, Path, bool]] = []
     try:
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise _not_directory_error(absolute)
-        if created_target:
-            os.fchmod(descriptor, PRIVATE_DIRECTORY_MODE)
+        if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
+            raise _not_directory_error(Path(absolute.anchor))
+
+        for name in absolute.parts[1:]:
+            current /= name
+            created_by_app = False
+            try:
+                expected = _validate_directory(current)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(name, PRIVATE_DIRECTORY_MODE, dir_fd=descriptors[-1])
+                except FileExistsError:
+                    # A concurrent creator owns this component; preserve its mode.
+                    expected = _validate_directory(current)
+                else:
+                    created_by_app = True
+                    expected = _validate_directory(current)
+                    # A same-mode replacement is indistinguishable here, but it
+                    # still satisfies the privacy invariant without mutation.
+                    _validate_created_directory_mode(current, expected)
+
+            descriptor = _open_directory_component(
+                descriptors[-1],
+                name,
+                current,
+                expected,
+            )
+            if created_by_app:
+                _validate_created_directory_mode(current, os.fstat(descriptor))
+            descriptors.append(descriptor)
+            components.append((name, current, created_by_app))
+
+        _verify_directory_chain(absolute, descriptors, components)
     finally:
-        os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _open_regular_file(

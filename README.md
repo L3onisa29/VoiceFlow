@@ -56,7 +56,7 @@ The production T3 Code bundle creates `~/.t3/userdata/integrations/voicebud/brid
 
 `pid` must be a positive integer. The socket path must be absolute, must resolve inside the descriptor directory, and must identify a real, non-symlink Unix socket owned by the same user. VoiceBud opens the descriptor with `O_NOFOLLOW`, validates it using `fstat`, limits it to 16 KiB, and rejects group/other permissions. It also pins the descriptor fingerprint and the socket `st_dev`/`st_ino` for every accepted recording.
 
-Each connection carries exactly one compact UTF-8 JSON object followed by newline and receives exactly one newline-terminated response. `recording.started` contains `version`, `type`, fresh `requestId` and `nonce` UUIDs, the recording UUID v4, Unix `sentAt` milliseconds, and `auth`. Only an explicit correlated response accepts the reservation:
+Each connection carries exactly one compact UTF-8 JSON object followed by newline and receives exactly one newline-terminated response. `recording.started` contains `version`, `type`, a fresh `requestId` formed as `<process-random-prefix>:<monotonic-counter>` (with the counter incremented under lock), an independently generated random UUID `nonce`, the recording UUID v4, Unix `sentAt` milliseconds, and `auth`. Only an explicit correlated response accepts the reservation:
 
 ```json
 {
@@ -120,3 +120,8 @@ VoiceBud is currently a local Python application rather than a signed `.app` bun
 ## Privacy
 
 Microphone samples remain in this process and are passed only to local ONNX Runtime. VoiceBud never sends audio to Codex or Ollama. When post-processing is enabled, only transcript text is sent to that provider. Transcript contents and provider stderr are not written to VoiceBud logs.
+
+Directories created by VoiceBud must be exactly `0700`; pre-existing custom directories
+keep their existing mode. If an unusual process umask removes owner permissions from a
+new directory, VoiceBud fails safely instead of applying `chmod`: after `mkdir` returns,
+the created inode may already have been replaced, so mutating the path would be unsafe.
