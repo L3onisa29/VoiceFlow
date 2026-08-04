@@ -23,6 +23,9 @@
     "src/voiceflow/dictionary/resilient.py",
     "src/voiceflow/dictionary/service.py",
     "src/voiceflow/system/text_ports.py",
-    "src/voiceflow/system/text_injector.py"
+    "src/voiceflow/system/text_injector.py",
+    "src/voiceflow/integrations/t3_protocol.py",
+    "src/voiceflow/integrations/t3_descriptor.py",
+    "src/voiceflow/integrations/t3_transport.py"
   ]
 }
