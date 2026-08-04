@@ -4,7 +4,6 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Any
 
 from voiceflow.state import (
     ActivityState,
@@ -14,6 +13,7 @@ from voiceflow.state import (
     StateStore,
     SystemState,
 )
+from voiceflow.ui.contracts import MenuView, ModelNotificationView, OverlayView
 
 
 class OverlayMode(StrEnum):
@@ -78,11 +78,11 @@ class StatusController:
 
     def __init__(
         self,
-        menu_bar: Any,
-        overlay: Any,
+        menu_bar: MenuView,
+        overlay: OverlayView,
         *,
         postprocess_label: str,
-        model_notification: Any | None = None,
+        model_notification: ModelNotificationView | None = None,
         stt_provider: str = "CPUExecutionProvider",
         dispatch: Callable[..., None] | None = None,
         show_processing_overlay: bool = True,
