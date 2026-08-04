@@ -9,48 +9,48 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
-from voiceflow.audio.recorder import Recorder
-from voiceflow.audio.release import AudioReleaseCoordinator
+from voiceflow.application_services import ApplicationServices
 from voiceflow.config import AppConfig, load_config
-from voiceflow.correction import CorrectionService, propose_replacement, word_diff
+from voiceflow.correction import propose_replacement, word_diff
 from voiceflow.diagnostics import BackgroundLogWriter, exception_fields, log_event
-from voiceflow.dictionary import DictionaryKind, DictionaryService, ResilientDictionary
-from voiceflow.dictionary.app_scope import AppBundleResolver
-from voiceflow.feedback import RecentAudioBuffer
+from voiceflow.dictionary import DictionaryKind
 from voiceflow.integrations import (
     BridgeOutcome,
     DictationDestination,
     FrontmostApplicationKind,
-    MacOSFrontmostApplicationDetector,
-    T3CodeBridge,
     T3CodeDestination,
 )
-from voiceflow.normalization import DeterministicNormalizer
-from voiceflow.pipeline import DictationPipeline
-from voiceflow.postprocess import create_postprocessor
-from voiceflow.postprocess.router import PostprocessRouter
 from voiceflow.processing import ProcessedDictation, ProcessingIntent
 from voiceflow.recording import (
     AccessibilityAtStop,
     CapturedSubmission,
     RecordingLease,
     RecordingPhase,
-    RecordingStopCoordinator,
     StopDisposition,
     StopResult,
 )
 from voiceflow.state import ActivityState, ModelState, PostprocessState, SystemState
-from voiceflow.storage import HistoryResultSink, VoiceBudStorage
-from voiceflow.stt.parakeet import ParakeetTranscriber
-from voiceflow.system.hotkey import PushToTalk, hotkey_label
-from voiceflow.system.permissions import check_permissions
-from voiceflow.system.text_injector import InjectionDestination, TextInjector
-from voiceflow.ui.menu_bar import MenuBar
-from voiceflow.ui.model_notification import ModelNotification
-from voiceflow.ui.overlay import Overlay
-from voiceflow.ui.status_controller import StatusController
+from voiceflow.system.hotkey import hotkey_label
+from voiceflow.system.text_injector import InjectionDestination
+from voiceflow.ui.contracts import MenuActions
+
+if TYPE_CHECKING:
+    from voiceflow.audio.recorder import Recorder
+    from voiceflow.audio.release import AudioReleaseCoordinator
+    from voiceflow.correction import CorrectionService
+    from voiceflow.dictionary import DictionaryService, ResilientDictionary
+    from voiceflow.normalization import DeterministicNormalizer
+    from voiceflow.pipeline import DictationPipeline
+    from voiceflow.postprocess.base import PostProcessor
+    from voiceflow.postprocess.router import PostprocessRouter
+    from voiceflow.storage import HistoryResultSink, VoiceBudStorage
+    from voiceflow.stt.parakeet import ParakeetTranscriber
+    from voiceflow.system.hotkey import PushToTalk
+    from voiceflow.system.text_injector import TextInjector
+    from voiceflow.ui.contracts import ApplicationViewBundle
+    from voiceflow.ui.status_controller import StatusController
 
 LOGGER = logging.getLogger(__name__)
 APP_NAME = "VoiceBud"
@@ -174,11 +174,10 @@ def _run_event_loop(app_helper: Any) -> None:
 
 
 class VoiceBudApplication:
-    def __init__(self, config: AppConfig) -> None:
-        from PyObjCTools import AppHelper
-
+    def __init__(self, config: AppConfig, services: ApplicationServices) -> None:
         self.config = config
-        self._app_helper = AppHelper
+        self.services = services
+        self._app_helper = services.app_helper
         self._lock = threading.RLock()
         self._loading = False
         self._postprocess_loading = False
@@ -192,92 +191,135 @@ class VoiceBudApplication:
         self.hotkey: PushToTalk | None = None
         self.recorder: Recorder | None = None
 
-        self.overlay = Overlay(self._audio_level)
-        self.model_notification = ModelNotification()
-        self.menu_bar = MenuBar(
-            on_retry_input=self.retry_input,
-            on_retry_model=self.retry_model,
-            on_retry_postprocess=self.retry_postprocess,
-            on_copy_last=self.copy_last_text,
-            on_copy_raw=self.copy_raw_text,
-            on_correct_last=self.correct_last,
-            on_add_term=self.add_term,
-            on_clear_history=self.clear_history,
-            on_deep_next=self.request_deep_cleanup,
-            on_quit=self.quit,
+        self.views: ApplicationViewBundle = services.own(
+            services.view_factory.create(
+                MenuActions(
+                    retry_input=self.retry_input,
+                    retry_model=self.retry_model,
+                    retry_postprocess=self.retry_postprocess,
+                    copy_last=self.copy_last_text,
+                    copy_raw=self.copy_raw_text,
+                    correct_last=self.correct_last,
+                    add_term=self.add_term,
+                    clear_history=self.clear_history,
+                    deep_next=self.request_deep_cleanup,
+                    quit=self.quit,
+                ),
+                level_fn=self._audio_level,
+            ),
+            lambda views: views.close(),
         )
+        self.overlay = self.views.overlay
+        self.model_notification = self.views.model_notification
+        self.menu_bar = self.views.menu
         postprocess_label = config.postprocess.provider
         if config.postprocess.provider == "codex":
             postprocess_label += f" / {config.postprocess.codex.model}"
         elif config.postprocess.provider == "ollama":
             postprocess_label += f" / {config.postprocess.ollama.model}"
-        self.status = StatusController(
-            self.menu_bar,
-            self.overlay,
-            postprocess_label=postprocess_label,
-            model_notification=self.model_notification,
-            stt_provider=config.stt.provider,
-            show_processing_overlay=config.ui.show_processing_overlay,
-            error_indicator_seconds=config.ui.error_indicator_seconds,
-            completion_indicator_seconds=config.ui.completion_indicator_seconds,
+        self.status: StatusController = services.own(
+            services.status_factory(
+                self.views,
+                config,
+                postprocess_label=postprocess_label,
+            ),
+            lambda status: status.close(),
         )
-        self.audio_release_coordinator = AudioReleaseCoordinator(
-            on_saturated=self._audio_status,
+        self.audio_release_coordinator: AudioReleaseCoordinator = services.own(
+            services.audio_release_factory(self._audio_status),
+            lambda coordinator: coordinator.close(timeout=AUDIO_RELEASE_SHUTDOWN_TIMEOUT_SECONDS),
         )
-        self.postprocessor = create_postprocessor(
-            config.postprocess,
-            state_callback=self._on_postprocess_state,
+        self.postprocessor: PostProcessor = services.own(
+            services.postprocessor_factory(
+                config,
+                state_callback=self._on_postprocess_state,
+            ),
+            lambda postprocessor: postprocessor.close(),
         )
-        self.transcriber = ParakeetTranscriber(
-            config.stt,
-            state_callback=self._on_model_state,
+        self.transcriber: ParakeetTranscriber = services.own(
+            services.transcriber_factory(
+                config,
+                state_callback=self._on_model_state,
+            ),
+            lambda _transcriber: None,
         )
-        self.injector = TextInjector(
-            method=config.inject.method,
-            clipboard_clear_after_seconds=config.inject.clipboard_clear_after_seconds,
+        self.injector: TextInjector = services.own(
+            services.injector_factory(config),
+            lambda injector: injector.close(),
         )
-        self.t3_bridge = T3CodeBridge()
-        self.frontmost_detector = MacOSFrontmostApplicationDetector()
+        self.t3_bridge = services.own(
+            services.t3_bridge_factory(),
+            lambda _bridge: None,
+        )
+        self.frontmost_detector = services.own(
+            services.frontmost_detector_factory(),
+            lambda _detector: None,
+        )
         self.storage: VoiceBudStorage | None = None
         self.dictionary: DictionaryService | None = None
         self.resilient_dictionary: ResilientDictionary | None = None
         storage_failed = False
         try:
-            self.storage = VoiceBudStorage(
-                config.storage.database_path,
-                history=config.history,
+            self.storage = services.own(
+                services.storage_factory(config),
+                lambda storage: storage.close(),
             )
             if config.dictionary.enabled:
-                self.dictionary = DictionaryService(self.storage)
-                self.resilient_dictionary = ResilientDictionary(
-                    self.dictionary,
-                    notifier=lambda message: self.status.transient(message, error=True),
-                    logger=LOGGER,
+                self.dictionary = services.own(
+                    services.dictionary_factory(self.storage),
+                    lambda _dictionary: None,
+                )
+                self.resilient_dictionary = services.own(
+                    services.resilient_dictionary_factory(
+                        self.dictionary,
+                        notifier=lambda message: self.status.transient(message, error=True),
+                    ),
+                    lambda _dictionary: None,
                 )
         except Exception:
             storage_failed = True
             LOGGER.exception("Optional local storage initialization failed")
-        self.history_sink = HistoryResultSink(self.storage, config.history)
-        self.correction_service = CorrectionService(self.history_sink, self.dictionary)
-        self.audio_feedback = RecentAudioBuffer.for_pipeline(
-            config.feedback.recent_audio_seconds,
-            max_pending=config.pipeline.max_pending,
+        self.history_sink: HistoryResultSink = services.own(
+            services.history_sink_factory(self.storage, config),
+            lambda _sink: None,
         )
-        self.app_bundle_resolver = AppBundleResolver()
-        self.recording_stop_coordinator = RecordingStopCoordinator(
-            audio_config=config.audio,
-            device_name=lambda: self.recorder.device_name if self.recorder is not None else "audio",
-            capture_destination=lambda: self.injector.capture_destination(),
-            resolve_bundle_id=lambda pid: self.app_bundle_resolver.resolve(pid),
-            store_recent_audio=lambda identifier, audio, sample_rate: self.audio_feedback.store(
-                identifier,
-                audio,
-                sample_rate,
+        self.correction_service: CorrectionService = services.own(
+            services.correction_factory(self.history_sink, self.dictionary),
+            lambda _correction: None,
+        )
+        self.audio_feedback = services.own(
+            services.feedback_factory(config),
+            lambda feedback: feedback.clear(),
+        )
+        self.app_bundle_resolver = services.own(
+            services.app_bundle_resolver_factory(),
+            lambda _resolver: None,
+        )
+        self.recording_stop_coordinator = services.own(
+            services.stop_coordinator_factory(
+                config,
+                device_name=lambda: (
+                    self.recorder.device_name if self.recorder is not None else "audio"
+                ),
+                capture_destination=lambda: self.injector.capture_destination(),
+                resolve_bundle_id=lambda pid: self.app_bundle_resolver.resolve(pid),
+                store_recent_audio=lambda identifier, audio, sample_rate: self.audio_feedback.store(
+                    identifier,
+                    audio,
+                    sample_rate,
+                ),
+                submission_allowed=self._recording_submission_allowed,
             ),
-            submission_allowed=self._recording_submission_allowed,
+            lambda _coordinator: None,
         )
-        self.normalizer = DeterministicNormalizer(self.resilient_dictionary)
-        self.postprocess_router = PostprocessRouter(self.postprocessor, config.postprocess.routing)
+        self.normalizer: DeterministicNormalizer = services.own(
+            services.normalizer_factory(self.resilient_dictionary),
+            lambda _normalizer: None,
+        )
+        self.postprocess_router: PostprocessRouter = services.own(
+            services.router_factory(self.postprocessor, config),
+            lambda _router: None,
+        )
         self.status.update(
             system=SystemState.CHECKING,
             model=ModelState.NOT_LOADED,
@@ -304,7 +346,7 @@ class VoiceBudApplication:
         self._start_loading()
 
     def _check_permissions(self, *, request: bool):
-        return check_permissions(
+        return self.services.permission_checker(
             request=request,
             microphone_callback=self._microphone_permission_decided,
         )
@@ -367,40 +409,30 @@ class VoiceBudApplication:
         recorder: Recorder | None = None
         pipeline: DictationPipeline | None = None
         hotkey: PushToTalk | None = None
-        release_coordinator = getattr(self, "audio_release_coordinator", None)
-        if release_coordinator is None:
-            release_coordinator = AudioReleaseCoordinator(on_saturated=self._audio_status)
-            self.audio_release_coordinator = release_coordinator
+        release_coordinator = self.audio_release_coordinator
         try:
-            recorder = Recorder(
-                sample_rate=self.config.audio.sample_rate,
-                channels=self.config.audio.channels,
-                device=self.config.audio.device,
-                maximum_recording_seconds=self.config.audio.maximum_recording_seconds,
+            recorder = self.services.recorder_factory(
+                self.config,
                 on_max_duration=self._recording_limit_reached,
                 on_status=self._audio_status,
                 release_coordinator=release_coordinator,
             )
-            pipeline = DictationPipeline(
+            pipeline = self.services.pipeline_factory(
+                self.config,
                 transcriber=self.transcriber,
                 postprocessor=self.postprocessor,
                 injector=self.injector,
                 status=self.status,
-                max_pending=self.config.pipeline.max_pending,
-                shutdown_timeout_seconds=self.config.pipeline.shutdown_timeout_seconds,
-                injection_timeout_seconds=self.config.pipeline.injection_timeout_seconds,
-                result_sink=getattr(self, "history_sink", None),
-                normalizer=getattr(self, "normalizer", None),
-                postprocess_router=getattr(self, "postprocess_router", None),
-                formatting=self.config.formatting,
+                result_sink=self.history_sink,
+                normalizer=self.normalizer,
+                postprocess_router=self.postprocess_router,
                 preferred_terms=self._preferred_terms,
                 t3_bridge=self.t3_bridge,
             )
-            hotkey = PushToTalk(
-                self.config.hotkey.key,
-                self._recording_started,
-                self._recording_stopped,
-                mode=self.config.hotkey.mode,
+            hotkey = self.services.hotkey_factory(
+                self.config,
+                on_start=self._recording_started,
+                on_stop=self._recording_stopped,
                 is_recording=self._is_recording,
             )
             hotkey.start()
@@ -1029,21 +1061,23 @@ class VoiceBudApplication:
             self._recording_destination = None
             self._recording_phase = RecordingPhase.IDLE
         if hotkey is not None:
-            hotkey.stop()
+            with suppress(Exception):
+                hotkey.stop()
+        if lease is not None:
+            with suppress(Exception):
+                lease.abort()
+        if pipeline is not None:
+            with suppress(Exception):
+                pipeline.shutdown(
+                    close_postprocessor=False,
+                    publish_stopping=False,
+                )
         if recorder is not None:
             if phase != RecordingPhase.STOPPING and recorder.recording:
                 with suppress(Exception):
                     recorder.stop()
             with suppress(Exception):
                 recorder.close()
-        if lease is not None:
-            with suppress(Exception):
-                lease.abort()
-        if pipeline is not None:
-            pipeline.shutdown(
-                close_postprocessor=False,
-                publish_stopping=False,
-            )
         self.status.update(
             activity=ActivityState.IDLE,
             recording=False,
@@ -1058,26 +1092,26 @@ class VoiceBudApplication:
             self._closing = True
             hotkey = self.hotkey
             recorder = self.recorder
+            pipeline = self.pipeline
             lease = self._recording_lease
             phase = self._recording_phase
+            self.hotkey = None
+            self.recorder = None
+            self.pipeline = None
             self._recording_lease = None
             self._recording_destination = None
             self._recording_phase = RecordingPhase.IDLE
+            self._shutdown_pipeline = pipeline
+            self._shutdown_recorder = recorder
+            self._shutdown_phase = phase
         self._stop_input_health_monitor()
         self.status.update(activity=ActivityState.STOPPING)
         if hotkey is not None:
-            hotkey.stop()
-        if recorder is not None and phase != RecordingPhase.STOPPING and recorder.recording:
             with suppress(Exception):
-                recorder.stop()
+                hotkey.stop()
         if lease is not None:
             with suppress(Exception):
                 lease.abort()
-        if recorder is not None:
-            with suppress(Exception):
-                recorder.close()
-        self.status.close()
-        self.overlay.close()
         threading.Thread(
             target=self._finish_quit,
             name="voiceflow-shutdown",
@@ -1085,26 +1119,30 @@ class VoiceBudApplication:
         ).start()
 
     def _finish_quit(self) -> None:
+        if hasattr(self, "_shutdown_pipeline"):
+            pipeline = self._shutdown_pipeline
+            recorder = self._shutdown_recorder
+            phase = self._shutdown_phase
+            self._shutdown_pipeline = None
+            self._shutdown_recorder = None
+        else:
+            pipeline = self.pipeline
+            recorder = getattr(self, "recorder", None)
+            phase = getattr(self, "_recording_phase", RecordingPhase.IDLE)
         try:
-            if self.pipeline is not None:
-                self.pipeline.shutdown()
-            else:
-                self.postprocessor.close()
+            if pipeline is not None:
+                pipeline.shutdown(close_postprocessor=False)
         except Exception:
             LOGGER.exception("Application shutdown failed")
         finally:
-            release_coordinator = getattr(self, "audio_release_coordinator", None)
-            if release_coordinator is not None:
+            if recorder is not None:
+                if phase != RecordingPhase.STOPPING and recorder.recording:
+                    with suppress(Exception):
+                        recorder.stop()
                 with suppress(Exception):
-                    release_coordinator.close(timeout=AUDIO_RELEASE_SHUTDOWN_TIMEOUT_SECONDS)
+                    recorder.close()
             with suppress(Exception):
-                self.injector.close()
-            with suppress(Exception):
-                self.audio_feedback.clear()
-            storage = getattr(self, "storage", None)
-            if storage is not None:
-                with suppress(Exception):
-                    storage.close()
+                self.services.close()
             self._app_helper.callAfter(self._app_helper.stopEventLoop)
 
 
@@ -1138,13 +1176,14 @@ def run(config_path: str | None = None, *, debug: bool = False) -> int:
             with _single_instance_lock():
                 _rename_process()
                 from AppKit import NSApplication
-                from PyObjCTools import AppHelper
+
+                from voiceflow.bootstrap import build_application
 
                 app = NSApplication.sharedApplication()
                 app.setActivationPolicy_(1)
-                controller = VoiceBudApplication(config)
+                controller = build_application(config)
                 controller.start()
-                _run_event_loop(AppHelper)
+                _run_event_loop(controller.services.app_helper)
         except AlreadyRunningError as exc:
             log_event(
                 LOGGER,

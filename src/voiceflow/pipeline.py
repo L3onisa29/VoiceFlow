@@ -233,9 +233,8 @@ class DictationPipeline:
                     context=self._job_context(job),
                     **exception_fields(exc),
                 )
-                self.status.transient(
-                    "Destinazione cambiata — testo lasciato negli appunti",
-                    error=True,
+                self.status.copied(
+                    detail="Destinazione cambiata — testo copiato negli appunti",
                 )
             except PermissionError as exc:
                 log_event(

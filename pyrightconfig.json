@@ -29,6 +29,8 @@
     "src/voiceflow/integrations/t3_transport.py",
     "src/voiceflow/ui/contracts.py",
     "src/voiceflow/ui/factory.py",
-    "src/voiceflow/ui/status_controller.py"
+    "src/voiceflow/ui/status_controller.py",
+    "src/voiceflow/application_services.py",
+    "src/voiceflow/bootstrap.py"
   ]
 }

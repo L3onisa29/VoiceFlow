@@ -31,6 +31,7 @@ class Status:
         self.updates: list[dict[str, Any]] = []
         self.messages: list[str] = []
         self.outcomes: list[dict[str, Any]] = []
+        self.copied_outcomes: list[dict[str, Any]] = []
 
     def update(self, **changes: Any) -> None:
         self.updates.append(changes)
@@ -41,6 +42,10 @@ class Status:
     def complete(self, **kwargs: Any) -> None:
         self.messages.append("Completato")
         self.outcomes.append(kwargs)
+
+    def copied(self, **kwargs: Any) -> None:
+        self.messages.append("Copiato")
+        self.copied_outcomes.append(kwargs)
 
 
 class Postprocessor:
@@ -443,10 +448,10 @@ def test_clipboard_only_destination_is_an_expected_completion() -> None:
         wait_empty(pipeline)
         assert injector.values == ["clean-raw text"]
         assert injector.destinations == [destination]
-        assert pipeline.status.outcomes == [
+        assert pipeline.status.outcomes == []
+        assert pipeline.status.copied_outcomes == [
             {
-                "fallback": False,
-                "detail": "Nessuna destinazione — testo lasciato negli appunti",
+                "detail": "Nessuna destinazione — testo copiato negli appunti",
             }
         ]
     finally:

@@ -67,6 +67,8 @@ class DeliveryStatusPresenter(Protocol):
 
     def complete(self, *, fallback: bool, detail: str | None) -> None: ...
 
+    def copied(self, *, detail: str | None = None) -> None: ...
+
 
 class T3DeliveryBridge(Protocol):
     def deliver_transcription(
@@ -414,21 +416,20 @@ class DeliveryStage:
     ) -> None:
         completion_details: list[str] = []
         if isinstance(destination, InjectionDestination) and destination.uses_clipboard_only:
-            completion_details.append("Nessuna destinazione — testo lasciato negli appunti")
+            completion_details.append("Nessuna destinazione — testo copiato negli appunti")
         if used_fallback:
             completion_details.append(
                 f"{fallback_provider} non disponibile — usato testo normalizzato"
             )
         if delivery == DeliveryStatus.T3_DELIVERED:
             completion_details.insert(0, "Consegnato a T3 Code")
-        if delivery in {
-            DeliveryStatus.INJECTED,
-            DeliveryStatus.CLIPBOARD_ONLY,
-            DeliveryStatus.T3_DELIVERED,
-        }:
+        detail = "; ".join(completion_details) or None
+        if delivery == DeliveryStatus.CLIPBOARD_ONLY:
+            self._status.copied(detail=detail)
+        elif delivery in {DeliveryStatus.INJECTED, DeliveryStatus.T3_DELIVERED}:
             self._status.complete(
                 fallback=used_fallback,
-                detail="; ".join(completion_details) or None,
+                detail=detail,
             )
 
 

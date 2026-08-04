@@ -21,6 +21,7 @@ class OverlayMode(StrEnum):
     WAVEFORM = "waveform"
     PROCESSING = "processing"
     SUCCESS = "success"
+    COPIED = "copied"
     WARNING = "warning"
     FAILURE = "failure"
 
@@ -190,6 +191,15 @@ class StatusController:
             duration=self.completion_indicator_seconds,
         )
 
+    def copied(self, *, detail: str | None = None) -> None:
+        self._set_outcome(
+            text=detail or "Testo copiato negli appunti",
+            icon="⧉",
+            mode=OverlayMode.COPIED,
+            accent=OverlayAccent.CYAN,
+            duration=self.completion_indicator_seconds,
+        )
+
     def _set_outcome(
         self,
         *,
@@ -312,11 +322,8 @@ class StatusController:
             self._transient_generation += 1
             timers = tuple(self._timers)
             self._timers.clear()
-            model_notification = self.model_notification
         for timer in timers:
             timer.cancel()
-        if model_notification is not None:
-            model_notification.close()
 
 
 def _state_has_priority_over_transient(state: AppState) -> bool:

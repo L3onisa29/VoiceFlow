@@ -650,12 +650,16 @@ class CapturingDeliveryStatus:
     def __init__(self) -> None:
         self.transients: list[tuple[str, bool]] = []
         self.completions: list[tuple[bool, str | None]] = []
+        self.copies: list[str | None] = []
 
     def transient(self, text: str, *, error: bool = False) -> None:
         self.transients.append((text, error))
 
     def complete(self, *, fallback: bool, detail: str | None) -> None:
         self.completions.append((fallback, detail))
+
+    def copied(self, *, detail: str | None = None) -> None:
+        self.copies.append(detail)
 
 
 class CapturingDeliveryInjector:
@@ -691,7 +695,7 @@ FOCUSED_DESTINATION = InjectionDestination.focused(FocusTarget(1, "field"))
         (
             InjectionDestination.clipboard_only(),
             DeliveryStatus.CLIPBOARD_ONLY,
-            "Nessuna destinazione — testo lasciato negli appunti; "
+            "Nessuna destinazione — testo copiato negli appunti; "
             "provider non disponibile — usato testo normalizzato",
         ),
     ],
@@ -724,7 +728,12 @@ def test_delivery_stage_injects_once_and_preserves_destination_timing_and_comple
     assert result == DeliveryStageResult(expected_delivery, None, destination)
     assert result.destination is destination
     assert injector.calls == [("final text", destination)]
-    assert status.completions == [(destination.uses_clipboard_only, expected_detail)]
+    if destination.uses_clipboard_only:
+        assert status.completions == []
+        assert status.copies == [expected_detail]
+    else:
+        assert status.completions == [(False, expected_detail)]
+        assert status.copies == []
     assert status.transients == []
     assert (trace.injection_started_ns, trace.injection_ended_ns) == (30, 40)
 

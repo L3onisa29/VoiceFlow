@@ -396,7 +396,26 @@ class Overlay:
 
         path = CGPathCreateMutable()
         center_x = self._geometry.width / 2
-        if mode in {OverlayMode.SUCCESS, OverlayMode.WARNING}:
+        if mode == OverlayMode.COPIED:
+            # Rear sheet: only the exposed edges are drawn to keep the
+            # overlapping-paper silhouette legible at menu-overlay size.
+            CGPathMoveToPoint(path, None, center_x - 6.0, 13.0)
+            CGPathAddLineToPoint(path, None, center_x - 6.0, 21.0)
+            CGPathAddLineToPoint(path, None, center_x + 3.0, 21.0)
+            CGPathAddLineToPoint(path, None, center_x + 3.0, 18.0)
+
+            # Front sheet.
+            CGPathMoveToPoint(path, None, center_x - 3.0, 9.0)
+            CGPathAddLineToPoint(path, None, center_x + 7.0, 9.0)
+            CGPathAddLineToPoint(path, None, center_x + 7.0, 18.0)
+            CGPathAddLineToPoint(path, None, center_x - 3.0, 18.0)
+            CGPathAddLineToPoint(path, None, center_x - 3.0, 9.0)
+
+            # Small success check inside the front sheet.
+            CGPathMoveToPoint(path, None, center_x - 1.0, 13.5)
+            CGPathAddLineToPoint(path, None, center_x + 1.0, 11.5)
+            CGPathAddLineToPoint(path, None, center_x + 5.0, 15.5)
+        elif mode in {OverlayMode.SUCCESS, OverlayMode.WARNING}:
             CGPathMoveToPoint(path, None, center_x - 6.5, 15.0)
             CGPathAddLineToPoint(path, None, center_x - 2.0, 10.5)
             CGPathAddLineToPoint(path, None, center_x + 6.8, 19.5)
@@ -407,6 +426,7 @@ class Overlay:
             CGPathAddLineToPoint(path, None, center_x - 5.0, 20.0)
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
+        self.outcome_layer.setLineWidth_(1.8 if mode == OverlayMode.COPIED else 2.4)
         self.outcome_layer.setPath_(path)
         CATransaction.commit()
 

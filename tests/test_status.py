@@ -22,6 +22,7 @@ from voiceflow.ui.status_controller import (
         (OverlayMode.WAVEFORM, 99, 50),
         (OverlayMode.PROCESSING, 60.5, 50),
         (OverlayMode.SUCCESS, 30, 50),
+        (OverlayMode.COPIED, 30, 50),
         (OverlayMode.WARNING, 30, 50),
         (OverlayMode.FAILURE, 30, 50),
     ],
@@ -111,7 +112,7 @@ def test_active_overlay_uses_twelve_pixel_horizontal_padding(
 
 @pytest.mark.parametrize(
     "mode",
-    [OverlayMode.SUCCESS, OverlayMode.WARNING, OverlayMode.FAILURE],
+    [OverlayMode.SUCCESS, OverlayMode.COPIED, OverlayMode.WARNING, OverlayMode.FAILURE],
 )
 def test_outcome_overlay_is_circular_without_shared_padding(
     mode: OverlayMode,
@@ -298,7 +299,7 @@ def test_model_notification_replaces_loading_overlay() -> None:
     assert notification.errors == [("model file missing", 4)]
     assert overlay.updates[-1].mode == OverlayMode.HIDDEN
     controller.close()
-    assert notification.closed
+    assert not notification.closed
 
 
 def test_identical_updates_do_not_schedule_duplicate_render() -> None:
@@ -368,7 +369,7 @@ def test_menu_and_overlay_are_deduplicated_independently() -> None:
     assert len(overlay.updates) == 1
 
 
-def test_success_fallback_and_failure_use_outcome_icons() -> None:
+def test_success_copy_fallback_and_failure_use_outcome_icons() -> None:
     menu, overlay = MenuView(), OverlayView()
     controller = StatusController(
         menu,
@@ -382,6 +383,11 @@ def test_success_fallback_and_failure_use_outcome_icons() -> None:
     controller.complete()
     assert overlay.updates[-1].mode == OverlayMode.SUCCESS
     assert overlay.updates[-1].accent == OverlayAccent.GREEN
+    controller.copied()
+    assert menu.updates[-1]["icon"] == "⧉"
+    assert menu.updates[-1]["text"] == "Testo copiato negli appunti"
+    assert overlay.updates[-1].mode == OverlayMode.COPIED
+    assert overlay.updates[-1].accent == OverlayAccent.CYAN
     controller.complete(fallback=True, detail="usato testo originale")
     assert overlay.updates[-1].mode == OverlayMode.WARNING
     assert overlay.updates[-1].accent == OverlayAccent.AMBER

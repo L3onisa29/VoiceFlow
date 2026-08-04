@@ -665,10 +665,10 @@ def test_stt_loading_is_independent_from_postprocess_preflight() -> None:
 
 def test_activation_rollback_does_not_publish_stopping(
     app_config: AppConfig,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     shutdown_calls: list[dict[str, Any]] = []
     release_coordinators: list[object] = []
+    close_events: list[str] = []
 
     class Recorder:
         device_name = "Default"
@@ -680,6 +680,7 @@ def test_activation_rollback_does_not_publish_stopping(
 
         def close(self) -> None:
             self.closed = True
+            close_events.append("close:recorder")
 
     class Pipeline:
         def __init__(self, **_kwargs: Any) -> None:
@@ -687,6 +688,8 @@ def test_activation_rollback_does_not_publish_stopping(
 
         def shutdown(self, **kwargs: Any) -> None:
             shutdown_calls.append(kwargs)
+            close_events.append("close:pipeline")
+            raise RuntimeError("pipeline close failed")
 
     class Hotkey:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -696,11 +699,8 @@ def test_activation_rollback_does_not_publish_stopping(
             raise RuntimeError("listener failed")
 
         def stop(self) -> None:
-            pass
-
-    monkeypatch.setattr("voiceflow.app.Recorder", Recorder)
-    monkeypatch.setattr("voiceflow.app.DictationPipeline", Pipeline)
-    monkeypatch.setattr("voiceflow.app.PushToTalk", Hotkey)
+            close_events.append("close:hotkey")
+            raise RuntimeError("hotkey close failed")
 
     app = VoiceBudApplication.__new__(VoiceBudApplication)
     app.config = app_config
@@ -715,6 +715,15 @@ def test_activation_rollback_does_not_publish_stopping(
     app.t3_bridge = object()
     app.status = Status()
     app.audio_release_coordinator = object()
+    app.history_sink = object()
+    app.normalizer = object()
+    app.postprocess_router = object()
+    app._preferred_terms = lambda _language, _app: ()
+    app.services = SimpleNamespace(
+        recorder_factory=lambda _config, **kwargs: Recorder(**kwargs),
+        pipeline_factory=lambda _config, **kwargs: Pipeline(**kwargs),
+        hotkey_factory=lambda _config, **kwargs: Hotkey(**kwargs),
+    )
 
     app._activate_input()
 
@@ -727,25 +736,23 @@ def test_activation_rollback_does_not_publish_stopping(
     assert app.status.updates[-1]["activity"] == ActivityState.IDLE
     assert app.status.updates[-1]["system"] == SystemState.ERROR
     assert release_coordinators == [app.audio_release_coordinator]
+    assert close_events == ["close:hotkey", "close:pipeline", "close:recorder"]
 
 
 def test_finish_quit_stops_event_loop_even_if_shutdown_raises() -> None:
     helper = Helper()
     app = VoiceBudApplication.__new__(VoiceBudApplication)
     app.pipeline = SimpleNamespace(
-        shutdown=lambda: (_ for _ in ()).throw(RuntimeError("shutdown failed"))
+        shutdown=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("shutdown failed"))
     )
-    app.postprocessor = object()
     app._app_helper = helper
-    close_calls: list[float] = []
-    app.audio_release_coordinator = SimpleNamespace(
-        close=lambda timeout: close_calls.append(timeout)
-    )
+    close_calls: list[str] = []
+    app.services = SimpleNamespace(close=lambda: close_calls.append("services"))
 
     app._finish_quit()
 
     assert helper.scheduled == [(helper.stopEventLoop, ())]
-    assert close_calls == [0.2]
+    assert close_calls == ["services"]
 
 
 def test_event_loop_installs_mach_interrupt_for_ctrl_c() -> None:

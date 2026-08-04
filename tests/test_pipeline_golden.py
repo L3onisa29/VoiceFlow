@@ -172,6 +172,7 @@ class GoldenStatus:
         self.updates: list[dict[str, Any]] = []
         self.messages: list[str] = []
         self.completions: list[dict[str, Any]] = []
+        self.copies: list[dict[str, Any]] = []
 
     def update(self, **changes: Any) -> None:
         self.updates.append(changes)
@@ -183,6 +184,9 @@ class GoldenStatus:
 
     def complete(self, **kwargs: Any) -> None:
         self.completions.append(kwargs)
+
+    def copied(self, **kwargs: Any) -> None:
+        self.copies.append(kwargs)
 
 
 class GoldenSink:
@@ -226,6 +230,7 @@ class GoldenExpectation:
     bridge_deliveries: tuple[tuple[str, str], ...] = ()
     messages: tuple[str, ...] = ()
     completions: tuple[tuple[bool, str | None], ...] = ()
+    copies: tuple[str | None, ...] = ()
 
 
 def trace(
@@ -483,7 +488,7 @@ GOLDEN_MATRIX: tuple[tuple[GoldenCase, GoldenExpectation], ...] = (
                 "result_sink",
             ),
             injected=("clean-raw text",),
-            completions=((False, "Nessuna destinazione — testo lasciato negli appunti"),),
+            copies=("Nessuna destinazione — testo copiato negli appunti",),
         ),
     ),
     (
@@ -508,7 +513,7 @@ GOLDEN_MATRIX: tuple[tuple[GoldenCase, GoldenExpectation], ...] = (
                 "result_sink",
             ),
             clipboard_fallbacks=("clean-raw text",),
-            messages=("Destinazione cambiata — testo lasciato negli appunti",),
+            copies=("Destinazione cambiata — testo copiato negli appunti",),
         ),
     ),
     (
@@ -827,6 +832,7 @@ def test_dictation_pipeline_golden_outcome_matrix(
         tuple((completion["fallback"], completion["detail"]) for completion in status.completions)
         == expected.completions
     )
+    assert tuple(copy["detail"] for copy in status.copies) == expected.copies
     if case.destination == "clipboard":
         assert injector.calls == [(expected.final_text, CLIPBOARD_DESTINATION)]
     if case.injection_failure == "permission":

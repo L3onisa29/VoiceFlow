@@ -191,7 +191,7 @@ def test_status_controller_exercises_typed_views_without_duplicate_renders() -> 
     assert notification.errors == [("missing", 3.0)]
     controller.close()
     controller.close()
-    assert notification.close_calls == 1
+    assert notification.close_calls == 0
 
 
 def test_stale_transient_timer_cannot_clear_newer_outcome(
