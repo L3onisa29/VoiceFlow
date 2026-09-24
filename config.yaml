@@ -116,6 +116,7 @@ ui:
 
 hotkey:
   key: alt+space
+  cancel_key: ctrl+space
   mode: toggle
 
 audio:

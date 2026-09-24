@@ -388,6 +388,7 @@ class Overlay:
         from Quartz import (
             CATransaction,
             CGPathAddLineToPoint,
+            CGPathCloseSubpath,
             CGPathCreateMutable,
             CGPathMoveToPoint,
         )
@@ -396,7 +397,57 @@ class Overlay:
 
         path = CGPathCreateMutable()
         center_x = self._geometry.width / 2
-        if mode == OverlayMode.COPIED:
+        if mode == OverlayMode.CANCELLED:
+            # A compact octagonal road sign with a line-art STOP label.
+            points = (
+                (center_x - 4.0, 5.5),
+                (center_x + 4.0, 5.5),
+                (center_x + 9.5, 11.0),
+                (center_x + 9.5, 19.0),
+                (center_x + 4.0, 24.5),
+                (center_x - 4.0, 24.5),
+                (center_x - 9.5, 19.0),
+                (center_x - 9.5, 11.0),
+            )
+            CGPathMoveToPoint(path, None, *points[0])
+            for point in points[1:]:
+                CGPathAddLineToPoint(path, None, *point)
+            CGPathCloseSubpath(path)
+
+            top, middle, bottom = 17.5, 15.0, 12.5
+            start_x = center_x - 6.5
+
+            # S
+            CGPathMoveToPoint(path, None, start_x + 2.5, top)
+            CGPathAddLineToPoint(path, None, start_x, top)
+            CGPathAddLineToPoint(path, None, start_x, middle)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, middle)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, bottom)
+            CGPathAddLineToPoint(path, None, start_x, bottom)
+
+            # T
+            start_x += 3.5
+            CGPathMoveToPoint(path, None, start_x, top)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, top)
+            CGPathMoveToPoint(path, None, start_x + 1.25, top)
+            CGPathAddLineToPoint(path, None, start_x + 1.25, bottom)
+
+            # O
+            start_x += 3.5
+            CGPathMoveToPoint(path, None, start_x, bottom)
+            CGPathAddLineToPoint(path, None, start_x, top)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, top)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, bottom)
+            CGPathCloseSubpath(path)
+
+            # P
+            start_x += 3.5
+            CGPathMoveToPoint(path, None, start_x, bottom)
+            CGPathAddLineToPoint(path, None, start_x, top)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, top)
+            CGPathAddLineToPoint(path, None, start_x + 2.5, middle)
+            CGPathAddLineToPoint(path, None, start_x, middle)
+        elif mode == OverlayMode.COPIED:
             # Rear sheet: only the exposed edges are drawn to keep the
             # overlapping-paper silhouette legible at menu-overlay size.
             CGPathMoveToPoint(path, None, center_x - 6.0, 13.0)
@@ -426,7 +477,10 @@ class Overlay:
             CGPathAddLineToPoint(path, None, center_x - 5.0, 20.0)
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
-        self.outcome_layer.setLineWidth_(1.8 if mode == OverlayMode.COPIED else 2.4)
+        line_width = (
+            1.2 if mode == OverlayMode.CANCELLED else 1.8 if mode == OverlayMode.COPIED else 2.4
+        )
+        self.outcome_layer.setLineWidth_(line_width)
         self.outcome_layer.setPath_(path)
         CATransaction.commit()
 

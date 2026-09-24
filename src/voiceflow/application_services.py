@@ -182,6 +182,7 @@ class HotkeyFactory(Protocol):
         *,
         on_start: Callable[[], bool],
         on_stop: Callable[[], bool],
+        on_cancel: Callable[[], bool],
         is_recording: Callable[[], bool],
     ) -> PushToTalk: ...
 

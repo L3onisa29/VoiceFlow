@@ -77,6 +77,7 @@ def test_default_input_and_clipboard_policy() -> None:
     assert config.audio.device == "MacBook Pro Microphone"
     assert not hasattr(config.audio, "preroll_ms")
     assert config.hotkey.key == "alt+space"
+    assert config.hotkey.cancel_key == "ctrl+space"
     assert not hasattr(config.inject, "restore_clipboard")
     assert config.postprocess.codex.reasoning_effort == "medium"
 
@@ -115,6 +116,28 @@ def test_option_space_is_configurable() -> None:
         }
     )
     assert config.hotkey.key == "alt+space"
+
+
+def test_cancel_hotkey_is_configurable_and_must_be_distinct() -> None:
+    config = AppConfig.model_validate(
+        {
+            "schema_version": 3,
+            "stt": {},
+            "postprocess": {"provider": "none"},
+            "hotkey": {"key": "alt+space", "cancel_key": "ctrl+space"},
+        }
+    )
+    assert config.hotkey.cancel_key == "ctrl+space"
+
+    with pytest.raises(ValueError, match="must differ"):
+        AppConfig.model_validate(
+            {
+                "schema_version": 3,
+                "stt": {},
+                "postprocess": {"provider": "none"},
+                "hotkey": {"key": "ctrl+space", "cancel_key": "ctrl+space"},
+            }
+        )
 
 
 def test_schema_v1_is_migrated_without_preserving_unsafe_defaults(tmp_path: Path) -> None:

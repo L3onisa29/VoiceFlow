@@ -58,6 +58,11 @@ INPUT_HEALTH_CHECK_SECONDS = 5.0
 AUDIO_RELEASE_SHUTDOWN_TIMEOUT_SECONDS = 0.2
 
 
+def _discard_recording_audio(recorder: Recorder) -> None:
+    audio = recorder.stop()
+    audio.fill(0)
+
+
 @dataclass(frozen=True, slots=True)
 class _RecordingStart:
     pipeline: DictationPipeline
@@ -433,6 +438,7 @@ class VoiceBudApplication:
                 self.config,
                 on_start=self._recording_started,
                 on_stop=self._recording_stopped,
+                on_cancel=self._recording_cancelled,
                 is_recording=self._is_recording,
             )
             hotkey.start()
@@ -472,6 +478,7 @@ class VoiceBudApplication:
             hotkey_label(self.config.hotkey.key),
             self.config.hotkey.mode,
         )
+        LOGGER.info("Cancel hotkey ready: %s", hotkey_label(self.config.hotkey.cancel_key))
 
     def _is_recording(self) -> bool:
         with self._lock:
@@ -623,7 +630,7 @@ class VoiceBudApplication:
     ) -> None:
         if stop_recorder:
             with suppress(Exception):
-                start.recorder.stop()
+                _discard_recording_audio(start.recorder)
         with suppress(Exception):
             lease.abort()
         self._cancel_recording_start(start)
@@ -692,6 +699,45 @@ class VoiceBudApplication:
         result = self.recording_stop_coordinator.submit(captured, stop.lease)
         self._finish_recording_stop(stop)
         return self._present_stop_result(result, captured)
+
+    def _recording_cancelled(self) -> bool:
+        stop = self._begin_recording_stop()
+        if stop is None:
+            return False
+
+        recorder_error: Exception | None = None
+        cleanup_error: Exception | None = None
+        try:
+            _discard_recording_audio(stop.recorder)
+        except Exception as exc:
+            recorder_error = exc
+            LOGGER.exception("Cannot stop audio input while cancelling recording")
+        try:
+            stop.lease.abort()
+        except Exception as exc:
+            cleanup_error = exc
+            LOGGER.exception("Cannot release cancelled recording")
+        finally:
+            self._finish_recording_stop(stop)
+            self.status.update(recording=False)
+
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "recording.cancelled",
+            "Recording cancelled before processing",
+            target_platform=(
+                "t3_code" if isinstance(stop.destination, T3CodeDestination) else "focused_input"
+            ),
+            operation=(
+                "integration" if isinstance(stop.destination, T3CodeDestination) else "input_write"
+            ),
+        )
+        if recorder_error is not None or cleanup_error is not None:
+            self.status.transient("Dettatura annullata con errori di pulizia", error=True)
+        else:
+            self.status.cancelled()
+        return True
 
     def _begin_recording_stop(self) -> _RecordingStop | None:
         with self._lock:
@@ -1075,7 +1121,7 @@ class VoiceBudApplication:
         if recorder is not None:
             if phase != RecordingPhase.STOPPING and recorder.recording:
                 with suppress(Exception):
-                    recorder.stop()
+                    _discard_recording_audio(recorder)
             with suppress(Exception):
                 recorder.close()
         self.status.update(
@@ -1138,7 +1184,7 @@ class VoiceBudApplication:
             if recorder is not None:
                 if phase != RecordingPhase.STOPPING and recorder.recording:
                     with suppress(Exception):
-                        recorder.stop()
+                        _discard_recording_audio(recorder)
                 with suppress(Exception):
                     recorder.close()
             with suppress(Exception):

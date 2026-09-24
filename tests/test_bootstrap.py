@@ -310,7 +310,12 @@ def test_dynamic_input_factories_receive_the_complete_dependency_graph(
         "preferred_terms": app._preferred_terms,
         "t3_bridge": app.t3_bridge,
     }
-    assert set(captured["hotkey"]) == {"on_start", "on_stop", "is_recording"}
+    assert set(captured["hotkey"]) == {
+        "on_start",
+        "on_stop",
+        "on_cancel",
+        "is_recording",
+    }
     assert events[-1] == "start:hotkey"
 
 

@@ -22,6 +22,7 @@ class OverlayMode(StrEnum):
     PROCESSING = "processing"
     SUCCESS = "success"
     COPIED = "copied"
+    CANCELLED = "cancelled"
     WARNING = "warning"
     FAILURE = "failure"
 
@@ -197,6 +198,15 @@ class StatusController:
             icon="⧉",
             mode=OverlayMode.COPIED,
             accent=OverlayAccent.CYAN,
+            duration=self.completion_indicator_seconds,
+        )
+
+    def cancelled(self, *, detail: str | None = None) -> None:
+        self._set_outcome(
+            text=detail or "Dettatura annullata",
+            icon="🟢",
+            mode=OverlayMode.CANCELLED,
+            accent=OverlayAccent.GREEN,
             duration=self.completion_indicator_seconds,
         )
 

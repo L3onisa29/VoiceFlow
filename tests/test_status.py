@@ -23,6 +23,7 @@ from voiceflow.ui.status_controller import (
         (OverlayMode.PROCESSING, 60.5, 50),
         (OverlayMode.SUCCESS, 30, 50),
         (OverlayMode.COPIED, 30, 50),
+        (OverlayMode.CANCELLED, 30, 50),
         (OverlayMode.WARNING, 30, 50),
         (OverlayMode.FAILURE, 30, 50),
     ],
@@ -95,6 +96,44 @@ def test_overlay_relocates_to_pointer_screen_without_duplicate_moves(
     ]
 
 
+def test_cancelled_outcome_draws_green_stop_sign_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[Any, ...]] = []
+    path = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "Quartz",
+        SimpleNamespace(
+            CATransaction=SimpleNamespace(
+                begin=lambda: None, commit=lambda: None, setDisableActions_=lambda _value: None
+            ),
+            CGPathCreateMutable=lambda: path,
+            CGPathMoveToPoint=lambda actual, _transform, x, y: commands.append(
+                ("move", actual, x, y)
+            ),
+            CGPathAddLineToPoint=lambda actual, _transform, x, y: commands.append(
+                ("line", actual, x, y)
+            ),
+            CGPathCloseSubpath=lambda actual: commands.append(("close", actual)),
+        ),
+    )
+    outcome = SimpleNamespace(
+        setLineWidth_=lambda width: commands.append(("width", width)),
+        setPath_=lambda actual: commands.append(("path", actual)),
+    )
+    overlay = Overlay.__new__(Overlay)
+    overlay._geometry = geometry_for_mode(OverlayMode.CANCELLED)
+    overlay.outcome_layer = outcome
+
+    overlay._set_outcome_path(OverlayMode.CANCELLED)
+
+    assert commands[0] == ("move", path, 11.0, 5.5)
+    assert ("close", path) in commands
+    assert ("width", 1.2) in commands
+    assert commands[-1] == ("path", path)
+
+
 @pytest.mark.parametrize(
     "mode",
     [OverlayMode.WAVEFORM, OverlayMode.PROCESSING],
@@ -112,7 +151,13 @@ def test_active_overlay_uses_twelve_pixel_horizontal_padding(
 
 @pytest.mark.parametrize(
     "mode",
-    [OverlayMode.SUCCESS, OverlayMode.COPIED, OverlayMode.WARNING, OverlayMode.FAILURE],
+    [
+        OverlayMode.SUCCESS,
+        OverlayMode.COPIED,
+        OverlayMode.CANCELLED,
+        OverlayMode.WARNING,
+        OverlayMode.FAILURE,
+    ],
 )
 def test_outcome_overlay_is_circular_without_shared_padding(
     mode: OverlayMode,
@@ -388,6 +433,11 @@ def test_success_copy_fallback_and_failure_use_outcome_icons() -> None:
     assert menu.updates[-1]["text"] == "Testo copiato negli appunti"
     assert overlay.updates[-1].mode == OverlayMode.COPIED
     assert overlay.updates[-1].accent == OverlayAccent.CYAN
+    controller.cancelled()
+    assert menu.updates[-1]["icon"] == "🟢"
+    assert menu.updates[-1]["text"] == "Dettatura annullata"
+    assert overlay.updates[-1].mode == OverlayMode.CANCELLED
+    assert overlay.updates[-1].accent == OverlayAccent.GREEN
     controller.complete(fallback=True, detail="usato testo originale")
     assert overlay.updates[-1].mode == OverlayMode.WARNING
     assert overlay.updates[-1].accent == OverlayAccent.AMBER

@@ -480,6 +480,69 @@ def test_option_space_is_supported() -> None:
     assert hotkey.chord == {"alt", "space"}
 
 
+def test_cancel_hotkey_discards_active_recording_without_firing_stop() -> None:
+    events: list[str] = []
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: events.append("start") or True,
+        lambda: events.append("stop") or True,
+        mode="toggle",
+        cancel_key_name="ctrl+space",
+        on_cancel=lambda: events.append("cancel") or True,
+        keyboard_module=keyboard_module(),
+    )
+
+    hotkey._press("alt")
+    hotkey._press("space")
+    hotkey._release("space")
+    hotkey._release("alt")
+    hotkey._press("ctrl")
+    hotkey._press("space")
+    hotkey._release("space")
+    hotkey._release("ctrl")
+
+    # Once idle, Control+Space belongs to the frontmost application again.
+    hotkey._press("ctrl")
+    hotkey._press("space")
+    hotkey._release("space")
+    hotkey._release("ctrl")
+
+    assert events == ["start", "cancel"]
+
+
+def test_cancel_space_is_only_consumed_during_recording() -> None:
+    keyboard = macos_keyboard_module()
+    quartz = quartz_module()
+    hotkey = PushToTalk(
+        "alt+space",
+        lambda: True,
+        lambda: True,
+        mode="toggle",
+        cancel_key_name="ctrl+space",
+        on_cancel=lambda: True,
+        keyboard_module=keyboard,
+        quartz_module=quartz,
+        callback_dispatcher=lambda action: action(),
+    )
+    listener = hotkey._listener
+    intercept = listener.callbacks["darwin_intercept"]
+    space_event = SimpleNamespace(virtual_keycode=49)
+
+    listener.callbacks["on_press"](keyboard.Key.ctrl)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyDown, space_event) is space_event
+    listener.callbacks["on_release"](keyboard.Key.space)
+    listener.callbacks["on_release"](keyboard.Key.ctrl)
+
+    listener.callbacks["on_press"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    listener.callbacks["on_release"](keyboard.Key.space)
+    listener.callbacks["on_release"](keyboard.Key.alt)
+    listener.callbacks["on_press"](keyboard.Key.ctrl)
+    listener.callbacks["on_press"](keyboard.Key.space)
+    assert intercept(quartz.kCGEventKeyDown, space_event) is None
+
+
 def test_option_space_toggle_is_consumed_without_reaching_the_frontmost_app() -> None:
     keyboard = macos_keyboard_module()
     quartz = quartz_module()

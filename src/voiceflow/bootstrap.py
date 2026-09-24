@@ -106,11 +106,13 @@ def build_application_services(_config: AppConfig) -> ApplicationServices:
             injection_timeout_seconds=config.pipeline.injection_timeout_seconds,
             formatting=config.formatting,
         ),
-        hotkey_factory=lambda config, on_start, on_stop, is_recording: PushToTalk(
+        hotkey_factory=lambda config, on_start, on_stop, on_cancel, is_recording: PushToTalk(
             config.hotkey.key,
             on_start,
             on_stop,
             mode=config.hotkey.mode,
+            cancel_key_name=config.hotkey.cancel_key,
+            on_cancel=on_cancel,
             is_recording=is_recording,
         ),
     )

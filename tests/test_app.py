@@ -41,6 +41,9 @@ class Status:
     def transient(self, text: str, **_kwargs: Any) -> None:
         self.messages.append(text)
 
+    def cancelled(self, *, detail: str | None = None) -> None:
+        self.messages.append(detail or "Dettatura annullata")
+
     def close(self) -> None:
         self.closed += 1
 
@@ -328,6 +331,38 @@ def test_t3_stop_failure_cancels_and_abandons(
     assert app.pipeline.cancelled == 1
     assert app.t3_bridge.abandoned == [recording_id]
     assert app._recording_destination is None
+
+
+def test_cancelled_recording_skips_pipeline_processing(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+
+    assert app._recording_started()
+    assert app._recording_cancelled()
+
+    assert not app.recorder.recording
+    assert app.pipeline.cancelled == 1
+    assert app.pipeline.submissions == []
+    assert app._recording_phase == RecordingPhase.IDLE
+    assert app._recording_destination is None
+    assert app.status.messages[-1] == "Dettatura annullata"
+
+
+def test_cancelled_t3_recording_closes_reserved_conversation(
+    app_config: AppConfig,
+) -> None:
+    app = make_recording_app(app_config)
+    app.frontmost_detector = SimpleNamespace(
+        detect=lambda: FrontmostApplication(FrontmostApplicationKind.T3_CODE)
+    )
+
+    assert app._recording_started()
+    recording_id = app.t3_bridge.reserved[0]
+    assert app._recording_cancelled()
+
+    assert app.t3_bridge.abandoned == [recording_id]
+    assert app.pipeline.submissions == []
 
 
 def test_shutdown_during_t3_recording_abandons_session(

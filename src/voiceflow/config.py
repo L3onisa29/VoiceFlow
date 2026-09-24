@@ -173,9 +173,10 @@ class UiConfig(StrictModel):
 
 class HotkeyConfig(StrictModel):
     key: str = "alt+space"
+    cancel_key: str = "ctrl+space"
     mode: Literal["hold", "toggle"] = "toggle"
 
-    @field_validator("key")
+    @field_validator("key", "cancel_key")
     @classmethod
     def safe_hotkey(cls, value: str) -> str:
         names = [name.strip().casefold() for name in value.split("+") if name.strip()]
@@ -187,8 +188,14 @@ class HotkeyConfig(StrictModel):
         if len(names) != len(set(names)):
             raise ValueError("hotkey.key cannot contain duplicate keys")
         if not set(names) & HOTKEY_NON_MODIFIERS:
-            raise ValueError("hotkey.key must contain a supported non-modifier key")
+            raise ValueError("hotkey chord must contain a supported non-modifier key")
         return "+".join(names)
+
+    @model_validator(mode="after")
+    def distinct_hotkeys(self) -> HotkeyConfig:
+        if self.key == self.cancel_key:
+            raise ValueError("hotkey.cancel_key must differ from hotkey.key")
+        return self
 
 
 class AudioConfig(StrictModel):
