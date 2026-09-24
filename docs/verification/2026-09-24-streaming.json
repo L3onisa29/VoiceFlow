@@ -1,0 +1,92 @@
+{
+  "date": "2026-09-24",
+  "machine": "Apple M1, 8 GB RAM, macOS 26.6.2",
+  "model": {
+    "model": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+    "quantization": "INT8",
+    "repository": "Gimics/nemotron-3.5-asr-streaming-0.6b-onnx-int8",
+    "revision": "65bc96f9ae5d365340a30cbc738fefdd4a791737",
+    "directory": "",
+    "files": [
+      {
+        "name": "decoder_joint.onnx",
+        "remoteName": "decoder_joint.int8.onnx",
+        "bytes": 24483962,
+        "sha256": "7fe1a8c2e247b55bbb8ca917ef64cf60227909c6fe63be2da7ea6fc3858d6a69"
+      },
+      {
+        "name": "encoder.onnx",
+        "remoteName": "encoder.int8.onnx",
+        "bytes": 657572066,
+        "sha256": "561818bf1e3d72fbaa99a05fa0c13341b4d72c4503963e74089a70f6d3aeb066"
+      },
+      {
+        "name": "tokenizer.model",
+        "remoteName": "tokenizer.model",
+        "bytes": 406554,
+        "sha256": "ce3895e40806f02a26c3a225161b96ef682d6c0054bae32a245dec4258d7d291"
+      }
+    ]
+  },
+  "input": "Synthetic macOS say voices Alice and Samantha, mono PCM16 16 kHz",
+  "scope": "Real decoder and resampler; microphone, native UI and target-app paste not exercised",
+  "samples": [
+    {
+      "sample": "it",
+      "audioSeconds": 13.329312499999805,
+      "chunkP95Ms": 139.259583,
+      "chunks": 27,
+      "event": "completed",
+      "finalizeMs": 441.863125,
+      "firstPartialAudioSeconds": 0.5600000000000002,
+      "firstPartialWallSeconds": 0.766375708,
+      "inferenceSeconds": 3.203054834,
+      "loadSeconds": 1.8732944169999999,
+      "model": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "paced": true,
+      "realTimeFactor": 0.24030157849476835,
+      "wallSeconds": 13.766504,
+      "partialUpdates": 22,
+      "transcriptCharacters": 229,
+      "confirmationOccurrences": 1
+    },
+    {
+      "sample": "en",
+      "audioSeconds": 10.934999999999857,
+      "chunkP95Ms": 318.2255,
+      "chunks": 23,
+      "event": "completed",
+      "finalizeMs": 377.21970799999997,
+      "firstPartialAudioSeconds": 0.5600000000000002,
+      "firstPartialWallSeconds": 0.754698,
+      "inferenceSeconds": 3.56853846,
+      "loadSeconds": 2.259292125,
+      "model": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "paced": true,
+      "realTimeFactor": 0.3263409657064515,
+      "wallSeconds": 11.301232542,
+      "partialUpdates": 19,
+      "transcriptCharacters": 191,
+      "confirmationOccurrences": 0
+    },
+    {
+      "sample": "long",
+      "audioSeconds": 133.29312499999438,
+      "chunkP95Ms": 219.778125,
+      "chunks": 242,
+      "event": "completed",
+      "finalizeMs": 413.109959,
+      "firstPartialAudioSeconds": 0.5600000000000002,
+      "firstPartialWallSeconds": 0.127758958,
+      "inferenceSeconds": 32.06775583600001,
+      "loadSeconds": 2.132421416,
+      "model": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "paced": false,
+      "realTimeFactor": 0.2405807188930514,
+      "wallSeconds": 32.166110833,
+      "partialUpdates": 234,
+      "transcriptCharacters": 2316,
+      "confirmationOccurrences": 10
+    }
+  ]
+}

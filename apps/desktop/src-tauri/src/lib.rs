@@ -1,0 +1,144 @@
+mod capture;
+mod platform;
+mod service;
+mod settings;
+use service::{Command, Service, Snapshot};
+use tauri::{
+    Manager, State,
+    menu::{Menu, MenuItem},
+    tray::TrayIconBuilder,
+};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
+
+#[tauri::command]
+fn get_state(service: State<'_, Service>) -> Snapshot {
+    service.snapshot()
+}
+#[tauri::command]
+fn get_permissions() -> platform::Permissions {
+    platform::permissions()
+}
+#[tauri::command]
+fn request_microphone() {
+    platform::request_microphone();
+}
+#[tauri::command]
+fn open_privacy(app: tauri::AppHandle, section: String) -> Result<(), String> {
+    let pane = match section.as_str() {
+        "microphone" => "Privacy_Microphone",
+        "accessibility" => "Privacy_Accessibility",
+        _ => return Err("Impostazione non valida".into()),
+    };
+    app.opener()
+        .open_url(
+            format!("x-apple.systempreferences:com.apple.preference.security?{pane}"),
+            None::<&str>,
+        )
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn load_model(service: State<'_, Service>) -> Result<(), String> {
+    service.send(Command::Load).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn toggle_recording(service: State<'_, Service>) -> Result<(), String> {
+    service.send(Command::Toggle).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn stop_recording(service: State<'_, Service>) -> Result<(), String> {
+    service.send(Command::Stop).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn cancel_recording(service: State<'_, Service>) -> Result<(), String> {
+    service.send(Command::Cancel).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn save_settings(service: State<'_, Service>, settings: settings::Settings) -> Result<(), String> {
+    service
+        .send(Command::Settings(settings))
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn copy_transcript(service: State<'_, Service>) -> Result<(), String> {
+    let snapshot = service.snapshot();
+    let text = if snapshot.final_text.is_empty() {
+        snapshot.transcript.text()
+    } else {
+        snapshot.final_text
+    };
+    if text.is_empty() {
+        return Err("Nessun testo da copiare".into());
+    }
+    platform::copy_text(&text).map_err(|e| e.to_string())
+}
+fn show(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            get_state,
+            get_permissions,
+            request_microphone,
+            open_privacy,
+            load_model,
+            toggle_recording,
+            stop_recording,
+            cancel_recording,
+            save_settings,
+            copy_transcript
+        ])
+        .setup(|app| {
+            let data = app
+                .path()
+                .home_dir()?
+                .join("Library/Application Support/VoiceFlow");
+            let service = Service::new(
+                app.handle().clone(),
+                data.join("models/nemotron-3.5-streaming-int8"),
+                data.join("desktop-settings.json"),
+            )?;
+            app.manage(service.clone());
+            let toggle: Shortcut = "Alt+Space".parse()?;
+            app.global_shortcut().on_shortcut(toggle, |app, _, event| {
+                if event.state == ShortcutState::Pressed {
+                    let _ = app.state::<Service>().send(Command::Toggle);
+                }
+            })?;
+            let open = MenuItem::with_id(app, "open", "Apri VoiceFlow", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Esci", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("VoiceFlow · ⌥ Spazio")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show(app),
+                    "quit" => {
+                        let _ = app.state::<Service>().send(Command::Quit);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+            if service.snapshot().model_present {
+                service.send(Command::Load)?;
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("VoiceFlow could not start");
+}

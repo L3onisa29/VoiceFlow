@@ -1,0 +1,17 @@
+[package]
+name = "voiceflow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+parakeet-rs = "=0.3.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3.5"
+rubato = "0.16"
+
+[dev-dependencies]
+tempfile = "3"

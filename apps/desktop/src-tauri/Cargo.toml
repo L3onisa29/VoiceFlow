@@ -1,0 +1,35 @@
+[package]
+name = "voiceflow-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Local streaming dictation for macOS"
+default-run = "voiceflow-desktop"
+
+[lib]
+name = "voiceflow_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+voiceflow-core = { path = "../../../crates/voiceflow-core" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+cpal = "0.16"
+crossbeam-channel = "0.5"
+arboard = { version = "3", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
+block2 = "0.6"
+core-foundation = "0.10"
+core-graphics = { version = "0.25", features = ["elcapitan"] }

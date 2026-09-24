@@ -1,4 +1,28 @@
-# VoiceBud
+# VoiceFlow
+
+The `codex/tauri-streaming-app` branch starts the macOS desktop rebuild with
+Tauri 2, Rust and React. NVIDIA Nemotron 3.5 ASR Streaming 0.6B produces a live
+preview in Italian or English. Dictation has no configured maximum duration.
+The app pastes the final text once when dictation stops and the original text
+field is still focused. Otherwise the result stays available to copy.
+
+```bash
+pnpm install --frozen-lockfile
+pnpm doctor
+pnpm model:download
+pnpm desktop:build
+```
+
+Open `target/release/bundle/macos/VoiceFlow.app` from Finder. Once built and the
+model downloaded, normal use needs no terminal, Python service or web server.
+Microphone and Accessibility permissions belong to the packaged VoiceFlow app.
+Development builds use local signing; distribution signing remains to be done.
+
+See [desktop migration](docs/desktop-migration.md) for the architecture, model
+provenance, verification and remaining work. The existing Python implementation
+remains available during the migration.
+
+## Legacy VoiceBud, Python
 
 VoiceBud is a macOS menu-bar dictation app. It records locally, transcribes with the multilingual Parakeet TDT 0.6B V3 ONNX INT8 model on `CPUExecutionProvider`, optionally cleans the transcript, and inserts it at the current cursor.
 
