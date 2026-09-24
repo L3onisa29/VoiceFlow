@@ -158,7 +158,15 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         if self.transcript.finished {
             return Ok(self.snapshot());
         }
+        self.flush_utterance()?;
+        self.transcript.finished = true;
+        Ok(self.snapshot())
+    }
+    /// Commit the audio tail at pause, retaining text and allowing a fresh stream.
+    pub fn flush_utterance(&mut self) -> Result<()> {
+        ensure!(!self.transcript.finished, "Session already finished");
         let size = self.decoder.chunk_samples();
+        ensure!(size > 0, "Invalid decoder chunk size");
         if !self.pending.is_empty() {
             let mut tail: Vec<f32> = self.pending.drain(..).collect();
             tail.resize(size, 0.0);
@@ -171,8 +179,9 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         }
         self.commit();
         self.decoder.reset();
-        self.transcript.finished = true;
-        Ok(self.snapshot())
+        self.speech_seen = false;
+        self.silence_samples = 0;
+        Ok(())
     }
 }
 
@@ -244,6 +253,23 @@ mod tests {
         assert!(!paused.finished);
         session.push(&[0.1; 8_960]).unwrap();
         assert_eq!(session.finish().unwrap().text(), "Una prova. Una prova.");
+    }
+    #[test]
+    fn explicit_pause_flushes_tail_once_and_resume_keeps_previous_words() {
+        let mut session = StreamingSession::new(Decoder {
+            samples: Vec::new(),
+            text: String::new(),
+        });
+        session.push(&[0.1; 320]).unwrap();
+        session.flush_utterance().unwrap();
+        assert_eq!(session.snapshot().confirmed, "Una prova.");
+        assert!(!session.snapshot().finished);
+        let fed = session.decoder.samples.len();
+        session.flush_utterance().unwrap();
+        assert_eq!(session.decoder.samples.len(), fed);
+        session.push(&[0.1; 640]).unwrap();
+        assert_eq!(session.finish().unwrap().text(), "Una prova. Una prova.");
+        assert_eq!(session.snapshot().audio_seconds, 960.0 / 16_000.0);
     }
     #[test]
     fn invalid_audio_is_rejected_before_duration_or_pending_audio_changes() {

@@ -1,4 +1,5 @@
 mod capture;
+mod hud;
 mod platform;
 mod service;
 mod settings;
@@ -42,12 +43,26 @@ fn load_model(service: State<'_, Service>) -> Result<(), String> {
     service.send(Command::Load).map_err(|e| e.to_string())
 }
 #[tauri::command]
-fn toggle_recording(service: State<'_, Service>) -> Result<(), String> {
-    service.send(Command::Toggle).map_err(|e| e.to_string())
+fn toggle_recording(app: tauri::AppHandle) -> Result<(), String> {
+    send_from_controls(&app, Command::Toggle)
 }
 #[tauri::command]
-fn stop_recording(service: State<'_, Service>) -> Result<(), String> {
-    service.send(Command::Stop).map_err(|e| e.to_string())
+fn stop_recording(app: tauri::AppHandle) -> Result<(), String> {
+    send_from_controls(&app, Command::Stop)
+}
+#[tauri::command]
+fn pause_recording(service: State<'_, Service>) -> Result<(), String> {
+    service.send(Command::Pause).map_err(|e| e.to_string())
+}
+fn send_from_controls(app: &tauri::AppHandle, command: Command) -> Result<(), String> {
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        platform::hide_if_frontmost(objc2_foundation::MainThreadMarker::new().unwrap());
+        if let Err(error) = handle.state::<Service>().send(command) {
+            eprintln!("{error}");
+        }
+    })
+    .map_err(|e| e.to_string())
 }
 #[tauri::command]
 fn cancel_recording(service: State<'_, Service>) -> Result<(), String> {
@@ -91,6 +106,7 @@ pub fn run() {
             load_model,
             toggle_recording,
             stop_recording,
+            pause_recording,
             cancel_recording,
             save_settings,
             copy_transcript
@@ -109,7 +125,7 @@ pub fn run() {
             let toggle: Shortcut = "Alt+Space".parse()?;
             app.global_shortcut().on_shortcut(toggle, |app, _, event| {
                 if event.state == ShortcutState::Pressed {
-                    let _ = app.state::<Service>().send(Command::Toggle);
+                    let _ = send_from_controls(app, Command::Toggle);
                 }
             })?;
             let open = MenuItem::with_id(app, "open", "Apri VoiceFlow", true, None::<&str>)?;

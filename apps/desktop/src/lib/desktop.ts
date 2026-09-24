@@ -12,6 +12,7 @@ export const stateSchema = z.object({
     "idle",
     "loading",
     "recording",
+    "paused",
     "finalizing",
     "complete",
     "error",
@@ -21,6 +22,7 @@ export const stateSchema = z.object({
   finalText: z.string(),
   message: z.string().nullable(),
   level: z.number(),
+  elapsedSeconds: z.number(),
   device: z.string(),
   settings: settingsSchema,
   transcript: z.object({
@@ -48,6 +50,7 @@ export async function getPermissions() {
 export type Action =
   | "toggle_recording"
   | "stop_recording"
+  | "pause_recording"
   | "cancel_recording"
   | "load_model"
   | "copy_transcript"

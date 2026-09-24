@@ -81,8 +81,13 @@ impl Capture {
             device_name,
         })
     }
-    pub fn stop(&self) -> Result<()> {
+    pub fn finish(self) -> Result<Receiver<Vec<f32>>> {
         self._stream.pause()?;
-        Ok(())
+        drop(self._stream);
+        anyhow::ensure!(
+            !self.failed.load(Ordering::Acquire),
+            "Acquisizione audio incompleta. Recupera il testo parziale."
+        );
+        Ok(self.frames)
     }
 }

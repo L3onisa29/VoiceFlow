@@ -4,16 +4,22 @@ use core_foundation::{
     string::{CFString, CFStringGetTypeID, CFStringRef},
 };
 use core_graphics::{
-    event::{CGEvent, CGEventFlags},
+    event::{CGEvent, CGEventFlags, CGEventTapLocation},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+use objc2_app_kit::{NSApplication, NSWorkspace};
 use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
+use objc2_foundation::MainThreadMarker;
 use serde::Serialize;
-use std::ffi::c_void;
+use std::{
+    ffi::c_void,
+    time::{Duration, Instant},
+};
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn CGEventSourceFlagsState(state: i32) -> u64;
     fn AXUIElementCreateSystemWide() -> CFTypeRef;
     fn AXUIElementCopyAttributeValue(
         element: CFTypeRef,
@@ -114,11 +120,7 @@ pub fn focused_target() -> Option<FocusTarget> {
             Some(CFString::wrap_under_create_rule(attribute as CFStringRef).to_string())
         };
         let role = attribute("AXRole");
-        if !matches!(
-            role.as_deref(),
-            Some("AXTextField" | "AXTextArea" | "AXComboBox")
-        ) || attribute("AXSubrole").as_deref() == Some("AXSecureTextField")
-        {
+        if !accepts_destination(role.as_deref(), attribute("AXSubrole").as_deref()) {
             CFRelease(value);
             return None;
         }
@@ -134,9 +136,17 @@ pub fn copy_text(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Paste only into the same focused element captured at start. Never activate an
-/// app or send Return; a focus change leaves the final text available to copy.
+/// Validate the element captured at stop after finalization. Never send Return.
 pub fn paste_text(target: &FocusTarget, text: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    // Option+Space stops dictation. Let the physical modifiers go before Cmd+V.
+    while unsafe { CGEventSourceFlagsState(1) } & 0x001e0000 != 0 {
+        ensure!(
+            Instant::now() < deadline,
+            "Rilascia i tasti modificatori. Il testo è disponibile in VoiceFlow."
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let current = focused_target().ok_or_else(|| anyhow!("Nessun campo di testo attivo"))?;
     ensure!(
         current.pid == target.pid && unsafe { CFEqual(current.element, target.element) } != 0,
@@ -151,7 +161,50 @@ pub fn paste_text(target: &FocusTarget, text: &str) -> Result<()> {
     down.set_flags(CGEventFlags::CGEventFlagCommand);
     up.set_flags(CGEventFlags::CGEventFlagCommand);
     copy_text(text)?;
-    down.post_to_pid(target.pid);
-    up.post_to_pid(target.pid);
+    down.post(CGEventTapLocation::HID);
+    up.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+fn accepts_destination(_role: Option<&str>, subrole: Option<&str>) -> bool {
+    subrole != Some("AXSecureTextField")
+}
+/// Main-window controls return focus to the user's previous app. The native HUD
+/// is nonactivating and never needs this step.
+pub fn hide_if_frontmost(mtm: MainThreadMarker) {
+    if is_frontmost() {
+        NSApplication::sharedApplication(mtm).hide(None);
+    }
+}
+fn is_frontmost() -> bool {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .is_some_and(|app| app.processIdentifier() == std::process::id() as i32)
+}
+pub fn destination_at_stop() -> Option<FocusTarget> {
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while is_frontmost() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    focused_target()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn editors_with_generic_accessibility_roles_can_receive_paste() {
+        for role in [Some("AXWebArea"), Some("AXGroup"), None] {
+            assert!(
+                accepts_destination(role, None),
+                "Focused editor rejected: {role:?}"
+            );
+        }
+    }
+    #[test]
+    fn password_fields_are_never_destinations() {
+        assert!(!accepts_destination(
+            Some("AXTextField"),
+            Some("AXSecureTextField")
+        ));
+    }
 }

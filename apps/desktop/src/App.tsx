@@ -8,6 +8,8 @@ import {
   Keyboard,
   LoaderCircle,
   Mic,
+  Pause,
+  Play,
   ShieldCheck,
   Square,
   X,
@@ -33,6 +35,7 @@ const phaseLabels = {
   idle: "Pronto quando vuoi",
   loading: "Preparazione del modello",
   recording: "Ti ascolto",
+  paused: "Dettatura in pausa",
   finalizing: "Ultime parole…",
   complete: "Dettatura completata",
   error: "Serve la tua attenzione",
@@ -56,9 +59,11 @@ export default function App() {
     privacy,
   } = useDictation();
   const recording = state?.phase === "recording";
+  const paused = state?.phase === "paused";
+  const active = recording || paused;
   const processing =
     state?.phase === "loading" || state?.phase === "finalizing";
-  const locked = busy || recording || processing;
+  const locked = busy || active || processing;
   const text =
     state?.finalText ||
     [state?.transcript.confirmed, state?.transcript.partial]
@@ -121,7 +126,9 @@ export default function App() {
           <div>
             <p className="eyebrow">PENSA A VOCE ALTA</p>
             <h1>Fai spazio alle parole.</h1>
-            <p>Parla liberamente. Ritrova il tuo testo, pronto da usare.</p>
+            <p>
+              Posiziona il cursore nella tua app. Detta e incolla con ⌥ Spazio.
+            </p>
           </div>
           <div className="privacy-chip">
             <span />
@@ -165,7 +172,7 @@ export default function App() {
               {status}
             </span>
             <span className="timer">
-              {duration(state?.transcript.audioSeconds ?? 0)}
+              {duration(state?.elapsedSeconds ?? 0)}
             </span>
           </div>
           <div
@@ -199,7 +206,7 @@ export default function App() {
                 <p>
                   {recording
                     ? "Le parole appariranno qui mentre parli."
-                    : "La trascrizione appare mentre parli.\nQuando termini, il testo è pronto per essere incollato."}
+                    : "La trascrizione appare mentre parli.\nQuando termini, VoiceFlow lo incolla nel campo in cui scrivi."}
                 </p>
               </div>
             )}
@@ -214,7 +221,7 @@ export default function App() {
             <Button
               variant="ghost"
               size="sm"
-              disabled={!text || recording || processing || busy}
+              disabled={!text || active || processing || busy}
               onClick={() => void execute("copy_transcript")}
             >
               {copied ? (
@@ -236,10 +243,10 @@ export default function App() {
               disabled={
                 busy ||
                 processing ||
-                (!recording && (!state?.modelReady || !permissions?.microphone))
+                (!active && (!state?.modelReady || !permissions?.microphone))
               }
               onClick={() =>
-                void execute(recording ? "stop_recording" : "toggle_recording")
+                void execute(active ? "stop_recording" : "toggle_recording")
               }
             >
               {processing ? (
@@ -247,18 +254,32 @@ export default function App() {
                   className="animate-spin"
                   data-icon="inline-start"
                 />
-              ) : recording ? (
+              ) : active ? (
                 <Square data-icon="inline-start" />
               ) : (
                 <Mic data-icon="inline-start" />
               )}
-              {recording
-                ? "Termina dettatura"
+              {active
+                ? "Termina e incolla"
                 : processing
                   ? "Un momento…"
                   : "Inizia a dettare"}
             </Button>
-            {recording ? (
+            {active && (
+              <Button
+                variant="outline"
+                disabled={busy}
+                onClick={() => void execute("pause_recording")}
+              >
+                {paused ? (
+                  <Play data-icon="inline-start" />
+                ) : (
+                  <Pause data-icon="inline-start" />
+                )}
+                {paused ? "Riprendi" : "Pausa"}
+              </Button>
+            )}
+            {active ? (
               <Button
                 variant="ghost"
                 disabled={busy}

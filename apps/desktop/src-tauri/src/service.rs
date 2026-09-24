@@ -26,6 +26,7 @@ pub struct Snapshot {
     pub final_text: String,
     pub message: Option<String>,
     pub level: f32,
+    pub elapsed_seconds: u64,
     pub device: String,
     pub settings: Settings,
 }
@@ -34,6 +35,7 @@ pub enum Command {
     Load,
     Toggle,
     Stop,
+    Pause,
     Cancel,
     Settings(Settings),
     Quit,
@@ -61,6 +63,7 @@ impl Service {
             final_text: String::new(),
             message,
             level: 0.0,
+            elapsed_seconds: 0,
             device: "Microfono di sistema".into(),
             settings: loaded.unwrap_or_default(),
         }));
@@ -95,11 +98,11 @@ impl Service {
     }
 }
 struct Active {
-    capture: Capture,
+    capture: Option<Capture>,
     resampler: StreamingResampler,
     session: StreamingSession<NvidiaDecoder>,
     emitted: Instant,
-    target: Option<platform::FocusTarget>,
+    clock: RecordingClock,
 }
 struct Worker {
     app: AppHandle,
@@ -122,6 +125,7 @@ impl Worker {
             s.revision += 1;
             s.clone()
         };
+        crate::hud::update(&self.app, snapshot.clone());
         let _ = self.app.emit("dictation-state", snapshot);
     }
     fn run(&mut self) {
@@ -130,7 +134,7 @@ impl Worker {
             let audio = self
                 .active
                 .as_ref()
-                .map(|a| a.capture.frames.clone())
+                .and_then(|a| a.capture.as_ref().map(|c| c.frames.clone()))
                 .unwrap_or_else(crossbeam_channel::never);
             select_biased! {
                 recv(self.receiver) -> cmd => {
@@ -144,14 +148,18 @@ impl Worker {
                 }
                 recv(audio) -> frame => {
                     if let Ok(frame) = frame {
-                        if self.active.as_ref().is_some_and(|a| a.capture.failed.load(Ordering::Acquire)) {
+                        if self.active.as_ref().is_some_and(|a| a.capture.as_ref().is_some_and(|c| c.failed.load(Ordering::Acquire))) {
                             self.fail(anyhow!("Acquisizione interrotta: audio incompleto. Il testo parziale è recuperabile."));
                         } else if let Err(error) = self.audio(&frame) { self.fail(error); }
                     }
                 }
                 recv(heartbeat) -> _ => {
-                    if self.active.as_ref().is_some_and(|a| a.capture.failed.load(Ordering::Acquire)) {
+                    if self.active.as_ref().is_some_and(|a| a.capture.as_ref().is_some_and(|c| c.failed.load(Ordering::Acquire))) {
                         self.fail(anyhow!("Acquisizione interrotta: microfono non disponibile o elaborazione troppo lenta. Il testo parziale è recuperabile."));
+                    } else if let Some(active) = &self.active {
+                        let elapsed = active.clock.elapsed(Instant::now()).as_secs();
+                        let previous = self.snapshot.lock().unwrap().elapsed_seconds;
+                        if elapsed != previous { self.update(|s| s.elapsed_seconds = elapsed); }
                     }
                 }
             }
@@ -201,7 +209,6 @@ impl Worker {
                     .ok_or_else(|| anyhow!("Carica prima il modello NVIDIA"))?;
                 let settings = self.snapshot.lock().unwrap().settings.clone();
                 let decoder = NvidiaDecoder::new(model, settings.language)?;
-                let target = platform::focused_target();
                 let capture = Capture::start()?;
                 let resampler = StreamingResampler::new(capture.sample_rate)?;
                 self.app
@@ -217,16 +224,23 @@ impl Worker {
                     s.final_text.clear();
                     s.message = None;
                     s.device = capture.device_name.clone();
+                    s.elapsed_seconds = 0;
+                    s.level = 0.0;
                 });
                 self.active = Some(Active {
-                    capture,
+                    capture: Some(capture),
                     resampler,
                     session: StreamingSession::new(decoder),
                     emitted: Instant::now(),
-                    target,
+                    clock: RecordingClock::new(Instant::now()),
                 });
             }
             Command::Stop => return self.stop(),
+            Command::Pause => {
+                if let Err(error) = self.pause() {
+                    self.fail(error);
+                }
+            }
             Command::Cancel => {
                 if self.active.take().is_some() {
                     let _ = self.app.global_shortcut().unregister("Control+Space");
@@ -266,26 +280,51 @@ impl Worker {
         }
         Ok(())
     }
+    fn pause(&mut self) -> Result<()> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(());
+        };
+        if active.capture.is_some() {
+            active.clock.pause(Instant::now());
+            // Drop the CoreAudio stream before draining its finite remaining queue.
+            active.drain()?;
+            active.session.flush_utterance()?;
+            let transcript = active.session.snapshot();
+            let elapsed = active.clock.elapsed(Instant::now()).as_secs();
+            self.update(|s| {
+                s.phase = "paused".into();
+                s.level = 0.0;
+                s.elapsed_seconds = elapsed;
+                s.transcript = transcript;
+            });
+        } else {
+            let capture = Capture::start()?;
+            active.resampler = StreamingResampler::new(capture.sample_rate)?;
+            let device = capture.device_name.clone();
+            active.capture = Some(capture);
+            active.clock.resume(Instant::now());
+            self.update(|s| {
+                s.phase = "recording".into();
+                s.device = device;
+            });
+        }
+        Ok(())
+    }
     fn stop(&mut self) -> Result<()> {
         let Some(mut active) = self.active.take() else {
             return Ok(());
         };
         let _ = self.app.global_shortcut().unregister("Control+Space");
-        // Pause before draining. No callback can extend the tail indefinitely.
+        // Choose the user's current field at stop, not a stale field from start.
+        let target = platform::destination_at_stop();
+        active.clock.pause(Instant::now());
         self.update(|s| {
             s.phase = "finalizing".into();
             s.level = 0.0;
+            s.elapsed_seconds = active.clock.elapsed(Instant::now()).as_secs();
         });
         let finalized = (|| -> Result<Transcript> {
-            active.capture.stop()?;
-            ensure!(
-                !active.capture.failed.load(Ordering::Acquire),
-                "Audio incompleto: il microfono si è interrotto o l’elaborazione è troppo lenta. Recupera il testo parziale."
-            );
-            for frame in active.capture.frames.try_iter() {
-                active.session.push(&active.resampler.push(&frame)?)?;
-            }
-            active.session.push(&active.resampler.finish()?)?;
+            active.drain()?;
             active.session.finish()
         })();
         let transcript = match finalized {
@@ -300,22 +339,84 @@ impl Worker {
         };
         let settings = self.snapshot.lock().unwrap().settings.clone();
         let final_text = format_transcript(&transcript.text(), settings.format);
+        // Persist before attempting delivery so any failure remains recoverable.
+        self.update(|s| {
+            s.transcript = transcript;
+            s.final_text = final_text.clone();
+        });
         let message = if final_text.is_empty() {
             "Nessun parlato rilevato".into()
-        } else if let Some(target) = active.target {
-            match platform::paste_text(&target, &final_text) {
-                Ok(()) => "Testo inviato al campo attivo".into(),
-                Err(error) => format!("Testo pronto. {error}"),
-            }
         } else {
-            "Testo pronto da copiare. Usa ⌥ Spazio da un’altra app per incollare alla fine.".into()
+            let target = target.ok_or_else(|| anyhow!(
+                "Nessun campo esterno accessibile. Consenti Accessibilità a VoiceFlow e posiziona il cursore nell’app di destinazione. Il testo è recuperabile con Copia testo."
+            ))?;
+            platform::paste_text(&target, &final_text)?;
+            "Incolla inviato al campo attivo".into()
         };
         self.update(|s| {
             s.phase = "complete".into();
-            s.transcript = transcript;
-            s.final_text = final_text;
             s.message = Some(message);
         });
         Ok(())
+    }
+}
+impl Active {
+    fn drain(&mut self) -> Result<()> {
+        if let Some(capture) = self.capture.take() {
+            for frame in capture.finish()?.try_iter() {
+                self.session.push(&self.resampler.push(&frame)?)?;
+            }
+            self.session.push(&self.resampler.finish()?)?;
+        }
+        Ok(())
+    }
+}
+/// Wall clock excludes paused intervals and includes capture time awaiting decode.
+struct RecordingClock {
+    accumulated: Duration,
+    since: Option<Instant>,
+}
+impl RecordingClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            accumulated: Duration::ZERO,
+            since: Some(now),
+        }
+    }
+    fn elapsed(&self, now: Instant) -> Duration {
+        self.accumulated
+            + self
+                .since
+                .map_or(Duration::ZERO, |start| now.duration_since(start))
+    }
+    fn pause(&mut self, now: Instant) {
+        self.accumulated = self.elapsed(now);
+        self.since = None;
+    }
+    fn resume(&mut self, now: Instant) {
+        if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn elapsed_clock_freezes_during_pause_and_resumes_without_a_duration_cap() {
+        let start = Instant::now();
+        let mut clock = RecordingClock::new(start);
+        clock.pause(start + Duration::from_secs(125));
+        assert_eq!(
+            clock.elapsed(start + Duration::from_secs(400)).as_secs(),
+            125
+        );
+        clock.pause(start + Duration::from_secs(450));
+        clock.resume(start + Duration::from_secs(500));
+        clock.resume(start + Duration::from_secs(501));
+        assert_eq!(
+            clock.elapsed(start + Duration::from_secs(600)).as_secs(),
+            225
+        );
     }
 }

@@ -14,7 +14,7 @@ resamples audio to mono 16 kHz and feeds the NVIDIA decoder every 560 ms.
 Encoder caches persist between chunks. Tauri events update the preview while
 recording. Stopping drains queued audio and flushes decoder lookahead.
 
-There is no recording timer or 30-second transcription batch. The audio queue
+There is no recording duration limit or 30-second transcription batch. The audio queue
 is bounded. A microphone error or processing overrun stops dictation with a
 visible error and preserves recognized text. Transcript memory grows with text,
 so available memory still matters in very long sessions.
@@ -31,10 +31,23 @@ threads. No NVIDIA GPU, CUDA, Python process or API key is needed.
 - Grant Microphone access to VoiceFlow, and Accessibility for automatic paste.
 - `Option+Space` starts and stops dictation from another app.
 - `Control+Space` cancels during recording and is released afterwards.
-- The app captures the focused text field at start and pastes only if that
-  element remains focused at completion. Secure fields are excluded.
-- Starting inside VoiceFlow, changing focus, or lacking Accessibility leaves
-  the final text in the preview for manual copying.
+- A black/orange native nonactivating NSPanel shows elapsed time on the left,
+  nine narrow audio bars, Pause/Resume and Finish controls on the right. It
+  appears above other apps, including full-screen spaces, without taking focus.
+- Pause releases the microphone, drains and commits the decoder tail, and freezes
+  the timer. Resume starts a fresh capture/resampler while retaining the text.
+  Finish works while paused. There is no pause timeout or recording duration cap.
+- The app captures the focused element at **stop**, then checks its PID and AX
+  identity again after finalization. Web editors exposed as AXWebArea or AXGroup
+  are accepted. Secure text fields and VoiceFlow itself are excluded.
+- Paste waits for physical modifier keys to be released, then posts Command+V to
+  the macOS HID event stream. It never sends Return. If focus changes during
+  finalization, it reports an error and preserves the complete text for recovery.
+- Starting/stopping from VoiceFlow's main window hides the app and returns focus
+  to the previous application. The floating panel doesn't need to restore focus.
+- The Rust app deliberately uses the same standard paste path for T3 Code as for
+  other editors. It does **not** use the legacy VoiceBud reservation/bridge.
+  The existing Python integration is retained only in the legacy implementation.
 - Closing the window hides it. The menu bar menu reopens it or quits.
 
 Paste sends Command+V, never Return. The reported outcome confirms the event
@@ -157,10 +170,13 @@ at 0.77 and 0.75 seconds respectively. See the
 
 The packaged app was built and `codesign --verify --deep --strict` passed with
 the audio-input entitlement. Its linked dependencies are system frameworks;
-ONNX Runtime is linked into the executable. Native UI inspection could not run because the
-computer-control tool failed twice with `Sky Computer Use native pipe startup
-failed`. Physical microphone capture, permissions prompts and target-app paste
-remain unverified. The synthetic benchmark does not cover those integrations.
+ONNX Runtime is linked into the executable. Native UI inspection now works and
+confirmed that the newly packaged app opens, loads NVIDIA, and displays the
+updated controls. macOS currently reports both Microphone and Accessibility
+ungranted for the rebuilt ad-hoc bundle. Physical microphone capture, floating
+panel interaction and target-app paste therefore remain pending permission and
+an actual end-to-end check. The synthetic benchmark does not cover those
+integrations. See [cursor/HUD verification](verification/2026-09-24-cursor-and-hud.md).
 
 ## Remaining migration work
 
@@ -169,7 +185,7 @@ Before promotion to `main`, verify physical microphones, long real dictation,
 device disconnection, focus changes, cancellation and paste in the user's
 editors. Assess whether the initial endpoint detector needs a trained VAD.
 
-Still to port or implement: Codex/Ollama semantic formatting, T3 integration,
+Still to port or implement: Codex/Ollama semantic formatting,
 feedback/recovery history, configurable shortcuts, clipboard cleanup, an in-app
 model downloader, updates, distribution signing and notarization. Evaluate
 formatting quality, privacy and cost separately using the finished transcript.
