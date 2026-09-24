@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import json
+import logging
 import os
 import stat
 import sys
@@ -23,6 +24,8 @@ from voiceflow.storage.permissions import (
     restrict_file_permissions,
     restrict_open_file,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +90,52 @@ class FileFeedbackCorpusRepository:
 
     _lock_guard: ClassVar[threading.Lock] = threading.Lock()
     _directory_locks: ClassVar[dict[Path, threading.Lock]] = {}
+    _TRANSACTION_PREFIXES: ClassVar[tuple[str, ...]] = (
+        ".manifest-",
+        ".voiceflow-rollback-",
+    )
+
+    @classmethod
+    def cleanup_stale_transactions(cls, directory: Path) -> int:
+        """Remove only abandoned private transaction files from a prior process."""
+        directory = directory.expanduser()
+        try:
+            directory_state = directory.lstat()
+        except FileNotFoundError:
+            return 0
+        if stat.S_ISLNK(directory_state.st_mode) or not stat.S_ISDIR(directory_state.st_mode):
+            raise OSError(errno.ENOTDIR, "feedback corpus path is not a directory", directory)
+
+        removed = 0
+        lock = cls._directory_lock(directory)
+        with lock:
+            for path in directory.iterdir():
+                if not cls._is_transaction_name(path.name):
+                    continue
+                try:
+                    state = path.lstat()
+                    if not stat.S_ISREG(state.st_mode) or state.st_uid != os.getuid():
+                        continue
+                    identity = state.st_dev, state.st_ino
+                    cls._remove_owned_path(path, identity)
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    LOGGER.warning(
+                        "Could not remove stale feedback transaction file %s",
+                        path,
+                        exc_info=True,
+                    )
+                    continue
+                removed += 1
+        return removed
+
+    @classmethod
+    def _is_transaction_name(cls, name: str) -> bool:
+        return (
+            name.startswith(cls._TRANSACTION_PREFIXES)
+            or (name.startswith(".voicebud-audio-") and name.endswith(".wav"))
+        )
 
     def save(self, sample: FeedbackSample, directory: Path) -> Path:
         self._validate_identifier(sample.identifier, directory)

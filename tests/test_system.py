@@ -76,7 +76,9 @@ def test_recorder_opens_the_microphone_only_while_recording() -> None:
     assert recorder.active
     assert not recorder.start()
     stream.callback(np.array([[1.0], [1.0]], dtype=np.float32), 2, None, None)
+    first_chunk = recorder._chunks[0]
     assert recorder.stop().tolist() == [1.0, 1.0]
+    assert first_chunk.tolist() == [0, 0]
     assert recorder.last_duration == 0.5
     assert recorder.last_rms == 1.0
     assert recorder.last_peak == 1.0
@@ -113,13 +115,37 @@ def test_recorder_reports_an_unexpected_stream_stop() -> None:
     recorder = Recorder(sounddevice_module=sounddevice, on_status=statuses.append)
     assert recorder.start()
     streams[0].callback(np.ones((2, 1), dtype=np.float32), 2, None, "input overflow")
+    captured_chunk = recorder._chunks[0]
     assert statuses == []
     streams[0].active = False
     streams[0].finished_callback()
 
     assert not recorder.active
     assert statuses == ["Audio input stream stopped unexpectedly"]
+    assert captured_chunk.tolist() == [0, 0]
     recorder.close()
+
+
+def test_closing_active_recorder_zeroizes_unsubmitted_chunks() -> None:
+    streams: list[FakeStream] = []
+
+    def input_stream(**kwargs: Any) -> FakeStream:
+        stream = FakeStream(**kwargs)
+        streams.append(stream)
+        return stream
+
+    sounddevice = SimpleNamespace(
+        InputStream=input_stream,
+        query_devices=lambda *args, **kwargs: {"name": "Default", "max_input_channels": 1},
+    )
+    recorder = Recorder(sounddevice_module=sounddevice)
+    assert recorder.start()
+    streams[0].callback(np.ones((2, 1), dtype=np.float32), 2, None, None)
+    captured_chunk = recorder._chunks[0]
+
+    recorder.close()
+
+    assert captured_chunk.tolist() == [0, 0]
 
 
 def test_input_device_resolution_is_exact() -> None:

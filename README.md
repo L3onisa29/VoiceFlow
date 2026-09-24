@@ -119,7 +119,7 @@ VoiceBud is currently a local Python application rather than a signed `.app` bun
 
 ## Privacy
 
-Microphone samples remain in this process and are passed only to local ONNX Runtime. VoiceBud never sends audio to Codex or Ollama. When post-processing is enabled, only transcript text is sent to that provider. Transcript contents and provider stderr are not written to VoiceBud logs.
+Microphone samples remain in this process and are passed only to local ONNX Runtime. VoiceBud never sends audio to Codex or Ollama. When post-processing is enabled, only transcript text is sent to that provider. Transcript contents and provider stderr are not written to VoiceBud logs. Pipeline-owned samples are zeroed after processing, while the bounded correction buffer schedules active expiry using `feedback.recent_audio_seconds` and zeroes expired samples even when the app is idle. Confirmed benchmark WAVs remain persistent by design; startup cleanup removes only abandoned hidden transaction files and never confirmed WAVs or `manifest.jsonl`.
 
 Directories created by VoiceBud must be exactly `0700`; pre-existing custom directories
 keep their existing mode. If an unusual process umask removes owner permissions from a

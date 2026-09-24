@@ -179,10 +179,11 @@ class DictationPipeline:
             pending = self._pending
             intent = processing_intent or self._next_processing_intent
             self._next_processing_intent = ProcessingIntent.AUTO
+        owned_audio = np.asarray(audio, dtype=np.float32).reshape(-1).copy()
         self._queue.put(
             AudioJob(
                 sequence_id,
-                np.asarray(audio, dtype=np.float32),
+                owned_audio,
                 sample_rate,
                 destination,
                 intent,
@@ -251,8 +252,11 @@ class DictationPipeline:
                 # _process logs the failed stage and traceback before propagating.
                 pass
             finally:
-                self._finish_job()
-                self._queue.task_done()
+                try:
+                    job.audio.fill(0)
+                finally:
+                    self._finish_job()
+                    self._queue.task_done()
 
     def _process(self, job: AudioJob) -> None:
         trace = job.trace
@@ -497,10 +501,13 @@ class DictationPipeline:
             except queue.Empty:
                 break
             if job is not None:
-                self._abandon_t3(job)
-                with self._lock:
-                    self._pending -= 1
-                    self._slots.release()
+                try:
+                    self._abandon_t3(job)
+                finally:
+                    job.audio.fill(0)
+                    with self._lock:
+                        self._pending -= 1
+                        self._slots.release()
             self._queue.task_done()
         self.status.update(queue_depth=self.pending)
         self._queue.put(None)

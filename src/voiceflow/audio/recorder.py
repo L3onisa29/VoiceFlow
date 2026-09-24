@@ -115,8 +115,10 @@ class Recorder:
             timer = self._duration_timer
             self._duration_timer = None
             self.level = 0.0
+            chunks, self._chunks = self._chunks, []
         if timer is not None:
             timer.cancel()
+        self._zero_chunks(chunks)
         self._release_stream(release_slot, stream, unexpectedly_stopped=True)
         if self._on_status is not None:
             self._on_status("Audio input stream stopped unexpectedly")
@@ -256,8 +258,10 @@ class Recorder:
         self._release_stream(release_slot, stream)
         if not chunks:
             return np.zeros(0, dtype=np.float32)
-        audio = np.concatenate(chunks).astype(np.float32, copy=False).reshape(-1)
-        return audio
+        try:
+            return np.concatenate(chunks).astype(np.float32, copy=False).reshape(-1)
+        finally:
+            self._zero_chunks(chunks)
 
     def close(self) -> None:
         with self._lock:
@@ -273,11 +277,18 @@ class Recorder:
             timer = self._duration_timer
             self._duration_timer = None
             self.level = 0.0
+            chunks, self._chunks = self._chunks, []
         if timer is not None:
             timer.cancel()
+        self._zero_chunks(chunks)
         self._release_stream(release_slot, stream)
         if self._owns_release_coordinator:
             self._release_coordinator.close(timeout=0)
+
+    @staticmethod
+    def _zero_chunks(chunks: list[np.ndarray]) -> None:
+        for chunk in chunks:
+            chunk.fill(0)
 
     def _release_stream(
         self,

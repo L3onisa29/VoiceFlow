@@ -61,6 +61,16 @@ class RecordingStopCoordinator:
         captured: CapturedSubmission,
         lease: _SubmissionLease,
     ) -> StopResult:
+        try:
+            return self._submit(captured, lease)
+        finally:
+            captured.audio.fill(0)
+
+    def _submit(
+        self,
+        captured: CapturedSubmission,
+        lease: _SubmissionLease,
+    ) -> StopResult:
         rejection = capture_rejection_reason(
             duration_seconds=captured.duration_seconds,
             rms=captured.rms,

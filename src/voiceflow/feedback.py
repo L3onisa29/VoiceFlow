@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
@@ -14,6 +16,19 @@ from voiceflow.storage.feedback_corpus import (
     FeedbackSample,
     FileFeedbackCorpusRepository,
 )
+
+LOGGER = logging.getLogger(__name__)
+
+
+class _ExpiryTimer(Protocol):
+    daemon: bool
+
+    def start(self) -> None: ...
+
+    def cancel(self) -> None: ...
+
+
+type _TimerFactory = Callable[[float, Callable[[], None]], _ExpiryTimer]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,11 +46,24 @@ class RecentAudioBuffer:
         *,
         max_pending: int,
         clock: Callable[[], float] = time.monotonic,
+        corpus_directory: Path | None = None,
+        timer_factory: _TimerFactory = threading.Timer,
     ) -> RecentAudioBuffer:
+        repository = FileFeedbackCorpusRepository()
+        if corpus_directory is not None:
+            try:
+                removed = repository.cleanup_stale_transactions(corpus_directory)
+            except Exception:
+                LOGGER.exception("Stale feedback transaction cleanup failed")
+            else:
+                if removed:
+                    LOGGER.info("Removed %d stale feedback transaction file(s)", removed)
         return cls(
             ttl_seconds,
             capacity=max_pending + 1,
             clock=clock,
+            repository=repository,
+            timer_factory=timer_factory,
         )
 
     def __init__(
@@ -45,6 +73,7 @@ class RecentAudioBuffer:
         capacity: int = 4,
         clock: Callable[[], float] = time.monotonic,
         repository: FeedbackCorpusRepository | None = None,
+        timer_factory: _TimerFactory = threading.Timer,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
@@ -52,8 +81,10 @@ class RecentAudioBuffer:
         self.capacity = capacity
         self._clock = clock
         self._repository = repository if repository is not None else FileFeedbackCorpusRepository()
+        self._timer_factory = timer_factory
         self._lock = threading.RLock()
         self._entries: OrderedDict[str, tuple[RecentAudio, np.ndarray]] = OrderedDict()
+        self._expiry_timer: tuple[object, _ExpiryTimer] | None = None
 
     def store(self, identifier: str, audio: np.ndarray, sample_rate: int) -> None:
         with self._lock:
@@ -71,10 +102,12 @@ class RecentAudioBuffer:
                 ),
                 np.asarray(audio, dtype=np.float32).reshape(-1).copy(),
             )
+            self._schedule_expiry_locked()
 
     def get(self, identifier: str) -> tuple[np.ndarray, int] | None:
         with self._lock:
             self._prune_expired(self._clock())
+            self._schedule_expiry_locked()
             entry = self._entries.get(identifier)
             if entry is None:
                 return None
@@ -83,9 +116,38 @@ class RecentAudioBuffer:
 
     def clear(self) -> None:
         with self._lock:
+            self._cancel_expiry_locked()
             for _metadata, audio in self._entries.values():
                 audio.fill(0)
             self._entries.clear()
+
+    def _schedule_expiry_locked(self) -> None:
+        self._cancel_expiry_locked()
+        if not self._entries:
+            return
+        expires_at = min(metadata.expires_at for metadata, _audio in self._entries.values())
+        delay = max(0.0, expires_at - self._clock())
+        token = object()
+        timer = self._timer_factory(delay, lambda: self._expire_due(token))
+        timer.daemon = True
+        self._expiry_timer = token, timer
+        timer.start()
+
+    def _cancel_expiry_locked(self) -> None:
+        current = self._expiry_timer
+        self._expiry_timer = None
+        if current is not None:
+            _token, timer = current
+            timer.cancel()
+
+    def _expire_due(self, token: object) -> None:
+        with self._lock:
+            current = self._expiry_timer
+            if current is None or current[0] is not token:
+                return
+            self._expiry_timer = None
+            self._prune_expired(self._clock())
+            self._schedule_expiry_locked()
 
     def _prune_expired(self, now: float) -> None:
         expired = [
@@ -115,6 +177,7 @@ class RecentAudioBuffer:
             return None
         with self._lock:
             self._prune_expired(self._clock())
+            self._schedule_expiry_locked()
             entry = self._entries.get(identifier)
             if entry is None:
                 raise ValueError("Recent audio is missing or expired")
@@ -134,4 +197,5 @@ class RecentAudioBuffer:
             current = self._entries.get(identifier)
             if current is not None and current[0] is metadata:
                 self._discard(identifier)
+                self._schedule_expiry_locked()
         return output

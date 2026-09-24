@@ -5,6 +5,7 @@ import sys
 import threading
 from collections.abc import Callable
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -191,6 +192,28 @@ def test_native_service_builder_defers_resource_construction(app_config: AppConf
     assert services.pipeline_factory is not None
     assert services.hotkey_factory is not None
     services.close()
+
+
+def test_native_feedback_factory_cleans_stale_transactions(
+    app_config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    stale = corpus / ".voicebud-audio-orphan.wav"
+    stale.write_bytes(b"stale")
+    confirmed = corpus / "confirmed.wav"
+    confirmed.write_bytes(b"confirmed")
+    app_config.feedback.benchmark_directory = corpus
+    services = build_application_services(app_config)
+
+    feedback = services.feedback_factory(app_config)
+    try:
+        assert not stale.exists()
+        assert confirmed.read_bytes() == b"confirmed"
+    finally:
+        feedback.clear()
+        services.close()
 
 
 def test_application_constructs_entirely_from_fake_services(app_config: AppConfig) -> None:

@@ -69,6 +69,42 @@ def _wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
     return contents.getvalue()
 
 
+def test_startup_cleanup_removes_only_owned_transaction_files(tmp_path: Path) -> None:
+    stale_files = [
+        tmp_path / ".voicebud-audio-orphan.wav",
+        tmp_path / ".manifest-orphan",
+        tmp_path / ".manifest-commit-orphan",
+        tmp_path / ".manifest-restore-orphan",
+        tmp_path / ".voiceflow-rollback-orphan",
+    ]
+    for path in stale_files:
+        path.write_bytes(b"stale")
+
+    confirmed_wav = tmp_path / "confirmed.wav"
+    confirmed_wav.write_bytes(b"confirmed")
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"audio":"confirmed.wav"}\n', encoding="utf-8")
+    similar_name = tmp_path / ".voicebud-audio-not-a-wav"
+    similar_name.write_bytes(b"preserve")
+    external = tmp_path / "external"
+    external.write_bytes(b"external")
+    transaction_symlink = tmp_path / ".manifest-symlink"
+    transaction_symlink.symlink_to(external)
+    transaction_directory = tmp_path / ".manifest-directory"
+    transaction_directory.mkdir()
+
+    removed = FileFeedbackCorpusRepository.cleanup_stale_transactions(tmp_path)
+
+    assert removed == len(stale_files)
+    assert all(not path.exists() for path in stale_files)
+    assert confirmed_wav.read_bytes() == b"confirmed"
+    assert manifest.read_text(encoding="utf-8") == '{"audio":"confirmed.wav"}\n'
+    assert similar_name.read_bytes() == b"preserve"
+    assert transaction_symlink.is_symlink()
+    assert external.read_bytes() == b"external"
+    assert transaction_directory.is_dir()
+
+
 def test_buffer_delegates_an_owned_float32_sample_then_zeroizes_after_success(
     tmp_path: Path,
 ) -> None:

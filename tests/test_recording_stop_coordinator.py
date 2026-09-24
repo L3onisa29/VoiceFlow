@@ -200,6 +200,30 @@ def test_feedback_failure_is_isolated_after_submission() -> None:
     assert stored == [("17", 16_000)]
 
 
+def test_submission_copies_feedback_before_zeroizing_captured_audio() -> None:
+    types = recording_types()
+    item = captured(InjectionDestination.clipboard_only())
+    stored: list[np.ndarray] = []
+
+    result = coordinator(
+        store_recent_audio=lambda _identifier, audio, _sample_rate: stored.append(audio.copy())
+    ).submit(item, Lease())
+
+    assert result.disposition == types.disposition.SUBMITTED
+    assert stored[0].tolist() == [1] * 160
+    assert item.audio.tolist() == [0] * 160
+
+
+def test_rejected_capture_is_zeroized() -> None:
+    types = recording_types()
+    item = captured(InjectionDestination.clipboard_only(), duration=0.01)
+
+    result = coordinator().submit(item, Lease())
+
+    assert result.disposition == types.disposition.REJECTED
+    assert item.audio.tolist() == [0] * 160
+
+
 def test_bundle_resolution_failure_does_not_block_submission() -> None:
     types = recording_types()
     destination = InjectionDestination.focused(FocusTarget(42, "field"))

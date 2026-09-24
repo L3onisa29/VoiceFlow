@@ -185,6 +185,30 @@ def test_worker_recovers_after_stt_error() -> None:
         pipeline.shutdown()
 
 
+def test_pipeline_owns_and_zeroizes_audio_after_processing() -> None:
+    observed: list[np.ndarray] = []
+
+    class Transcriber:
+        def transcribe(self, audio: np.ndarray, *, sample_rate: int) -> str:
+            assert sample_rate == 16000
+            observed.append(audio)
+            return "done"
+
+    source = np.array([0.25, -0.5], dtype=np.float32)
+    pipeline, _injector = make_pipeline(Transcriber())
+    try:
+        assert pipeline.try_reserve()
+        pipeline.submit_reserved(source, destination=DESTINATION)
+        wait_empty(pipeline)
+
+        assert source.tolist() == [0.25, -0.5]
+        assert len(observed) == 1
+        assert not np.shares_memory(source, observed[0])
+        assert observed[0].tolist() == [0, 0]
+    finally:
+        pipeline.shutdown()
+
+
 def test_empty_transcript_is_reported() -> None:
     pipeline, injector = make_pipeline(
         type("T", (), {"transcribe": lambda *_args, **_kwargs: ""})()

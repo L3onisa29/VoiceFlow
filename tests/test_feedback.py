@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,6 +11,53 @@ import numpy as np
 import pytest
 
 from voiceflow.feedback import RecentAudioBuffer
+
+
+class ManualTimer:
+    def __init__(self, delay: float, callback: Callable[[], None]) -> None:
+        self.delay = delay
+        self.callback = callback
+        self.daemon = False
+        self.cancelled = False
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self.callback()
+
+
+def test_expiration_timer_zeroizes_audio_without_later_buffer_activity() -> None:
+    now = [0.0]
+    timers: list[ManualTimer] = []
+
+    def timer_factory(delay: float, callback: Callable[[], None]) -> ManualTimer:
+        timer = ManualTimer(delay, callback)
+        timers.append(timer)
+        return timer
+
+    buffer = RecentAudioBuffer(
+        10,
+        clock=lambda: now[0],
+        timer_factory=timer_factory,
+    )
+    buffer.store("one", np.array([0.25, -0.5], dtype=np.float32), 16000)
+    retained = buffer._entries["one"][1]
+
+    assert timers[-1].started
+    assert timers[-1].daemon
+    assert timers[-1].delay == 10
+
+    now[0] = 10
+    timers[-1].fire()
+
+    assert buffer._entries == {}
+    assert retained.tolist() == [0, 0]
 
 
 def test_audio_stays_in_ram_until_confirmation_and_expires(tmp_path: Path) -> None:

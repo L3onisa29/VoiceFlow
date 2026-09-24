@@ -80,6 +80,7 @@ def build_application_services(_config: AppConfig) -> ApplicationServices:
         feedback_factory=lambda config: RecentAudioBuffer.for_pipeline(
             config.feedback.recent_audio_seconds,
             max_pending=config.pipeline.max_pending,
+            corpus_directory=config.feedback.benchmark_directory,
         ),
         app_bundle_resolver_factory=AppBundleResolver,
         stop_coordinator_factory=lambda config, **kwargs: RecordingStopCoordinator(
