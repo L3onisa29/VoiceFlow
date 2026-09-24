@@ -2,6 +2,13 @@
 
 ## Current application
 
+TanStack Router owns navigation in the React interface. `src/router.ts` assembles
+the typed route tree from `src/routes/__root.tsx` and `src/routes/index.tsx`.
+The `/` route renders dictation. The root provides the outlet and a recovery
+link for unknown routes. Hash history keeps navigation within the bundled
+WebView document, without requiring server rewrites. See the
+[TanStack history documentation](https://tanstack.com/router/latest/docs/guide/history-types).
+
 The Tauri `.app` embeds React assets. CPAL captures the system microphone; Rust
 resamples audio to mono 16 kHz and feeds the NVIDIA decoder every 560 ms.
 Encoder caches persist between chunks. Tauri events update the preview while

@@ -1,6 +1,6 @@
 # VoiceFlow
 
-A macOS dictation app built with Rust, Tauri 2 and React. NVIDIA Nemotron 3.5
+A macOS dictation app built with Rust, Tauri 2, React and TanStack Router. NVIDIA Nemotron 3.5
 ASR Streaming 0.6B transcribes Italian and English locally while you speak.
 The app shows a live preview and pastes the final text at the cursor when you
 finish. There is no configured recording duration limit.

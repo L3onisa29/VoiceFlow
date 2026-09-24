@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import {
   AudioLines,
   ArrowUpRight,
@@ -90,11 +91,11 @@ export default function App() {
           </span>
         </div>
         <div className="sidebar-section-label">IL TUO SPAZIO</div>
-        <div className="nav-current">
+        <Link to="/" className="nav-current" activeOptions={{ exact: true }}>
           <Mic aria-hidden="true" />
           <span>Dettatura</span>
           <span className="nav-dot" />
-        </div>
+        </Link>
         <div className="sidebar-note">
           <ShieldCheck />
           <p>
