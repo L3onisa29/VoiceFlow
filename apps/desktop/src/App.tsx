@@ -140,6 +140,15 @@ export default function App() {
           <Alert variant="destructive">
             <AlertTitle>Operazione non completata</AlertTitle>
             <AlertDescription>{error || state?.message}</AlertDescription>
+            {state?.phase === "error" && state.modelReady && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void execute("cancel_recording")}
+              >
+                Annulla dettatura
+              </Button>
+            )}
             {needsAccessibility && (
               <Button
                 variant="outline"

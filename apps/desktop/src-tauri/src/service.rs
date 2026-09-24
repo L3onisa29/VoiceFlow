@@ -43,6 +43,7 @@ pub enum Command {
 #[derive(Clone)]
 pub struct Service {
     sender: Sender<Command>,
+    cancel_sender: Sender<()>,
     snapshot: Arc<Mutex<Snapshot>>,
 }
 impl Service {
@@ -68,8 +69,10 @@ impl Service {
             settings: loaded.unwrap_or_default(),
         }));
         let (sender, receiver) = bounded(16);
+        let (cancel_sender, cancel_receiver) = bounded(1);
         let service = Self {
             sender,
+            cancel_sender,
             snapshot: Arc::clone(&snapshot),
         };
         std::thread::Builder::new()
@@ -81,6 +84,7 @@ impl Service {
                     model_path,
                     settings_path,
                     receiver,
+                    cancel_receiver,
                     model: None,
                     active: None,
                 };
@@ -89,6 +93,14 @@ impl Service {
         Ok(service)
     }
     pub fn send(&self, command: Command) -> Result<()> {
+        // Cancellation is not ordinary work: a full command queue must never
+        // delay or reject it. Multiple requests cancel the same pending session.
+        if matches!(command, Command::Cancel) {
+            return match self.cancel_sender.try_send(()) {
+                Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(()),
+                Err(_) => Err(anyhow!("VoiceFlow non è disponibile")),
+            };
+        }
         self.sender
             .try_send(command)
             .map_err(|_| anyhow!("VoiceFlow è occupato, riprova tra un istante"))
@@ -110,6 +122,7 @@ struct Worker {
     model_path: PathBuf,
     settings_path: PathBuf,
     receiver: Receiver<Command>,
+    cancel_receiver: Receiver<()>,
     model: Option<parakeet_handle::Handle>,
     active: Option<Active>,
 }
@@ -137,6 +150,10 @@ impl Worker {
                 .and_then(|a| a.capture.as_ref().map(|c| c.frames.clone()))
                 .unwrap_or_else(crossbeam_channel::never);
             select_biased! {
+                recv(self.cancel_receiver) -> cancelled => {
+                    if cancelled.is_err() { break; }
+                    self.cancel();
+                }
                 recv(self.receiver) -> cmd => {
                     match cmd {
                         Ok(Command::Quit) | Err(_) => break,
@@ -167,7 +184,16 @@ impl Worker {
         self.active = None;
     }
     fn fail(&mut self, error: anyhow::Error) {
-        let _ = self.app.global_shortcut().unregister("Control+Space");
+        if self.take_cancellation() {
+            return;
+        }
+        // A recording error can win the race just before Ctrl+Space arrives.
+        // Keep cancellation available until that recoverable session is dismissed.
+        let phase = self.snapshot.lock().unwrap().phase.clone();
+        if self.active.is_none() && !matches!(phase.as_str(), "recording" | "paused" | "finalizing")
+        {
+            let _ = self.app.global_shortcut().unregister("Control+Space");
+        }
         if let Some(active) = self.active.take() {
             self.update(|s| {
                 s.transcript = active.session.snapshot();
@@ -211,13 +237,15 @@ impl Worker {
                 let decoder = NvidiaDecoder::new(model, settings.language)?;
                 let capture = Capture::start()?;
                 let resampler = StreamingResampler::new(capture.sample_rate)?;
-                self.app
-                    .global_shortcut()
-                    .on_shortcut("Control+Space", |app, _, event| {
-                        if event.state == ShortcutState::Pressed {
-                            let _ = app.state::<Service>().send(Command::Cancel);
-                        }
-                    })?;
+                if !self.app.global_shortcut().is_registered("Control+Space") {
+                    self.app
+                        .global_shortcut()
+                        .on_shortcut("Control+Space", |app, _, event| {
+                            if event.state == ShortcutState::Pressed {
+                                let _ = app.state::<Service>().send(Command::Cancel);
+                            }
+                        })?;
+                }
                 self.update(|s| {
                     s.phase = "recording".into();
                     s.transcript = Transcript::default();
@@ -241,18 +269,7 @@ impl Worker {
                     self.fail(error);
                 }
             }
-            Command::Cancel => {
-                if self.active.take().is_some() {
-                    let _ = self.app.global_shortcut().unregister("Control+Space");
-                    self.update(|s| {
-                        s.phase = "idle".into();
-                        s.transcript = Transcript::default();
-                        s.final_text.clear();
-                        s.level = 0.0;
-                        s.message = Some("Dettatura annullata".into());
-                    });
-                }
-            }
+            Command::Cancel => self.cancel(),
             Command::Settings(settings) => {
                 ensure!(self.active.is_none(), "Termina prima la registrazione");
                 settings.save(&self.settings_path)?;
@@ -263,6 +280,19 @@ impl Worker {
             Command::Quit => {}
         }
         Ok(())
+    }
+    fn cancel(&mut self) {
+        let had_active = self.active.take().is_some();
+        let _ = self.app.global_shortcut().unregister("Control+Space");
+        self.update(|s| apply_cancellation(s, had_active));
+    }
+    fn take_cancellation(&mut self) -> bool {
+        if self.cancel_receiver.try_recv().is_ok() {
+            self.cancel();
+            true
+        } else {
+            false
+        }
     }
     fn audio(&mut self, frame: &[f32]) -> Result<()> {
         let Some(active) = self.active.as_mut() else {
@@ -287,7 +317,7 @@ impl Worker {
         if active.capture.is_some() {
             active.clock.pause(Instant::now());
             // Drop the CoreAudio stream before draining its finite remaining queue.
-            active.drain()?;
+            active.drain(&self.cancel_receiver)?;
             active.session.flush_utterance()?;
             let transcript = active.session.snapshot();
             let elapsed = active.clock.elapsed(Instant::now()).as_secs();
@@ -314,7 +344,6 @@ impl Worker {
         let Some(mut active) = self.active.take() else {
             return Ok(());
         };
-        let _ = self.app.global_shortcut().unregister("Control+Space");
         // Choose the user's current field at stop, not a stale field from start.
         let target = platform::destination_at_stop();
         active.clock.pause(Instant::now());
@@ -324,9 +353,12 @@ impl Worker {
             s.elapsed_seconds = active.clock.elapsed(Instant::now()).as_secs();
         });
         let finalized = (|| -> Result<Transcript> {
-            active.drain()?;
+            active.drain(&self.cancel_receiver)?;
             active.session.finish()
         })();
+        if self.take_cancellation() {
+            return Ok(());
+        }
         let transcript = match finalized {
             Ok(transcript) => transcript,
             Err(error) => {
@@ -350,9 +382,10 @@ impl Worker {
             let target = target.ok_or_else(|| anyhow!(
                 "Nessun campo esterno accessibile. Consenti Accessibilità a VoiceFlow e posiziona il cursore nell’app di destinazione. Il testo è recuperabile con Copia testo."
             ))?;
-            platform::paste_text(&target, &final_text)?;
+            platform::paste_text(&target, &final_text, || !self.cancel_receiver.is_empty())?;
             "Incolla inviato al campo attivo".into()
         };
+        let _ = self.app.global_shortcut().unregister("Control+Space");
         self.update(|s| {
             s.phase = "complete".into();
             s.message = Some(message);
@@ -361,14 +394,30 @@ impl Worker {
     }
 }
 impl Active {
-    fn drain(&mut self) -> Result<()> {
+    fn drain(&mut self, cancellation: &Receiver<()>) -> Result<()> {
         if let Some(capture) = self.capture.take() {
             for frame in capture.finish()?.try_iter() {
+                ensure!(cancellation.is_empty(), "Dettatura annullata");
                 self.session.push(&self.resampler.push(&frame)?)?;
             }
             self.session.push(&self.resampler.finish()?)?;
         }
         Ok(())
+    }
+}
+fn apply_cancellation(snapshot: &mut Snapshot, had_active: bool) {
+    if had_active
+        || matches!(
+            snapshot.phase.as_str(),
+            "recording" | "paused" | "finalizing" | "error"
+        )
+    {
+        snapshot.phase = "idle".into();
+        snapshot.transcript = Transcript::default();
+        snapshot.final_text.clear();
+        snapshot.level = 0.0;
+        snapshot.elapsed_seconds = 0;
+        snapshot.message = Some("Dettatura annullata".into());
     }
 }
 /// Wall clock excludes paused intervals and includes capture time awaiting decode.
@@ -402,6 +451,72 @@ impl RecordingClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn failed_snapshot() -> Snapshot {
+        Snapshot {
+            revision: 1,
+            phase: "error".into(),
+            model_ready: true,
+            model_present: true,
+            transcript: Transcript {
+                partial: "testo da scartare".into(),
+                ..Transcript::default()
+            },
+            final_text: "testo da scartare".into(),
+            message: Some(
+                "Acquisizione interrotta: audio incompleto. Il testo parziale è recuperabile."
+                    .into(),
+            ),
+            level: 0.0,
+            elapsed_seconds: 5,
+            device: "test".into(),
+            settings: Settings::default(),
+        }
+    }
+    #[test]
+    fn cancellation_after_capture_failure_must_clear_error_instead_of_being_ignored() {
+        let mut snapshot = failed_snapshot();
+        apply_cancellation(&mut snapshot, false);
+        assert_eq!(
+            snapshot.phase, "idle",
+            "Cancellation left the capture error visible"
+        );
+        assert!(snapshot.final_text.is_empty());
+        assert!(snapshot.transcript.text().is_empty());
+        assert_eq!(snapshot.message.as_deref(), Some("Dettatura annullata"));
+    }
+    #[test]
+    fn cancellation_bypasses_a_full_command_queue_and_coalesces_repeated_key_presses() {
+        let (sender, receiver) = bounded(1);
+        sender.send(Command::Stop).unwrap();
+        let (cancel_sender, cancellation) = bounded(1);
+        let service = Service {
+            sender,
+            cancel_sender,
+            snapshot: Arc::new(Mutex::new(failed_snapshot())),
+        };
+        for _ in 0..10 {
+            service.send(Command::Cancel).unwrap();
+        }
+        assert_eq!(cancellation.len(), 1);
+        assert!(matches!(receiver.recv().unwrap(), Command::Stop));
+        cancellation.recv().unwrap();
+        assert!(cancellation.is_empty());
+    }
+    #[test]
+    fn cancellation_clears_finalization_and_is_idempotent_but_cannot_undo_delivery() {
+        let mut snapshot = failed_snapshot();
+        snapshot.phase = "finalizing".into();
+        apply_cancellation(&mut snapshot, false);
+        apply_cancellation(&mut snapshot, false);
+        assert_eq!(snapshot.phase, "idle");
+        assert_eq!(snapshot.elapsed_seconds, 0);
+        assert!(snapshot.final_text.is_empty());
+        snapshot.phase = "complete".into();
+        snapshot.final_text = "already delivered".into();
+        apply_cancellation(&mut snapshot, false);
+        assert_eq!(snapshot.final_text, "already delivered");
+        assert_eq!(snapshot.phase, "complete");
+    }
     #[test]
     fn elapsed_clock_freezes_during_pause_and_resumes_without_a_duration_cap() {
         let start = Instant::now();

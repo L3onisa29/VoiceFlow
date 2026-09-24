@@ -51,7 +51,7 @@ define_class!(
         }
         #[unsafe(method(finishClicked:))]
         fn finish_clicked(&self, _sender: &AnyObject) {
-            if self.ivars().phase.borrow().as_str() == "error" { hide(); }
+            if self.ivars().phase.borrow().as_str() == "error" { let _ = self.ivars().app.state::<Service>().send(Command::Cancel); }
             else { let _ = self.ivars().app.state::<Service>().send(Command::Stop); }
         }
     }

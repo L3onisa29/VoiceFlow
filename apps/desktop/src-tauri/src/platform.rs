@@ -137,10 +137,11 @@ pub fn copy_text(text: &str) -> Result<()> {
 }
 
 /// Validate the element captured at stop after finalization. Never send Return.
-pub fn paste_text(target: &FocusTarget, text: &str) -> Result<()> {
+pub fn paste_text(target: &FocusTarget, text: &str, cancelled: impl Fn() -> bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     // Option+Space stops dictation. Let the physical modifiers go before Cmd+V.
     while unsafe { CGEventSourceFlagsState(1) } & 0x001e0000 != 0 {
+        ensure!(!cancelled(), "Dettatura annullata");
         ensure!(
             Instant::now() < deadline,
             "Rilascia i tasti modificatori. Il testo è disponibile in VoiceFlow."
@@ -160,7 +161,9 @@ pub fn paste_text(target: &FocusTarget, text: &str) -> Result<()> {
         .map_err(|_| anyhow!("Cannot create paste event"))?;
     down.set_flags(CGEventFlags::CGEventFlagCommand);
     up.set_flags(CGEventFlags::CGEventFlagCommand);
+    ensure!(!cancelled(), "Dettatura annullata");
     copy_text(text)?;
+    ensure!(!cancelled(), "Dettatura annullata");
     down.post(CGEventTapLocation::HID);
     up.post(CGEventTapLocation::HID);
     Ok(())
