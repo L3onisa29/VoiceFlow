@@ -164,7 +164,7 @@ export default function App() {
         {needsMicrophone && (
           <Alert className="permission-callout">
             <Mic />
-            <AlertTitle>Una volta sola, il permesso di ascoltarti.</AlertTitle>
+            <AlertTitle>Consenti l’accesso al microfono.</AlertTitle>
             <AlertDescription>
               Consenti l’accesso al microfono per iniziare a dettare.
             </AlertDescription>

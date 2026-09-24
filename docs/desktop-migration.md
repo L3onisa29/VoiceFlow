@@ -68,8 +68,19 @@ transcripts under ignored `artifacts/streaming/`.
 
 The bundle identifier is `com.voiceflow.desktop`. Microphone usage description
 and the audio-input entitlement are in the bundle. Grant permissions to the
-packaged app. Ad-hoc builds can require renewed permission after rebuilding or
-moving. Stable distribution signing and notarization remain to be configured.
+packaged app. `pnpm desktop:build` now requires a stable Apple signing identity.
+On this Mac it uses the personal development certificate already in Keychain.
+The signer and designated requirement are pinned outside the repository in
+`~/Library/Application Support/VoiceFlow/build-signing.json`. The build verifies
+the bundle signature and rejects a changed identity or ad-hoc fallback.
+On a new Mac, set `APPLE_SIGNING_IDENTITY` to the intended Keychain certificate
+for the first build; later builds reuse it automatically. Direct Tauri builds
+without this wrapper fail in the pre-build hook.
+
+The existing personal certificate expires on 2027-09-16. Renewal requires an
+explicit signing configuration review; never delete the pin merely to get an
+unrecognized signer through. Developer ID distribution and notarization remain
+separate work. See [update permission verification](verification/2026-09-24-stable-signing.md).
 
 ## NVIDIA model and provenance
 
