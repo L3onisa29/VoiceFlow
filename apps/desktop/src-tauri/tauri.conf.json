@@ -19,7 +19,8 @@
         "minWidth": 780,
         "minHeight": 620,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "theme": "Dark"
       }
     ],
     "security": {
@@ -28,9 +29,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "app"
-    ],
+    "targets": ["app"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
