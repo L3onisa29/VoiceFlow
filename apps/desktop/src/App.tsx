@@ -71,6 +71,7 @@ export default function App() {
       .join(" ");
   const words = text?.trim() ? text.trim().split(/\s+/).length : 0;
   const needsMicrophone = permissions && !permissions.microphone;
+  const needsAccessibility = permissions && !permissions.accessibility;
   const status = state ? phaseLabels[state.phase] : "Collegamento all’app";
   return (
     <div className="app-shell">
@@ -139,6 +140,16 @@ export default function App() {
           <Alert variant="destructive">
             <AlertTitle>Operazione non completata</AlertTitle>
             <AlertDescription>{error || state?.message}</AlertDescription>
+            {needsAccessibility && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void privacy("accessibility")}
+              >
+                Apri Accessibilità
+                <ArrowUpRight data-icon="inline-end" />
+              </Button>
+            )}
           </Alert>
         )}
         {needsMicrophone && (
@@ -158,6 +169,26 @@ export default function App() {
               }
             >
               Consenti microfono
+              <ArrowUpRight data-icon="inline-end" />
+            </Button>
+          </Alert>
+        )}
+        {needsAccessibility && (
+          <Alert className="permission-callout">
+            <Keyboard />
+            <AlertTitle>
+              Consenti a VoiceFlow di incollare dove scrivi.
+            </AlertTitle>
+            <AlertDescription>
+              Apri Accessibilità e abilita VoiceFlow. Il permesso serve per
+              inserire la dettatura al cursore in T3 Code e nelle altre app.
+            </AlertDescription>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void privacy("accessibility")}
+            >
+              Consenti Accessibilità
               <ArrowUpRight data-icon="inline-end" />
             </Button>
           </Alert>
@@ -381,21 +412,25 @@ export default function App() {
             </span>
           </p>
         </footer>
-        {permissions && !permissions.accessibility && (
-          <div className="accessibility-row">
-            <span>
-              Per l’incolla automatico serve il permesso Accessibilità.
-            </span>
+        <div className="accessibility-row" aria-label="Permessi macOS">
+          <span>Permessi macOS</span>
+          <div className="permission-links">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => void privacy("microphone")}
+            >
+              Microfono <ArrowUpRight data-icon="inline-end" />
+            </Button>
             <Button
               size="sm"
               variant="ghost"
               onClick={() => void privacy("accessibility")}
             >
-              Apri impostazioni
-              <ArrowUpRight data-icon="inline-end" />
+              Accessibilità <ArrowUpRight data-icon="inline-end" />
             </Button>
           </div>
-        )}
+        </div>
         {state && !state.modelReady && !processing && (
           <div className="accessibility-row">
             <span>

@@ -46,13 +46,32 @@ user's latest direction. No T3 installation or legacy Python integration was cha
 - Opened the packaged app with native computer control. NVIDIA loaded and the
   revised UI was visible. T3 Code's installed composer is accessible to the
   inspection tool; no T3 bridge calls were made.
-- The previous bundle lacked Accessibility. The rebuilt bundle reports both
-  Microphone and Accessibility ungranted. A permission request is pending with
-  the user. No system permission was changed by the agent.
-- Therefore **recording HUD interaction, real pause/resume, global shortcut and
-  actual insertion at the T3 caret are not yet verified**. Synthetic/unit tests
-  and the successful build do not establish those desktop outcomes.
-- A synthetic Option+Space sent by the UI tool did not activate dictation; it
-  inserted a nonbreaking space, which was removed immediately. Verify the
-  physical shortcut after permissions are enabled. No message was submitted.
-
+- With the user's authorization, refreshed Accessibility by removing the old
+  VoiceFlow entry and adding the exact current bundle from
+  `target/release/bundle/macos/VoiceFlow.app`. Toggling the old entry alone did
+  not work. The app then recognized Accessibility without a restart. The
+  Microphone permission was also recognized.
+- Verified actual microphone capture and progressive NVIDIA transcription using
+  a synthetic Italian phrase played through the Mac's audio output.
+- **Verified real insertion in T3 Code**: placed the caret before `VF_END` in
+  `VF_START  VF_END`. VoiceFlow inserted `Questa è una prova di inserimento al
+  cursore. Il testo deve restare nella bozza` between the markers. Both markers
+  survived and no message was submitted. Removed the complete test draft after
+  verification, leaving the composer empty.
+- **Verified the native floating panel visually**: black/orange, elapsed timer on
+  the left, nine compact bars, Pause/Resume and Finish on the right.
+- Paused at 00:05 from the main window. The timer remained 00:05 through subsequent
+  inspection. Hid the main window, resumed from the floating panel, observed the
+  timer advance to 00:13, and paused from the panel at 00:19.
+- T3's empty composer remained the focused UI element after using the panel.
+- Finished while paused. The panel disappeared, VoiceFlow's process remained
+  alive, and the silent test left T3's composer empty.
+- Typecheck, packaged build and strict codesign verification also passed after
+  adding visible permission shortcuts. Both top permission callouts were checked
+  in the running app. The persistent permission links remain available below.
+- Not yet verified: physical global shortcut through this automation tool,
+  microphone disconnection, long physical-microphone sessions and other editors.
+  The initial synthetic Option+Space did not activate dictation; its inserted
+  nonbreaking space was removed immediately. No message was submitted.
+- Reopening the hidden main window from Finder did not expose a window to the
+  automation tool. Tray reopening and Dock reopening need a separate check.

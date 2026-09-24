@@ -539,3 +539,9 @@ kbd {
     transition: none !important;
   }
 }
+
+.permission-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}

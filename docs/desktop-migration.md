@@ -170,20 +170,20 @@ at 0.77 and 0.75 seconds respectively. See the
 
 The packaged app was built and `codesign --verify --deep --strict` passed with
 the audio-input entitlement. Its linked dependencies are system frameworks;
-ONNX Runtime is linked into the executable. Native UI inspection now works and
-confirmed that the newly packaged app opens, loads NVIDIA, and displays the
-updated controls. macOS currently reports both Microphone and Accessibility
-ungranted for the rebuilt ad-hoc bundle. Physical microphone capture, floating
-panel interaction and target-app paste therefore remain pending permission and
-an actual end-to-end check. The synthetic benchmark does not cover those
-integrations. See [cursor/HUD verification](verification/2026-09-24-cursor-and-hud.md).
+ONNX Runtime is linked into the executable. Native UI verification now covers
+microphone capture, progressive transcription, actual insertion between existing
+text in T3 Code, the floating panel's appearance, pause/resume with a frozen
+clock, and retaining the editor's focus while using panel controls. The test draft
+was removed without sending a message. Accessibility initially remained stale
+across ad-hoc rebuilds: removing its old entry and adding the exact current bundle
+resolved the mismatch. See [cursor/HUD verification](verification/2026-09-24-cursor-and-hud.md).
 
 ## Remaining migration work
 
 This is the first desktop implementation, not feature parity with Python.
-Before promotion to `main`, verify physical microphones, long real dictation,
-device disconnection, focus changes, cancellation and paste in the user's
-editors. Assess whether the initial endpoint detector needs a trained VAD.
+Before promotion to `main`, extend the verified T3 flow to other editors and
+check long real dictation, device disconnection, focus changes during
+finalization, cancellation, physical global shortcuts and reopening hidden windows. Assess whether the initial endpoint detector needs a trained VAD.
 
 Still to port or implement: Codex/Ollama semantic formatting,
 feedback/recovery history, configurable shortcuts, clipboard cleanup, an in-app
