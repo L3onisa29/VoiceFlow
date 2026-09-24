@@ -1,11 +1,4 @@
-# VoiceFlow desktop migration
-
-Work branch: `codex/tauri-streaming-app`. `main` is unchanged. Pending work was
-saved on `codex/uv-parakeet-migration` before creating this branch:
-
-- `03c533d`: retained-audio expiry and abandoned feedback cleanup.
-- `6606bb4`: cancellation shortcut and dictation lifecycle changes.
-- `86af34d`: ignore local test artifacts.
+# VoiceFlow desktop
 
 ## Current application
 
@@ -45,15 +38,14 @@ threads. No NVIDIA GPU, CUDA, Python process or API key is needed.
   finalization, it reports an error and preserves the complete text for recovery.
 - Starting/stopping from VoiceFlow's main window hides the app and returns focus
   to the previous application. The floating panel doesn't need to restore focus.
-- The Rust app deliberately uses the same standard paste path for T3 Code as for
-  other editors. It does **not** use the legacy VoiceBud reservation/bridge.
-  The existing Python integration is retained only in the legacy implementation.
+- T3 Code uses the same standard paste path as other editors. No dedicated
+  integration or bridge is required.
 - Closing the window hides it. The menu bar menu reopens it or quits.
 
 Paste sends Command+V, never Return. The reported outcome confirms the event
 was sent, not that the destination editor confirmed insertion. The final text
-replaces the clipboard and remains there until replaced. Legacy clipboard
-expiry/restoration has not yet been ported.
+replaces the clipboard and remains there until replaced. Automatic clipboard
+expiry/restoration is not implemented.
 
 Faithful formatting preserves recognized words and the model's punctuation.
 The optional command formatter recognizes `a capo`, `nuovo paragrafo`,
@@ -109,14 +101,14 @@ Application code retains the repository's MIT license. Inference uses
 
 Verified on 24 September 2026, Apple M1 with 8 GB RAM and macOS 26.6.2:
 
-| Component | Installed |
-| --- | --- |
-| Node via nvm | 24.18.0 |
-| pnpm | 11.5.0 |
-| Rust and Cargo, Homebrew | 1.97.1 |
-| Rustfmt and Clippy | available |
-| Xcode and macOS SDK | 27.0 |
-| Clang | Xcode toolchain |
+| Component                | Installed       |
+| ------------------------ | --------------- |
+| Node via nvm             | 24.18.0         |
+| pnpm                     | 11.5.0          |
+| Rust and Cargo, Homebrew | 1.97.1          |
+| Rustfmt and Clippy       | available       |
+| Xcode and macOS SDK      | 27.0            |
+| Clang                    | Xcode toolchain |
 
 `pnpm doctor` repeats prerequisite checks and checks model-file presence.
 Rustup and CMake are unnecessary here: Homebrew supplies Rust and `ort` uses
@@ -136,8 +128,7 @@ pnpm desktop:build
 The output is `target/release/bundle/macos/VoiceFlow.app`. Runtime needs no Vite
 server. Run performance measurements separately from builds on an 8 GB Mac.
 
-The Python baseline passed 619 tests with 2 opt-in tests skipped, Ruff and
-Pyright before preservation commits. Rust tests cover preview before stop,
+Rust tests cover preview before stop,
 over 300 seconds of input, continuation after pauses, idempotent finish, silence,
 invalid samples, resampling duration and command formatting.
 
@@ -156,10 +147,10 @@ JSONL records retain successive partial transcripts and timing measurements.
 
 Initial measured results on the M1 with INT8:
 
-| Synthetic input | Duration | Inference | RTF | First partial, input elapsed | Stop flush |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Italian | 13.33 s | 4.86 s | 0.365 | 0.56 s | 353 ms |
-| English | 11.00 s | 3.21 s | 0.292 | 0.56 s | 421 ms |
+| Synthetic input | Duration | Inference |   RTF | First partial, input elapsed | Stop flush |
+| --------------- | -------: | --------: | ----: | ---------------------------: | ---------: |
+| Italian         |  13.33 s |    4.86 s | 0.365 |                       0.56 s |     353 ms |
+| English         |  11.00 s |    3.21 s | 0.292 |                       0.56 s |     421 ms |
 
 RTF below 1 means inference consumed less time than the audio duration. The
 input timestamp is not wall-clock latency. The benchmark additionally reports
@@ -187,16 +178,18 @@ text in T3 Code, the floating panel's appearance, pause/resume with a frozen
 clock, and retaining the editor's focus while using panel controls. The test draft
 was removed without sending a message. Accessibility initially remained stale
 across ad-hoc rebuilds: removing its old entry and adding the exact current bundle
-resolved the mismatch. See [cursor/HUD verification](verification/2026-09-24-cursor-and-hud.md).
+resolved the mismatch. Stable signing now preserves permissions across updates.
+The later signing check confirmed microphone capture and permission retention,
+but did not confirm T3 insertion. See [cursor/HUD verification](verification/2026-09-24-cursor-and-hud.md)
+and [the latest signing check](verification/2026-09-24-stable-signing.md).
 
-## Remaining migration work
+## Remaining work
 
-This is the first desktop implementation, not feature parity with Python.
-Before promotion to `main`, extend the verified T3 flow to other editors and
+Before promotion to `main`, recheck T3 insertion and extend verification to other editors. Also
 check long real dictation, device disconnection, focus changes during
 finalization, cancellation, physical global shortcuts and reopening hidden windows. Assess whether the initial endpoint detector needs a trained VAD.
 
-Still to port or implement: Codex/Ollama semantic formatting,
+Possible later features include semantic formatting,
 feedback/recovery history, configurable shortcuts, clipboard cleanup, an in-app
 model downloader, updates, distribution signing and notarization. Evaluate
 formatting quality, privacy and cost separately using the finished transcript.

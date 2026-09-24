@@ -1,12 +1,5 @@
-__pycache__/
-*.pyc
-.venv/
 .DS_Store
 *.log
-
-.coverage
-.pytest_cache/
-.ruff_cache/
 node_modules/
 /target/
 **/src-tauri/gen/

@@ -1,4 +1,0 @@
-{
-  "request_frame": "{\"version\":1,\"type\":\"transcription.completed\",\"requestId\":\"golden-prefix:7\",\"recordingId\":\"0ded863b-e851-4c21-ab6c-a1a2525b8ee2\",\"nonce\":\"golden-nonce\",\"sentAt\":1234500,\"auth\":\"sècret🙂\",\"transcript\":\"Caffè 東京 🙂\"}\n",
-  "accepted_response": "{\"version\":1,\"requestId\":\"golden-prefix:7\",\"accepted\":true,\"code\":\"accepted\"}"
-}
