@@ -522,6 +522,7 @@ impl RecordingClock {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use voiceflow_core::formatting::FormatMode;
 
     #[derive(Default)]
     struct DelayedDecoder {
@@ -553,6 +554,89 @@ mod tests {
         fn reset(&mut self) {
             self.utterance += 1;
             self.text.clear();
+        }
+    }
+
+    #[test]
+    fn decoder_markers_stay_filtered_in_preview_final_and_new_history_only() {
+        struct SnapshotDecoder(Arc<Mutex<String>>);
+        impl StreamingDecoder for SnapshotDecoder {
+            fn chunk_samples(&self) -> usize {
+                8_960
+            }
+            fn feed(&mut self, _: &[f32]) -> Result<()> {
+                Ok(())
+            }
+            fn text(&self) -> String {
+                self.0.lock().unwrap().clone()
+            }
+            fn reset(&mut self) {
+                self.0.lock().unwrap().clear();
+            }
+        }
+
+        for mode in [FormatMode::Faithful, FormatMode::SpokenCommands] {
+            for cleanup in [false, true] {
+                let raw = Arc::new(Mutex::new(String::new()));
+                let mut session = StreamingSession::with_processing(
+                    SnapshotDecoder(Arc::clone(&raw)),
+                    mode,
+                    cleanup,
+                );
+                for (snapshot, expected) in [
+                    ("<un", ""),
+                    ("<unk> Ciao<noise>, mondo <un", "Ciao, mondo"),
+                    ("<unk> Ciao<noise>, Davide <unk>", "Ciao, Davide"),
+                ] {
+                    *raw.lock().unwrap() = snapshot.into();
+                    session.push(&[0.25; 8_960]).unwrap();
+                    let preview = session.snapshot();
+                    assert_eq!(preview.text(), expected);
+                    assert_eq!(
+                        format!("{}{}", preview.confirmed, preview.partial).trim(),
+                        expected
+                    );
+                }
+                session.flush_utterance().unwrap();
+                *raw.lock().unwrap() =
+                    "molto molto importante <literal content> <incompleto".into();
+                session.push(&[0.25; 8_960]).unwrap();
+                let final_text = session.finish().unwrap().text();
+                assert_eq!(
+                    final_text,
+                    "Ciao, Davide molto molto importante <incompleto"
+                );
+                assert_eq!(session.finish().unwrap().text(), final_text);
+
+                let path = std::env::temp_dir().join(format!(
+                    "voiceflow-markers-{}-{}.sqlite3",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let store = HistoryStore::new(path.clone());
+                for (session_key, text) in [
+                    ("legacy", "vecchio <unk> testo"),
+                    ("new", final_text.as_str()),
+                ] {
+                    store
+                        .record(&CompletedDictation {
+                            session_key,
+                            created_at: 1,
+                            text,
+                            duration_seconds: 1.0,
+                            language: "it",
+                        })
+                        .unwrap();
+                }
+                // History copy reads this exact stored value; it must not clean old rows.
+                let reopened = HistoryStore::new(path.clone());
+                assert_eq!(reopened.text(1).unwrap(), "vecchio <unk> testo");
+                assert_eq!(reopened.text(2).unwrap(), final_text);
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
 

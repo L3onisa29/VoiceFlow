@@ -9,6 +9,8 @@
     "desktop:build": "node scripts/build-desktop.ts",
     "desktop:check": "pnpm --filter @voiceflow/desktop check",
     "desktop:ui": "pnpm --filter @voiceflow/desktop build",
+    "desktop:verify-runtime": "node scripts/verify-desktop-runtime.ts",
+    "test:desktop-runtime": "node --test scripts/desktop-runtime.test.ts",
     "doctor": "node scripts/doctor.ts",
     "model:download": "node scripts/download-model.ts",
     "test:rust": "cargo test --workspace --locked",

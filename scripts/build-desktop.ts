@@ -14,6 +14,10 @@ import {
   selectIdentity,
   type SigningConfig,
 } from "./build-signing.ts";
+import {
+  desktopRuntimeMessage,
+  inspectDesktopRuntime,
+} from "./desktop-runtime.ts";
 
 if (process.argv.includes("--check")) {
   if (
@@ -98,4 +102,16 @@ if (process.argv.includes("--check")) {
   console.log(
     "Firma VoiceFlow verificata. Identità macOS stabile e salvata per i prossimi aggiornamenti.",
   );
+  try {
+    console.log(
+      desktopRuntimeMessage(
+        inspectDesktopRuntime(join(bundle, "Contents/MacOS/voiceflow-desktop")),
+      ),
+    );
+  } catch (error) {
+    console.warn(
+      "Build firmata; versione del processo attivo non verificata.",
+      error,
+    );
+  }
 }
