@@ -1,3 +1,4 @@
+import { SessionPrivacy } from "@/components/analysis/session-privacy";
 import { useEffect, useRef, useState } from "react";
 import { Copy, Save, Undo2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -266,6 +267,7 @@ export function HistoryEditor({
                   </Field>
                 </FieldGroup>
               )}
+              <SessionPrivacy id={id} disabled={busy} />
               <Separator />
               <FieldGroup>
                 <Field>

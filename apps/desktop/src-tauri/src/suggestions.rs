@@ -59,6 +59,21 @@ pub struct IngestRequest {
     pub candidate: Candidate,
     pub evidence: Vec<EvidenceRef>,
 }
+/// Only explicit domain validation failures may consume an analysis source.
+/// Unmarked errors, including storage/serialization faults, remain retryable.
+#[derive(Debug)]
+pub(crate) struct CandidateRejection(pub anyhow::Error);
+impl std::fmt::Display for CandidateRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for CandidateRejection {}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IngestFailure {
+    InvalidCandidate,
+    Infrastructure,
+}
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Evidence {
@@ -556,7 +571,7 @@ fn evidence(connection: &Connection, reference: EvidenceRef) -> Result<Evidence>
     ensure!(
         reference.session_id > 0
             && !(reference.revision_id.is_some() && reference.original_index.is_some()),
-        "Riferimento evidenza non valido."
+        CandidateRejection(anyhow::anyhow!("Riferimento evidenza non valido."))
     );
     let (produced, raw): (String, Option<String>) = connection
         .query_row(
@@ -564,16 +579,24 @@ fn evidence(connection: &Connection, reference: EvidenceRef) -> Result<Evidence>
             [reference.session_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .context("Sessione sorgente eliminata o inesistente.")?;
+        .optional()?
+        .ok_or_else(|| {
+            CandidateRejection(anyhow::anyhow!(
+                "Sessione sorgente eliminata o inesistente."
+            ))
+        })?;
     let (before, after, human_confirmed) = if let Some(id) = reference.revision_id {
-        connection.query_row("SELECT r.before_text,r.text,EXISTS(SELECT 1 FROM confirmed_corrections c WHERE c.revision_id=r.id) AND r.reverted=0 FROM history_revisions r WHERE r.id=?1 AND r.transcription_id=?2", params![id,reference.session_id], |r|Ok((r.get(0)?,Some(r.get(1)?),r.get(2)?))).context("Revisione non appartenente alla sessione.")?
+        connection.query_row("SELECT r.before_text,r.text,EXISTS(SELECT 1 FROM confirmed_corrections c WHERE c.revision_id=r.id) AND r.reverted=0 FROM history_revisions r WHERE r.id=?1 AND r.transcription_id=?2", params![id,reference.session_id], |r|Ok((r.get(0)?,Some(r.get(1)?),r.get(2)?))).optional()?.ok_or_else(|| CandidateRejection(anyhow::anyhow!("Revisione non appartenente alla sessione.")))?
     } else if let Some(index) = reference.original_index {
-        let parts: Vec<String> =
-            serde_json::from_str(&raw.context("Originale ASR non disponibile.")?)?;
+        let parts: Vec<String> = serde_json::from_str(&raw.ok_or_else(|| {
+            CandidateRejection(anyhow::anyhow!("Originale ASR non disponibile."))
+        })?)?;
         (
             parts
                 .get(index as usize)
-                .context("Segmento originale inesistente.")?
+                .ok_or_else(|| {
+                    CandidateRejection(anyhow::anyhow!("Segmento originale inesistente."))
+                })?
                 .clone(),
             None,
             false,
@@ -653,22 +676,42 @@ impl SuggestionStore {
         })
     }
     pub fn ingest(&self, request: IngestRequest) -> Result<ReviewSnapshot> {
+        self.ingest_scoped(request, None)?;
+        self.snapshot()
+    }
+    /// Analysis capability validates the prepared allowlist and privacy within this transaction.
+    pub(crate) fn ingest_prepared(
+        &self,
+        request: IngestRequest,
+        batch_id: i64,
+    ) -> std::result::Result<(), IngestFailure> {
+        self.ingest_scoped(request, Some(batch_id))
+            .map_err(|error| {
+                if error.is::<CandidateRejection>() {
+                    IngestFailure::InvalidCandidate
+                } else {
+                    IngestFailure::Infrastructure
+                }
+            })
+    }
+    fn ingest_scoped(&self, request: IngestRequest, batch_id: Option<i64>) -> Result<()> {
         ensure!(
             !request.evidence.is_empty() && request.evidence.len() <= 64,
-            "Servono da 1 a 64 riferimenti reali."
+            CandidateRejection(anyhow::anyhow!("Servono da 1 a 64 riferimenti reali."))
         );
         let candidate = normalize(request.candidate);
         self.access(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let dictionary = crate::dictionary::read_schema_snapshot(&tx,"vocabulary")?;
-            validate(&candidate,&dictionary)?;
-            for reference in &request.evidence { validate_evidence(&candidate,&evidence(&tx,reference.clone())?)?; }
+            if let Some(id)=batch_id { crate::analysis::validate_scope(&tx,id,&request.evidence)?; }
+            validate(&candidate,&dictionary).map_err(CandidateRejection)?;
+            for reference in &request.evidence { validate_evidence(&candidate,&evidence(&tx,reference.clone())?).map_err(CandidateRejection)?; }
             let identity = canonical(&candidate)?;
             let existing: Option<(i64,String)> = tx.query_row("SELECT id,candidate_json FROM suggestions WHERE identity=?1",[&identity],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let id = if let Some((id,json)) = existing {
                 let old:Candidate=serde_json::from_str(&json)?;
                 // A duplicate cannot silently alter a reviewed definition or its examples.
-                for reference in &request.evidence { validate_evidence(&old,&evidence(&tx,reference.clone())?)?; }
+                for reference in &request.evidence { validate_evidence(&old,&evidence(&tx,reference.clone())?).map_err(CandidateRejection)?; }
                 id
             } else {
                 tx.execute("INSERT INTO suggestions(identity,candidate_json,state) VALUES(?1,?2,'proposed')",params![identity,serde_json::to_string(&candidate)?])?; tx.last_insert_rowid()
@@ -684,8 +727,7 @@ impl SuggestionStore {
             }
             if inserted > 0 { tx.execute("UPDATE suggestions SET revision=revision+1,state=CASE WHEN state='rejected' AND ?2 THEN 'proposed' ELSE state END WHERE id=?1",params![id,new_source])?; }
             tx.commit()?; Ok(())
-        })?;
-        self.snapshot()
+        })
     }
     pub fn snapshot(&self) -> Result<ReviewSnapshot> {
         self.access(|connection| {

@@ -20,8 +20,8 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | B1 | VF-02 storico e feedback | Verifica manuale pendente | `39ef4ef`; verifica indipendente senza difetti bloccanti |
 | B2 | VF-03 dizionario operativo | Verifica manuale pendente | `1ac4fb0`; verifica indipendente e 5.360 casi aggiuntivi |
 | C1 | VF-04 catalogo | Verifica manuale pendente | `d501551`; seconda verifica passata dopo riparazione |
-| C2 | VF-05 suggerimenti | Verifica manuale pendente | Seconda verifica passata; commit in preparazione |
-| D1 | VF-06 analisi | Da iniziare | |
+| C2 | VF-05 suggerimenti | Verifica manuale pendente | `60cdfbd`; seconda verifica passata |
+| D1 | VF-06 analisi | Verifica manuale pendente | Seconda verifica passata; commit in preparazione |
 | D2 | VF-07 scheduler | Da iniziare | |
 | E | VF-09 boosting | Da iniziare | |
 | Trasversale | VF-08 qualità | Da iniziare | Fixture distinte da parlato personale |
@@ -97,3 +97,21 @@ Ricognizione E: la release NVIDIA `v0.1.0` pubblica un archivio CPU macOS arm64 
 Riparazione C2: modificati solo il modulo suggerimenti e il report. Quattro regressioni aggiunte, tre fallivano prima della correzione; 16 test mirati e 120 workspace passati, 4 ignorati, fmt/clippy passati. Il probe indipendente originale, ricompilato, mantiene il rifiuto e respinge il falso confine Unicode. Avviato un nuovo contesto di verifica in sola lettura.
 
 Seconda verifica C2: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`. Probe originali ricompilati e passati; ulteriori 72 casi di confine, 6 casi di output umano e 6 permutazioni delle evidenze passati. Workspace 120/4, fmt/clippy, diff e manifest passati. Evidenze UI/TypeScript/firma della prima verifica riutilizzate perché invariate. Nessun blocco riproducibile; prove ASR/WebView/focus/incolla reali e build firmata finale ancora pendenti. D1 può procedere sui contratti verificati.
+
+Ricognizione D2: manuale `launchd.plist` della macchina e [guida Apple](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html) confermano che `StartCalendarInterval` recupera al risveglio le scadenze durante lo sleep, mentre `StartInterval` può perderle. Il worker deve comunque riverificare autonomamente la fascia locale: il risveglio non autorizza lavoro dopo le 06:00. Nessun LaunchAgent installato o avviato durante questa ricognizione.
+
+### D1 / VF-06
+
+Implementazione in corso. Contratto previsto: archivio analisi dedicato con preparazione, esecuzione tramite provider sostituibile, stato, configurazione, esclusioni e recupero. Checkpoint per eventi, includendo nuove correzioni ricordate di sessioni precedenti. I cambi di consenso/esclusione invalidano i lotti preparati; l’ingestione verifica nella stessa transazione appartenenza alle fonti autorizzate e autorizzazione corrente. Il contesto delle proposte esclude quelle collegate a sessioni escluse e omette motivazioni/esempi testuali. Nessuna analisi remota di dati reali avviata.
+
+Ricognizione E aggiuntiva: [header C pubblico della release v0.1.0](https://raw.githubusercontent.com/NVIDIA/NeMo-Speech.cpp/v0.1.0/include/nemo_speech/asr.h) espone `nemo_speech_asr_speech_context` con frasi/peso nelle opzioni di riconoscimento, anche streaming. Un harness nativo può quindi tentare boosting senza server. La [scheda del modello NVIDIA](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) dichiara licenza OpenMDW 1.1, distinta da Apache 2.0 del runtime. Da verificare sugli artefatti esatti durante E.
+
+D1, prime prove dell’implementatore: 24 test mirati passati su migrazioni SQLite, consenso, riapertura, rollback, entrambe le categorie linguistiche, correzioni di vecchie sessioni, checkpoint/retry, fonti escluse/eliminate/annullate/estranee, assenza di pubblicazione, input ostile e guasti di processo. Risolti lotti vuoti persistenti e ambiguità da rilettura fallita dopo ingestione già confermata. Typecheck/build UI passati; matrice completa e prova UI in corso. Nessuna approvazione del lotto ancora emessa.
+
+D1 pronto per verifica indipendente: [report](../verification/voiceflow-v1-d1.md), [API e policy](../analysis.md). 29 test D1, workspace 149 passati e 4 ignorati, fmt/clippy, typecheck/build UI, firma 3. UI D1/B1/C2 7/7/6 gruppi passati. Budget prenotato prima della spawn e mantenuto dopo crash; cursore limitato evita blocco da fonti troppo grandi. La CLI reale rimane da provare dopo consenso nell’app: i processi di test sono sostitutivi. Avviato nuovo contesto di revisione in sola lettura.
+
+Prima verifica D1: `NOT APPROVED`. Matrice 149/4, fmt/clippy, TypeScript/build/firma, UI 7/7/6 e manifest passati. Due probe indipendenti riproducono: eventi strumenti `item.started`/`item.updated` non respinti; errore SQLite nell’ingestione classificato come candidato invalido con avanzamento definitivo del checkpoint. Un nuovo contesto ripara solo questi blocchi, includendo retry dopo guasto a metà lotto. D2 attende nuova verifica.
+
+Riparazione D1: validazione degli elementi CLI in ogni fase e distinzione esplicita fra rifiuto del candidato e errore infrastrutturale. Entrambe le regressioni fallivano prima del fix. Test mirati 32, workspace 152 passati/4 ignorati, fmt/clippy/typecheck/diff/manifest passati. Probe originali ricompilati: eventi strumenti respinti; guasto SQLite produce errore con fonte ancora pendente e retry disponibile. Regressione di guasto a metà lotto verifica deduplica senza riaprire rifiuti. Avviata seconda verifica indipendente.
+
+Seconda verifica D1: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`. Originali ricompilati, 48 ulteriori varianti di eventi e cinque prove avverse SQLite passate: rollback evidenze, guasto a metà lotto/riapertura/deduplica/rifiuto, JSON corrotto, finalizzazione fallita, candidato semanticamente invalido. Workspace 152/4, fmt/clippy/typecheck/diff/manifest passati. UI/build/firma invariati riutilizzati. Nessun blocco; restano CLI reale dopo consenso e WebView nativo. D2 può procedere.

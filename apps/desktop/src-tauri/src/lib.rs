@@ -1,3 +1,4 @@
+pub mod analysis;
 mod capture;
 mod dictionary;
 mod history;
@@ -128,6 +129,10 @@ pub fn run() {
             history::history_undo,
             suggestions::suggestions_snapshot,
             suggestions::suggestions_review,
+            analysis::analysis_status,
+            analysis::analysis_configure,
+            analysis::analysis_exclude,
+            analysis::analysis_excluded,
             history::history_remember
         ])
         .setup(|app| {
@@ -140,6 +145,10 @@ pub fn run() {
             ));
             let history = history::HistoryStore::new(data.join("history.sqlite3"));
             app.manage(history.clone());
+            app.manage(analysis::AnalysisStore::new(
+                history.clone(),
+                app.state::<dictionary::DictionaryStore>().inner().clone(),
+            ));
             app.manage(suggestions::SuggestionStore::new(
                 history.clone(),
                 app.state::<dictionary::DictionaryStore>().inner().clone(),

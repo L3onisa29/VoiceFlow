@@ -229,6 +229,7 @@ impl HistoryStore {
             )?;
         }
         crate::suggestions::migrate(&tx)?;
+        crate::analysis::migrate(&tx)?;
         tx.commit()?;
         operation(&mut connection)
     }

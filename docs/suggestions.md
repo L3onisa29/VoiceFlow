@@ -61,3 +61,9 @@ Identità della proposta: definizione normalizzata, lingua e gruppi ordinati. Le
 `ReviewSnapshot.proposals` espone stati `proposed`, `deferred`, `rejected`, `approved`, `disabled`. `approvedAt` traccia l'autorizzazione indipendentemente dallo stato attivo; `evidence.humanConfirmed` viene calcolato dallo storico. Le pubblicazioni espongono gli ID effettivi delle regole attive, inclusi i ripristini. D1 deve leggere questi stati e non trasformare output automatici in esempi umani.
 
 `review` richiede `id`, `expectedRevision`, `expectedVersion`, `dictionaryVersion`, `requestKey`, `action`. `restore` usa `id: null` e `expectedRevision: null`. La stessa chiave con lo stesso payload restituisce lo stato attuale senza una seconda pubblicazione; la stessa chiave con un payload diverso è rifiutata. Dopo conflitto di versione serve rileggere e confermare nuovamente la decisione nella UI. D1 deve chiamare solo `ingest`, mai `review` per pubblicare automaticamente.
+
+## Ingestione dei lotti D1
+
+L'analizzatore usa [analysis-output-v1.json](schemas/analysis-output-v1.json), un envelope limitato a 16 candidati del contratto sopra. Il percorso interno `ingest_prepared` aggiunge, nella stessa transazione di ogni candidato, consenso attuale, versione privacy, appartenenza esatta al lotto e fingerprint delle fonti. Una sessione esistente ma non preparata non è un'evidenza ammessa. La riuscita restituita al worker corrisponde al commit dell'ingestione, senza dipendere da una successiva lettura dell'intera pagina di revisione.
+
+Output incompleto o invalido blocca l'intero lotto; candidati individuali invalidi in un envelope completo producono uno stato parziale e un conteggio esplicito. La policy di checkpoint, privacy e ripresa è descritta in [analysis.md](analysis.md). L'API pubblica C2 `ingest` e gli IPC di revisione mantengono il loro contratto.

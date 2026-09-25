@@ -54,6 +54,8 @@ const details = {
 window.details = details;
 mockIPC(async (cmd,args) => {
   window.calls.push({cmd,args});
+  if(cmd === 'analysis_excluded') return false;
+  if(cmd === 'analysis_exclude') return;
   if(cmd === 'get_state') return structuredClone(window.state);
   if(cmd === 'get_permissions') return {microphone:true,microphoneStatus:'authorized',accessibility:true};
   if(cmd === 'dictionary_snapshot') return {terms:[],groups:[],selectedGroupIds:[],version:1,conflicts:[]};

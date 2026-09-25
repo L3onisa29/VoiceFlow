@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "voiceflow:analysis-output:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "candidate": {
+            "$ref": "#/$defs/candidate"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/evidence"
+            },
+            "minItems": 1,
+            "maxItems": 64
+          }
+        },
+        "required": ["candidate", "evidence"]
+      }
+    }
+  },
+  "required": ["candidates"],
+  "$defs": {
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "before": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exceptBefore": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "minItems": 0,
+          "maxItems": 32
+        },
+        "exceptAfter": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "minItems": 0,
+          "maxItems": 32
+        }
+      },
+      "required": ["before", "after", "exceptBefore", "exceptAfter"]
+    },
+    "operation": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "remove-false-start"
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "minItems": 2,
+              "maxItems": 7
+            }
+          },
+          "required": ["kind", "source"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "repeat"
+            },
+            "word": {
+              "enum": [
+                "il",
+                "lo",
+                "la",
+                "gli",
+                "le",
+                "un",
+                "una",
+                "di",
+                "del",
+                "della",
+                "dello",
+                "dei",
+                "degli",
+                "delle"
+              ]
+            }
+          },
+          "required": ["kind", "word"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "elision"
+            },
+            "first": {
+              "const": "della"
+            },
+            "prefix": {
+              "enum": ["dell'", "dell’"]
+            }
+          },
+          "required": ["kind", "first", "prefix"]
+        }
+      ]
+    },
+    "definition": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "category": {
+              "const": "terminology"
+            },
+            "preferred": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "variants": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "minItems": 1,
+              "maxItems": 32
+            },
+            "matching": {
+              "enum": ["exact", "unicode-lowercase"]
+            },
+            "context": {
+              "$ref": "#/$defs/context"
+            }
+          },
+          "required": [
+            "category",
+            "preferred",
+            "variants",
+            "matching",
+            "context"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "category": {
+              "const": "cleanup"
+            },
+            "operation": {
+              "$ref": "#/$defs/operation"
+            },
+            "context": {
+              "$ref": "#/$defs/context"
+            }
+          },
+          "required": ["category", "operation", "context"]
+        }
+      ]
+    },
+    "example": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      },
+      "required": ["input", "output"]
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "definition": {
+          "$ref": "#/$defs/definition"
+        },
+        "language": {
+          "enum": ["*", "it", "en"]
+        },
+        "groupIds": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "minItems": 0,
+          "maxItems": 32
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "positiveExamples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/example"
+          },
+          "minItems": 1,
+          "maxItems": 16
+        },
+        "negativeExamples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/example"
+          },
+          "minItems": 1,
+          "maxItems": 16
+        }
+      },
+      "required": [
+        "definition",
+        "language",
+        "groupIds",
+        "reason",
+        "positiveExamples",
+        "negativeExamples"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "revisionId": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "originalIndex": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": ["sessionId", "revisionId", "originalIndex"]
+    }
+  }
+}
