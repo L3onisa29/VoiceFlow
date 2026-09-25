@@ -259,7 +259,10 @@ impl Worker {
                     .as_ref()
                     .ok_or_else(|| anyhow!("Carica prima il modello NVIDIA"))?;
                 let settings = self.snapshot.lock().unwrap().settings.clone();
-                let processing = processing_metadata(&settings)?;
+                let (processing, dictionary, dictionary_warning) = processing_snapshot(
+                    &settings,
+                    &self.app.state::<crate::dictionary::DictionaryStore>(),
+                )?;
                 self.update(|s| {
                     s.phase = "loading".into();
                     s.message = None;
@@ -282,7 +285,7 @@ impl Worker {
                     s.phase = "recording".into();
                     s.transcript = Transcript::default();
                     s.final_text.clear();
-                    s.message = None;
+                    s.message = dictionary_warning;
                     s.device = capture.device_name.clone();
                     s.elapsed_seconds = 0;
                     s.level = 0.0;
@@ -293,10 +296,11 @@ impl Worker {
                     created_at: started.as_millis() as i64,
                     capture: Some(capture),
                     resampler,
-                    session: StreamingSession::with_processing(
+                    session: StreamingSession::with_dictionary(
                         decoder,
                         settings.format,
                         settings.cleanup,
+                        dictionary,
                     ),
                     emitted: Instant::now(),
                     clock: RecordingClock::new(Instant::now()),
@@ -452,6 +456,31 @@ impl Worker {
     }
 }
 
+fn processing_snapshot(
+    settings: &Settings,
+    store: &crate::dictionary::DictionaryStore,
+) -> Result<(
+    ProcessingMetadata,
+    voiceflow_core::dictionary::Dictionary,
+    Option<String>,
+)> {
+    let mut processing = processing_metadata(settings)?;
+    let (dictionary, warning) = match store.session_snapshot(settings.language.code()) {
+        Ok((dictionary, groups, version)) => {
+            processing.groups = groups;
+            processing.dictionary_version = Some(version);
+            (dictionary, None)
+        }
+        Err(error) => (
+            voiceflow_core::dictionary::Dictionary::default(),
+            Some(format!(
+                "Dizionario non applicato a questa sessione: {error}"
+            )),
+        ),
+    };
+    Ok((processing, dictionary, warning))
+}
+
 pub(crate) fn processing_metadata(settings: &Settings) -> Result<ProcessingMetadata> {
     let manifest: serde_json::Value =
         serde_json::from_str(include_str!("../../../../models/nemotron-manifest.json"))?;
@@ -463,7 +492,7 @@ pub(crate) fn processing_metadata(settings: &Settings) -> Result<ProcessingMetad
             .into(),
         model_provenance: "download-manifest; runtime files not rehashed".into(),
         decoder_version: "parakeet-rs/0.3.8; preroll-v1".into(),
-        processor_version: "voiceflow-text-v1".into(),
+        processor_version: "voiceflow-text-v2".into(),
         format: match settings.format {
             voiceflow_core::formatting::FormatMode::Faithful => "faithful",
             voiceflow_core::formatting::FormatMode::SpokenCommands => "spoken-commands",
@@ -552,6 +581,50 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use voiceflow_core::formatting::FormatMode;
+
+    #[test]
+    fn dictionary_session_metadata_records_actual_snapshot_and_failure_is_visible() {
+        let directory = std::env::temp_dir().join(format!(
+            "voiceflow-session-dictionary-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("dictionary.sqlite3");
+        let store = crate::dictionary::DictionaryStore::new(path.clone());
+        store
+            .save_group(
+                serde_json::from_value(serde_json::json!({"id":null,"name":"Project"})).unwrap(),
+            )
+            .unwrap();
+        store.select_groups(vec![1]).unwrap();
+        store.save_term(serde_json::from_value(serde_json::json!({"id":null,"text":"VoiceFlow","groupIds":[1],"variants":["voice flow"],"language":"it"})).unwrap()).unwrap();
+        let settings = Settings {
+            language: voiceflow_core::streaming::Language::Italian,
+            ..Settings::default()
+        };
+        let (metadata, dictionary, warning) = processing_snapshot(&settings, &store).unwrap();
+        assert_eq!(metadata.groups, ["1:Project"]);
+        assert_eq!(
+            metadata.dictionary_version.as_deref(),
+            Some("dictionary-v2:4")
+        );
+        assert!(!dictionary.is_empty());
+        assert!(warning.is_none());
+        std::fs::write(&path, "broken").unwrap();
+        let (metadata, dictionary, warning) = processing_snapshot(&settings, &store).unwrap();
+        assert!(dictionary.is_empty());
+        assert!(metadata.groups.is_empty());
+        assert!(metadata.dictionary_version.is_none());
+        assert!(
+            warning
+                .unwrap()
+                .starts_with("Dizionario non applicato a questa sessione:")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[derive(Default)]
     struct DelayedDecoder {

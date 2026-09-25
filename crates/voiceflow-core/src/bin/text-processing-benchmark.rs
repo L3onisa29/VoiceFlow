@@ -2,7 +2,10 @@
 use anyhow::{Result, ensure};
 use serde_json::json;
 use std::{hint::black_box, time::Instant};
-use voiceflow_core::formatting::{FormatMode, MUTABLE_WORDS, RETAINED_WORDS, TextProcessor};
+use voiceflow_core::dictionary::{Context, Dictionary, MatchMode, Rule};
+use voiceflow_core::formatting::{
+    DICTIONARY_RETAINED_WORDS, FormatMode, MUTABLE_WORDS, RETAINED_WORDS, TextProcessor,
+};
 
 fn main() -> Result<()> {
     let words: usize = std::env::args()
@@ -10,11 +13,33 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "100000".into())
         .parse()?;
     ensure!(words > 0, "Word count must be positive");
-    for (mode, cleanup, label) in [
-        (FormatMode::Faithful, false, "faithful"),
-        (FormatMode::SpokenCommands, true, "cleanup-and-commands"),
+    let preview = std::env::args().nth(2).as_deref() == Some("preview");
+    for (mode, cleanup, label, rule_count) in [
+        (FormatMode::Faithful, false, "faithful", 0),
+        (FormatMode::SpokenCommands, true, "cleanup-and-commands", 0),
+        (FormatMode::SpokenCommands, true, "dictionary-1000", 1000),
+        (FormatMode::SpokenCommands, true, "dictionary-4096", 4096),
     ] {
-        let mut processor = TextProcessor::new(mode, cleanup);
+        let compile_start = Instant::now();
+        let rules = (0..rule_count)
+            .map(|index| Rule {
+                id: index,
+                variant: if index == 0 {
+                    "scheda".into()
+                } else if index == 1 {
+                    "uno due tre quattro cinque sei sette".into()
+                } else {
+                    format!("unmatched{index}")
+                },
+                preferred: format!("Preferred{index}"),
+                mode: MatchMode::Exact,
+                context: Context::default(),
+                scope: 0,
+            })
+            .collect();
+        let dictionary = Dictionary::compile(rules)?;
+        let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+        let mut processor = TextProcessor::with_dictionary(mode, cleanup, dictionary);
         let mut input = String::with_capacity(words * 8);
         let phrase = [
             "il",
@@ -35,6 +60,9 @@ fn main() -> Result<()> {
             input.push_str(phrase[i % phrase.len()]);
             input.push(' ');
             processor.update(black_box(&input), false)?;
+            if preview {
+                black_box(processor.parts());
+            }
             maximum = maximum.max(processor.buffered_words());
             maximum_retained = maximum_retained.max(processor.retained_words());
         }
@@ -45,7 +73,12 @@ fn main() -> Result<()> {
             "Mutable window exceeded its bound"
         );
         ensure!(
-            maximum_retained <= RETAINED_WORDS,
+            maximum_retained
+                <= if rule_count == 0 {
+                    RETAINED_WORDS
+                } else {
+                    DICTIONARY_RETAINED_WORDS
+                },
             "Retained source words exceeded their bound"
         );
         ensure!(
@@ -55,7 +88,7 @@ fn main() -> Result<()> {
         println!(
             "{}",
             json!({
-                "mode": label, "inputWords": words, "inputBytes": input.len(),
+                "mode": label, "preview": preview, "rules": rule_count, "compileMs": compile_ms, "inputWords": words, "inputBytes": input.len(),
                 "outputBytes": processor.parts().0.len(), "maxMutableWords": maximum,
                 "maxRetainedWords": maximum_retained,
                 "elapsedMs": elapsed.as_secs_f64() * 1000.0,

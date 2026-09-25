@@ -17,9 +17,9 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | Lotto | Requisiti | Stato | Evidenze / commit |
 | --- | --- | --- | --- |
 | A | VF-01 marcatori | Verifica manuale pendente | `cf987b9`; controlli indipendenti passati |
-| B1 | VF-02 storico e feedback | Verifica manuale pendente | Verifica indipendente senza difetti bloccanti |
-| B2 | VF-03 dizionario operativo | In sviluppo | |
-| C1 | VF-04 catalogo | Da iniziare | |
+| B1 | VF-02 storico e feedback | Verifica manuale pendente | `39ef4ef`; verifica indipendente senza difetti bloccanti |
+| B2 | VF-03 dizionario operativo | Verifica manuale pendente | Verifica indipendente passata, 5.360 casi aggiuntivi |
+| C1 | VF-04 catalogo | In sviluppo | |
 | C2 | VF-05 suggerimenti | Da iniziare | |
 | D1 | VF-06 analisi | Da iniziare | |
 | D2 | VF-07 scheduler | Da iniziare | |
@@ -61,3 +61,11 @@ Riaperti i riferimenti NVIDIA [customization](https://github.com/NVIDIA/NeMo-Spe
 [Report e contratti B1](../verification/voiceflow-v1-b1.md). Originale ASR per segmento finalizzato, risultato prodotto, revisioni e conferme separate; metadati fissati all'avvio. Migrazione SQLite v2 transazionale, trigger di immutabilità, protezione delle modifiche concorrenti e statistiche originarie preservate. UI per modifica/annullamento/conferma categorizzata. Nessuna attivazione di regole.
 
 Implementatore: 10 test SQLite, 15 streaming, 75 test workspace passati e 4 ignorati; clippy/fmt, typecheck e UI build passati. Sette gruppi di prova UI con IPC simulato e asset di produzione, senza server. Verifica indipendente: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`, nessun blocco. Ripetuta la matrice e aggiunte prove avverse su dettaglio ritardato, errore di caricamento, risposta persa dopo commit e conflitto di revisione: passate. Screenshot ispezionati. Prova reale nel bundle firmato ancora pendente. B2 può usare i contratti verificati senza dipendere dall'audio reale.
+
+### B2 / VF-03
+
+Implementazione in verifica indipendente, [report B2](../verification/voiceflow-v1-b2.md). Varianti esplicite, lingua, condizioni/eccezioni di parole adiacenti, gruppi manuali e snapshot immutabile. Matching sul sorgente senza catene di sostituzioni. La finestra revisionabile rimane di 7 parole; le dipendenze delle espressioni più lunghe richiedono contesto sorgente congelato, fino a 15 parole complete complessive, sempre limitato. Nessuna query per parola. Dizionario non leggibile: dettatura senza regole e avviso visibile.
+
+Prime prove dell'implementatore: UI B2 6 gruppi e regressione UI B1 7 gruppi passati. Misura sintetica finale del solo aggiornamento, 100.000 parole: fedele 14,52 ms, pulizia 14,95 ms, 1.000 varianti 31,81 ms, 4.096 varianti 32,97 ms. Con richiesta di anteprima a ogni parola: 59,70 / 63,76 / 451,33 / 457,54 ms. RSS circa 10,75 MB. Da confermare nella revisione; non sono misure di ASR né del parlato personale.
+
+Verifica indipendente: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`, nessun blocco. 93 test Rust, 4 ignorati preesistenti, fmt/clippy, typecheck/UI build, firma 3 test e UI B2/B1 ripetuti. Ulteriori 5.360 casi eseguibili contro il sorgente reale passati, con frammentazione, revisioni consentite, venti offset di confine, frasi lunghe, comandi, condizioni, conflitti e testi di controllo. Benchmark ripetuto: 4.096 regole 33,10 ms aggiornamenti e 457,31 ms con anteprima; limiti 7/15 rispettati. Rimangono prova ASR/WebView/incolla reale e build firmata finale. C1 può procedere sui contratti automatici verificati.

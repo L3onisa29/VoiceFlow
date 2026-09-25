@@ -138,6 +138,17 @@ impl<D: StreamingDecoder> StreamingSession<D> {
             original_utterances: Vec::new(),
         }
     }
+    pub fn with_dictionary(
+        decoder: D,
+        mode: FormatMode,
+        cleanup: bool,
+        dictionary: crate::dictionary::Dictionary,
+    ) -> Self {
+        Self {
+            processor: TextProcessor::with_dictionary(mode, cleanup, dictionary),
+            ..Self::with_processing(decoder, mode, cleanup)
+        }
+    }
     pub fn snapshot(&self) -> Transcript {
         let (confirmed, partial) = self.processor.parts();
         Transcript {
@@ -379,6 +390,48 @@ mod processing_tests {
         session.push(&[0.1; 8_960]).unwrap();
         assert!(session.processor.buffered_words() <= MUTABLE_WORDS);
         session.snapshot()
+    }
+
+    #[test]
+    fn dictionary_snapshot_survives_pause_resume_and_original_remains_exact() {
+        use crate::dictionary::{Context, Dictionary, MatchMode, Rule};
+        let dictionary = Dictionary::compile(vec![Rule {
+            id: 1,
+            variant: "voice flow".into(),
+            preferred: "VoiceFlow".into(),
+            mode: MatchMode::Exact,
+            context: Context::default(),
+            scope: 0,
+        }])
+        .unwrap();
+        let mut active = StreamingSession::with_dictionary(
+            Snapshots {
+                updates: ["voice fl", "voice flow "].into_iter().collect(),
+                current: String::new(),
+                fail: false,
+            },
+            FormatMode::Faithful,
+            false,
+            dictionary,
+        );
+        assert_eq!(step(&mut active).text(), "voice fl");
+        assert_eq!(step(&mut active).text(), "VoiceFlow");
+        active.flush_utterance().unwrap();
+        active.flush_utterance().unwrap();
+        active.decoder.updates.push_back("voice flow non 42");
+        step(&mut active);
+        assert_eq!(
+            active.finish().unwrap().text(),
+            "VoiceFlow VoiceFlow non 42"
+        );
+        assert_eq!(
+            active.original_utterances().unwrap(),
+            ["voice flow ", "voice flow non 42"]
+        );
+        assert_eq!(
+            active.finish().unwrap().text(),
+            "VoiceFlow VoiceFlow non 42"
+        );
     }
 
     #[test]

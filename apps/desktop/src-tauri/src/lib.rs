@@ -114,6 +114,7 @@ pub fn run() {
             save_settings,
             copy_transcript,
             dictionary::dictionary_snapshot,
+            dictionary::dictionary_select_groups,
             dictionary::dictionary_save_term,
             dictionary::dictionary_save_group,
             dictionary::dictionary_delete_term,

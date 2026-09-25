@@ -6,17 +6,34 @@ La sessione di dettatura appartiene al layout principale. Cambiare pagina mantie
 
 ## Dizionario
 
-Le parole salvate non modificano ancora la dettatura. Non vengono inviate al modello né usate per correggere il testo.
+Il dizionario corregge soltanto le varianti che confermi nella pagina. Apri una parola, inserisci la grafia preferita e le varianti riconosciute da sostituire, una per riga, poi premi **Conferma varianti e salva**. Un termine senza varianti rimane un promemoria e non autorizza corrispondenze inventate. Le correzioni ricordate nello storico sono esempi separati e non diventano regole automaticamente.
 
-Puoi aggiungere, modificare ed eliminare parole o espressioni e organizzarle in gruppi. Una parola può appartenere a più gruppi. Il filtro comprende tutte le parole, quelle senza gruppo e ogni gruppo creato; i conteggi dei gruppi indicano il totale, mentre il conteggio sopra la tabella segue anche la ricerca. Per rinominare o eliminare un gruppo, selezionalo nel filtro. Le eliminazioni richiedono conferma. Eliminare un gruppo conserva tutte le parole e le altre appartenenze.
+### Gruppi e sessioni
 
-Il dizionario nasce vuoto. Il database SQLite locale si trova in:
+Una parola può appartenere a più gruppi. Seleziona manualmente i **Gruppi attivi nella prossima dettatura**. I termini senza gruppo sono sempre disponibili; gli altri richiedono almeno un gruppo selezionato. Il filtro della tabella serve solo a trovare e gestire parole, non attiva i gruppi. Eliminare un gruppo conserva le parole e le altre appartenenze, rimuove la sua selezione e rende globali i termini rimasti senza gruppi.
 
-`~/Library/Application Support/VoiceFlow/dictionary.sqlite3`
+All'avvio di una nuova dettatura, VoiceFlow legge una sola volta uno snapshot coerente dal database e compila le varianti in RAM. Cambi a parole, gruppi e selezione si applicano alla sessione successiva. Pausa e ripresa usano lo stesso snapshot. Lo storico registra i gruppi selezionati con ID e nome, la versione del dizionario e quella del processore. La versione identifica la configurazione usata; il database B2 non conserva copie storiche di tutte le configurazioni precedenti.
 
-Il file ha permessi `0600`. Non viene cancellato o sostituito se non è leggibile. Un errore viene mostrato nella pagina, con possibilità di riprovare; non impedisce l’avvio del servizio di dettatura. Chiudi VoiceFlow prima di copiare il file per un backup o di ripristinarlo.
+### Corrispondenze, condizioni e conflitti
 
-Le parole accettano fino a 200 caratteri Unicode, i nomi dei gruppi fino a 80. Gli spazi iniziali e finali vengono rimossi; testo vuoto e caratteri di controllo vengono rifiutati. Le chiavi uniche usano il testo convertito in minuscolo Unicode: `Èquipe` ed `èquipe` sono duplicati. Non vengono applicate normalizzazione degli accenti o equivalenza fonetica.
+- La corrispondenza esatta distingue maiuscole e usa un singolo spazio tra le parole. L'opzione **Ignora maiuscole Unicode** converte esplicitamente in minuscolo Unicode e accetta separatori di spazi; non attraversa un ritorno a capo. Non corregge accenti, apostrofi o somiglianze fonetiche.
+- Il confronto usa parole intere. `voice flow` può diventare `VoiceFlow`, mentre `voice flower`, `https://voice.flow` e `x_voice_flow` restano invariati. La punteggiatura terminale `, . : ; ! ?` viene conservata. Apostrofo diritto e tipografico sono distinti: aggiungi entrambe le varianti se le vuoi autorizzare.
+- Le lingue Italiano e Inglese seguono la lingua scelta nelle impostazioni. Con lingua automatica si applicano soltanto le regole **Tutte**, senza indovinare il contesto linguistico.
+- **Solo dopo** e **Solo prima di** richiedono una parola adiacente nell'originale. Le eccezioni escludono il contesto indicato. Ogni condizione o riga di eccezione contiene una sola parola. Il confronto segue l'opzione esatta o Unicode della regola e comprende la punteggiatura scritta nel campo. Le condizioni non attraversano pausa o fine segmento.
+- Ogni variante contiene da una a sette parole. Se usa una condizione o eccezione successiva, variante e parola successiva devono rientrare nelle sette parole. Il modulo rifiuta le espressioni oltre il limite, senza spezzarle. Massimo 128 varianti per termine, 32 eccezioni per lato e 4096 varianti applicabili per lingua, considerando tutti i gruppi. La grafia preferita accetta fino a 200 caratteri e non può introdurre parentesi angolari riservate al filtro dei marcatori.
+- Vince prima la frase più lunga, poi il maggior numero di condizioni richieste, la lingua specifica, il gruppo specifico e infine la corrispondenza esatta. Le eccezioni escludono una regola prima del confronto. Se due regole applicabili hanno lo stesso rango e risultati diversi, l'intera frase originale resta invariata. La pagina evidenzia anche conflitti potenziali tra gruppi selezionabili insieme. Modifica variante, condizione, lingua o appartenenza per risolverli.
+
+I comandi parlati hanno precedenza quando il formato li abilita. Nessuna variante può assorbire una parte di un comando riconosciuto. Le sostituzioni terminologiche vengono decise sull'originale della finestra, prima della pulizia locale. Un risultato sostituito non viene passato nuovamente al dizionario, ai comandi o alla pulizia. Negazioni, numeri, nomi, ripetizioni volute, URL e codice fuori dalle corrispondenze esplicite restano invariati.
+
+Il processore conserva sette parole rivedibili dal decoder. Per decidere una frase lunga senza consolidarla troppo presto trattiene anche un contesto sorgente già congelato, fino a quindici parole complete totali contando il contesto sinistro. Il numero è limitato e indipendente dalla durata della dettatura. Non consulta SQLite né servizi remoti per ogni parola.
+
+### Persistenza
+
+Il dizionario nasce vuoto. SQLite locale si trova in `~/Library/Application Support/VoiceFlow/dictionary.sqlite3`, con permessi `0600`. La migrazione v2 conserva i termini precedenti senza inventare varianti e parte senza gruppi selezionati. Le transazioni proteggono testo, appartenenze, selezione e versione; un errore annulla la modifica.
+
+Un database non leggibile non viene sostituito. La pagina mostra l'errore e permette di riprovare. Se non è disponibile all'avvio della dettatura, la sessione continua senza regole terminologiche, con un avviso e senza una versione di dizionario nei metadati. Chiudi VoiceFlow prima di copiare il database per backup o ripristino.
+
+I nomi dei gruppi accettano fino a 80 caratteri. Le chiavi dei termini e gruppi usano il minuscolo Unicode per evitare duplicati come `Èquipe` ed `èquipe`. Non viene applicata normalizzazione degli accenti.
 
 ## Impostazioni
 
@@ -24,14 +41,15 @@ La pagina raccoglie lingua, pulizia locale, formato del testo, stato e caricamen
 
 ## Persistenza e verifiche
 
-`src-tauri/src/dictionary.rs` possiede schema, validazione e transazioni. I comandi Tauri vengono eseguiti in background, separati dal worker audio; un mutex serializza letture e scritture. Ogni mutazione riguarda una sola parola o un solo gruppo e restituisce uno snapshot coerente. Le chiavi esterne proteggono le appartenenze e le transazioni annullano l’intera modifica in caso di errore. Il frontend valida le risposte IPC con Zod.
+`src-tauri/src/dictionary.rs` possiede schema, validazione e transazioni. I comandi Tauri vengono eseguiti in background, separati dal worker audio; un mutex serializza letture e scritture. Ogni mutazione riguarda una parola, un gruppo o la selezione dei gruppi e restituisce uno snapshot coerente. Le chiavi esterne proteggono le appartenenze e le transazioni annullano l’intera modifica in caso di errore. Il frontend valida le risposte IPC con Zod.
 
 SQLite è incluso tramite `rusqlite` con la feature `bundled`, senza dipendere dall’installazione di SQLite sul Mac. La versione dello schema è registrata in `PRAGMA user_version`; uno schema più recente viene rifiutato.
 
-Le prove automatiche del modulo coprono persistenza dopo riapertura, Unicode, duplicati, rollback, appartenenze multiple, eliminazioni, ID sconosciuti, input non valido, file corrotto e scritture concorrenti. Per eseguirle senza avviare l’app o usare l’audio:
+Le prove automatiche coprono migrazioni e rollback su SQLite reale, riapertura, snapshot immutabili, lingue e gruppi, conflitti, Unicode, duplicati, eliminazioni, input non valido, file corrotto e scritture concorrenti. Le prove del processore coprono frasi di sette parole, revisioni, frammentazione, pause, comandi, conservazione del testo e assenza di sostituzioni ricorsive. Per eseguirle senza avviare l’app o usare l’audio:
 
 ```sh
 cargo test -p voiceflow-desktop --locked dictionary::tests
+cargo test -p voiceflow-core --locked dictionary::tests
 pnpm desktop:check
 pnpm desktop:ui
 ```

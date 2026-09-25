@@ -56,7 +56,7 @@ mockIPC(async (cmd,args) => {
   window.calls.push({cmd,args});
   if(cmd === 'get_state') return structuredClone(window.state);
   if(cmd === 'get_permissions') return {microphone:true,microphoneStatus:'authorized',accessibility:true};
-  if(cmd === 'dictionary_snapshot') return {terms:[],groups:[]};
+  if(cmd === 'dictionary_snapshot') return {terms:[],groups:[],selectedGroupIds:[],version:1,conflicts:[]};
   if(cmd === 'history_page') return {entries:Object.values(details).map(d=>structuredClone(d.entry)).reverse(),nextCursor:null,stats:{totalWords:Object.keys(details).length*4,totalSessions:Object.keys(details).length,totalSeconds:Object.keys(details).length*12,wordsPerMinute:20}};
   if(cmd === 'history_detail') return structuredClone(details[args.id]);
   if(cmd === 'history_copy') return;

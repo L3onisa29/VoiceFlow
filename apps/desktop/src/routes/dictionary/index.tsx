@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { createRoute } from "@tanstack/react-router";
 import { BookOpen, Plus, Pencil, Trash2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
@@ -49,6 +50,7 @@ import { DictionaryError } from "@/components/dictionary/dictionary-error";
 import { useDictionary } from "@/hooks/use-dictionary";
 import {
   dictionaryApi,
+  emptyTermRule,
   type TermInput,
   type GroupInput,
 } from "@/lib/dictionary";
@@ -104,6 +106,7 @@ export function DictionaryPage() {
   };
   const addTerm = () =>
     openTerm({
+      ...emptyTermRule,
       id: null,
       text: "",
       groupIds: selectedGroup ? [selectedGroup.id] : [],
@@ -140,7 +143,9 @@ export function DictionaryPage() {
       <Alert>
         <BookOpen aria-hidden="true" />
         <AlertDescription>
-          Le parole salvate non modificano ancora la dettatura.
+          Solo le varianti confermate modificano la dettatura. Gruppi e
+          modifiche si applicano dalla prossima sessione; pausa e ripresa
+          mantengono lo stesso dizionario.
         </AlertDescription>
       </Alert>
       {error && !term && !group && !deletion && (
@@ -186,6 +191,57 @@ export function DictionaryPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="flex min-w-0 flex-col gap-4">
+            <FieldGroup>
+              <FieldLabel>Gruppi attivi nella prossima dettatura</FieldLabel>
+              <p className="text-sm text-muted-foreground">
+                I termini senza gruppo sono sempre disponibili. Seleziona
+                manualmente i contesti da usare.
+              </p>
+              <div className="flex flex-wrap gap-4">
+                {data.groups.map((item) => (
+                  <Field
+                    key={item.id}
+                    orientation="horizontal"
+                    className="w-auto"
+                  >
+                    <Checkbox
+                      id={`active-group-${item.id}`}
+                      checked={data.selectedGroupIds.includes(item.id)}
+                      disabled={locked}
+                      onCheckedChange={(checked) => {
+                        void mutate(() =>
+                          dictionaryApi.selectGroups(
+                            checked === true
+                              ? [...data.selectedGroupIds, item.id]
+                              : data.selectedGroupIds.filter(
+                                  (id) => id !== item.id,
+                                ),
+                          ),
+                        );
+                      }}
+                    />
+                    <FieldLabel htmlFor={`active-group-${item.id}`}>
+                      {item.name}
+                    </FieldLabel>
+                  </Field>
+                ))}
+                {!data.groups.length && (
+                  <p className="text-sm text-muted-foreground">
+                    Crea un gruppo per limitare le varianti a un contesto.
+                  </p>
+                )}
+              </div>
+            </FieldGroup>
+            {data.conflicts.length > 0 && (
+              <Alert variant="destructive">
+                <AlertDescription>
+                  Varianti in conflitto tra {data.conflicts.length} termini.
+                  Quando le regole hanno la stessa specificità, il testo
+                  originale viene conservato. Modifica varianti, condizioni o
+                  gruppi.
+                </AlertDescription>
+              </Alert>
+            )}
             <FieldGroup className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <Field>
                 <FieldLabel htmlFor="dictionary-search">
@@ -310,7 +366,17 @@ export function DictionaryPage() {
                     {terms.map((item) => (
                       <TableRow key={item.id}>
                         <TableCell className="max-w-56 whitespace-normal break-words">
-                          {item.text}
+                          <div className="flex flex-col gap-1">
+                            <span>{item.text}</span>
+                            <span className="text-xs text-muted-foreground">
+                              {item.variants.length
+                                ? item.variants.join(" · ")
+                                : "Nessuna variante, non applicata"}
+                            </span>
+                            {data.conflicts.includes(item.id) && (
+                              <Badge variant="destructive">Conflitto</Badge>
+                            )}
+                          </div>
                         </TableCell>
                         <TableCell className="max-w-64 whitespace-normal">
                           <div className="flex flex-wrap gap-1">
@@ -409,7 +475,8 @@ export function DictionaryPage() {
           </CardContent>
           <CardFooter>
             <p className="text-xs text-muted-foreground">
-              Salvato solo su questo Mac · {data.groups.length}{" "}
+              Versione {data.version} · Salvato solo su questo Mac ·{" "}
+              {data.groups.length}{" "}
               {data.groups.length === 1 ? "gruppo" : "gruppi"}
             </p>
           </CardFooter>

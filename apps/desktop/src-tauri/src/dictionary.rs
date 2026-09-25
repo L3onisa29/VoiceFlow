@@ -9,28 +9,53 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use voiceflow_core::dictionary::{
+    Context as RuleContext, Dictionary, MatchMode, Rule, validate_rule,
+};
 
 #[derive(Clone)]
 pub struct DictionaryStore(Arc<Mutex<PathBuf>>);
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Term {
     id: i64,
     text: String,
     group_ids: Vec<i64>,
+    #[serde(flatten)]
+    rule: TermRule,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Group {
     id: i64,
     name: String,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DictionarySnapshot {
     terms: Vec<Term>,
     groups: Vec<Group>,
+    selected_group_ids: Vec<i64>,
+    version: i64,
+    conflicts: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TermRule {
+    #[serde(default)]
+    variants: Vec<String>,
+    #[serde(default = "all_languages")]
+    language: String,
+    #[serde(default)]
+    matching: MatchMode,
+    #[serde(default)]
+    context: RuleContext,
+}
+fn all_languages() -> String {
+    "*".into()
 }
 
 #[derive(Deserialize)]
@@ -39,6 +64,8 @@ pub struct SaveTerm {
     id: Option<i64>,
     text: String,
     group_ids: Vec<i64>,
+    #[serde(flatten)]
+    rule: TermRule,
 }
 
 #[derive(Deserialize)]
@@ -101,13 +128,20 @@ impl DictionaryStore {
         connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            version <= 1,
+            version <= 2,
             "Questo dizionario richiede una versione più recente di VoiceFlow."
         );
-        if version == 0 {
+        if version < 2 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS terms (
+            // Re-read after the write lock: another process may have migrated.
+            let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            ensure!(
+                version <= 2,
+                "Questo dizionario richiede una versione più recente di VoiceFlow."
+            );
+            if version == 0 {
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS terms (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     text TEXT NOT NULL,
                     text_key TEXT NOT NULL UNIQUE
@@ -124,7 +158,15 @@ impl DictionaryStore {
                 );
                 CREATE INDEX IF NOT EXISTS memberships_group ON memberships(group_id);
                 PRAGMA user_version = 1;",
-            )?;
+                )?;
+            }
+            if version < 2 {
+                tx.execute_batch(r#"ALTER TABLE terms ADD COLUMN rule_json TEXT NOT NULL DEFAULT '{"variants":[],"language":"*","matching":"exact","context":{"before":null,"after":null,"exceptBefore":[],"exceptAfter":[]}}';
+                CREATE TABLE dictionary_state(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+                INSERT INTO dictionary_state VALUES(1, 1);
+                CREATE TABLE selected_groups(group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE);
+                PRAGMA user_version = 2;"#)?;
+            }
             tx.commit()?;
         }
         operation(&mut connection)
@@ -151,6 +193,25 @@ impl DictionaryStore {
         for &id in &input.group_ids {
             require_id(id)?;
         }
+        ensure!(
+            ["*", "it", "en"].contains(&input.rule.language.as_str()),
+            "Lingua non valida."
+        );
+        ensure!(
+            input.rule.variants.len() <= 128,
+            "Massimo 128 varianti per termine."
+        );
+        for variant in &input.rule.variants {
+            validate_rule(&Rule {
+                id: input.id.unwrap_or(0),
+                variant: variant.clone(),
+                preferred: text.clone(),
+                mode: input.rule.matching,
+                context: input.rule.context.clone(),
+                scope: 0,
+            })?;
+        }
+        let rule_json = serde_json::to_string(&input.rule)?;
         self.access(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let duplicate: Option<i64> = tx
@@ -178,6 +239,10 @@ impl DictionaryStore {
                 )?;
                 tx.last_insert_rowid()
             };
+            tx.execute(
+                "UPDATE terms SET rule_json = ?1 WHERE id = ?2",
+                params![rule_json, id],
+            )?;
             tx.execute("DELETE FROM memberships WHERE term_id = ?1", [id])?;
             for group_id in input.group_ids {
                 let exists: bool = tx.query_row(
@@ -191,6 +256,10 @@ impl DictionaryStore {
                     params![id, group_id],
                 )?;
             }
+            tx.execute(
+                "UPDATE dictionary_state SET revision = revision + 1 WHERE id = 1",
+                [],
+            )?;
             let snapshot = read_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
@@ -227,10 +296,53 @@ impl DictionaryStore {
                     params![name, key],
                 )?;
             }
+            tx.execute(
+                "UPDATE dictionary_state SET revision = revision + 1 WHERE id = 1",
+                [],
+            )?;
             let snapshot = read_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
         })
+    }
+
+    pub fn select_groups(&self, ids: Vec<i64>) -> Result<DictionarySnapshot> {
+        ensure!(ids.len() <= 1000, "Troppi gruppi selezionati.");
+        for &id in &ids {
+            require_id(id)?;
+        }
+        self.access(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("DELETE FROM selected_groups", [])?;
+            for id in ids {
+                tx.execute("INSERT OR IGNORE INTO selected_groups VALUES(?1)", [id])?;
+            }
+            tx.execute(
+                "UPDATE dictionary_state SET revision = revision + 1 WHERE id = 1",
+                [],
+            )?;
+            let snapshot = read_snapshot(&tx)?;
+            tx.commit()?;
+            Ok(snapshot)
+        })
+    }
+
+    pub fn session_snapshot(&self, language: &str) -> Result<(Dictionary, Vec<String>, String)> {
+        let snapshot = self.snapshot()?;
+        let language = language.split('-').next().unwrap_or(language);
+        let rules = snapshot.rules(Some(language));
+        let dictionary = Dictionary::compile(rules)?;
+        let groups = snapshot
+            .groups
+            .iter()
+            .filter(|group| snapshot.selected_group_ids.contains(&group.id))
+            .map(|group| format!("{}:{}", group.id, group.name))
+            .collect();
+        Ok((
+            dictionary,
+            groups,
+            format!("dictionary-v2:{}", snapshot.version),
+        ))
     }
 
     pub fn delete_term(&self, id: i64) -> Result<DictionarySnapshot> {
@@ -246,6 +358,10 @@ impl DictionaryStore {
             if tx.execute(statement, [id])? != 1 {
                 bail!("Elemento non più presente. Aggiorna il dizionario.");
             }
+            tx.execute(
+                "UPDATE dictionary_state SET revision = revision + 1 WHERE id = 1",
+                [],
+            )?;
             let snapshot = read_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
@@ -264,12 +380,19 @@ fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut terms = connection
-        .prepare("SELECT id, text FROM terms ORDER BY text_key, id")?
+        .prepare("SELECT id, text, rule_json FROM terms ORDER BY text_key, id")?
         .query_map([], |row| {
             Ok(Term {
                 id: row.get(0)?,
                 text: row.get(1)?,
                 group_ids: vec![],
+                rule: serde_json::from_str(&row.get::<_, String>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -288,7 +411,70 @@ fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
             terms[position].group_ids.push(group);
         }
     }
-    Ok(DictionarySnapshot { terms, groups })
+    let selected_group_ids = connection
+        .prepare("SELECT group_id FROM selected_groups ORDER BY group_id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    let version = connection.query_row(
+        "SELECT revision FROM dictionary_state WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut snapshot = DictionarySnapshot {
+        terms,
+        groups,
+        selected_group_ids,
+        version,
+        conflicts: Vec::new(),
+    };
+    // Check potential co-activation for each language. Different groups can be
+    // selected together, but Italian and English scopes cannot both match.
+    let mut potential = snapshot.clone();
+    potential.selected_group_ids = potential.groups.iter().map(|group| group.id).collect();
+    for language in ["it", "en", "auto"] {
+        snapshot
+            .conflicts
+            .extend(Dictionary::compile(potential.rules(Some(language)))?.conflicts());
+    }
+    snapshot.conflicts.sort_unstable();
+    snapshot.conflicts.dedup();
+    Ok(snapshot)
+}
+
+impl DictionarySnapshot {
+    fn rules(&self, language: Option<&str>) -> Vec<Rule> {
+        self.terms
+            .iter()
+            .filter(|term| {
+                language.is_none_or(|language| {
+                    (term.rule.language == "*" || term.rule.language == language)
+                        && (term.group_ids.is_empty()
+                            || term
+                                .group_ids
+                                .iter()
+                                .any(|id| self.selected_group_ids.contains(id)))
+                })
+            })
+            .flat_map(|term| {
+                term.rule.variants.iter().map(|variant| Rule {
+                    id: term.id,
+                    variant: variant.clone(),
+                    preferred: term.text.clone(),
+                    mode: term.rule.matching,
+                    context: term.rule.context.clone(),
+                    scope: u8::from(term.rule.language != "*") * 2
+                        + u8::from(!term.group_ids.is_empty()),
+                })
+            })
+            .collect()
+    }
+}
+#[tauri::command]
+pub async fn dictionary_select_groups(
+    store: tauri::State<'_, DictionaryStore>,
+    ids: Vec<i64>,
+) -> Result<DictionarySnapshot, String> {
+    run(store.inner().clone(), move |store| store.select_groups(ids)).await
 }
 
 async fn run(
@@ -374,6 +560,10 @@ mod tests {
                     id: None,
                     text: text.into(),
                     group_ids,
+                    rule: TermRule {
+                        language: all_languages(),
+                        ..TermRule::default()
+                    },
                 })
                 .unwrap()
                 .terms
@@ -415,6 +605,8 @@ mod tests {
         );
         let json = serde_json::to_value(before).unwrap();
         assert_eq!(json["terms"][1]["groupIds"], serde_json::json!([z, a]));
+        assert_eq!(json["selectedGroupIds"], serde_json::json!([]));
+        assert!(json["version"].is_number());
     }
 
     #[test]
@@ -431,7 +623,11 @@ mod tests {
                 .save_term(SaveTerm {
                     id: None,
                     text: " école ".into(),
-                    group_ids: vec![]
+                    group_ids: vec![],
+                    rule: TermRule {
+                        language: all_languages(),
+                        ..TermRule::default()
+                    },
                 })
                 .is_err()
         );
@@ -441,7 +637,11 @@ mod tests {
                 .save_term(SaveTerm {
                     id: Some(word),
                     text: "école".into(),
-                    group_ids: vec![group]
+                    group_ids: vec![group],
+                    rule: TermRule {
+                        language: all_languages(),
+                        ..TermRule::default()
+                    },
                 })
                 .is_err()
         );
@@ -486,7 +686,11 @@ mod tests {
                 .save_term(SaveTerm {
                     id: Some(word),
                     text: "Changed".into(),
-                    group_ids: vec![group, 999]
+                    group_ids: vec![group, 999],
+                    rule: TermRule {
+                        language: all_languages(),
+                        ..TermRule::default()
+                    },
                 })
                 .is_err()
         );
@@ -496,7 +700,11 @@ mod tests {
                 .save_term(SaveTerm {
                     id: None,
                     text: "New".into(),
-                    group_ids: vec![999]
+                    group_ids: vec![999],
+                    rule: TermRule {
+                        language: all_languages(),
+                        ..TermRule::default()
+                    },
                 })
                 .is_err()
         );
@@ -542,6 +750,10 @@ mod tests {
                 id: Some(word),
                 text: "After".into(),
                 group_ids: vec![second],
+                rule: TermRule {
+                    language: all_languages(),
+                    ..TermRule::default()
+                },
             })
             .unwrap();
         assert_eq!(snapshot.terms[0].text, "After");
@@ -554,6 +766,10 @@ mod tests {
                 id: Some(word),
                 text: "After".into(),
                 group_ids: vec![],
+                rule: TermRule {
+                    language: all_languages(),
+                    ..TermRule::default()
+                },
             })
             .unwrap();
         assert!(snapshot.terms[0].group_ids.is_empty());
@@ -576,7 +792,11 @@ mod tests {
                     .save_term(SaveTerm {
                         id: None,
                         text,
-                        group_ids: vec![]
+                        group_ids: vec![],
+                        rule: TermRule {
+                            language: all_languages(),
+                            ..TermRule::default()
+                        },
                     })
                     .is_err()
             );
@@ -596,7 +816,11 @@ mod tests {
                     .save_term(SaveTerm {
                         id: Some(id),
                         text: "Valid".into(),
-                        group_ids: vec![]
+                        group_ids: vec![],
+                        rule: TermRule {
+                            language: all_languages(),
+                            ..TermRule::default()
+                        },
                     })
                     .is_err()
             );
@@ -652,7 +876,191 @@ mod tests {
                             id: None,
                             text: format!("Term {index}"),
                             group_ids: vec![],
+                            rule: TermRule {
+                                language: all_languages(),
+                                ..TermRule::default()
+                            },
                         })
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(fixture.store.snapshot().unwrap().terms.len(), 8);
+    }
+    fn configured(text: &str, variants: &[&str], groups: Vec<i64>, language: &str) -> SaveTerm {
+        serde_json::from_value(serde_json::json!({"id":null,"text":text,"groupIds":groups,"variants":variants,"language":language,"matching":"exact","context":{"before":null,"after":null,"exceptBefore":[],"exceptAfter":[]}})).unwrap()
+    }
+    fn output(dictionary: Dictionary, text: &str) -> String {
+        let mut processor = voiceflow_core::formatting::TextProcessor::with_dictionary(
+            voiceflow_core::formatting::FormatMode::Faithful,
+            false,
+            dictionary,
+        );
+        processor.update(text, true).unwrap();
+        processor.parts().0.into()
+    }
+    #[test]
+    fn confirmed_variants_group_language_reopen_and_snapshot_immutability() {
+        let fixture = Fixture::new();
+        let project = fixture.group("Project");
+        fixture
+            .store
+            .save_term(configured(
+                "VoiceFlow",
+                &["voice flow"],
+                vec![project],
+                "it",
+            ))
+            .unwrap();
+        fixture
+            .store
+            .save_term(configured("Memo", &[], vec![], "*"))
+            .unwrap();
+        let (inactive, groups, _) = fixture.store.session_snapshot("it-IT").unwrap();
+        assert!(groups.is_empty());
+        assert_eq!(output(inactive, "voice flow memo"), "voice flow memo");
+        fixture.store.select_groups(vec![project]).unwrap();
+        let (active, groups, version) = fixture.store.session_snapshot("it-IT").unwrap();
+        assert_eq!(groups, [format!("{project}:Project")]);
+        assert_eq!(output(active.clone(), "voice flow"), "VoiceFlow");
+        assert_eq!(
+            output(
+                fixture.store.session_snapshot("en-US").unwrap().0,
+                "voice flow"
+            ),
+            "voice flow"
+        );
+        assert_eq!(
+            output(
+                fixture.store.session_snapshot("auto").unwrap().0,
+                "voice flow"
+            ),
+            "voice flow"
+        );
+        let reopened = DictionaryStore::new(fixture.root.join("dictionary.sqlite3"));
+        assert_eq!(reopened.session_snapshot("it-IT").unwrap().2, version);
+        reopened.select_groups(vec![]).unwrap();
+        assert_eq!(output(active, "voice flow"), "VoiceFlow");
+        assert_eq!(
+            output(reopened.session_snapshot("it-IT").unwrap().0, "voice flow"),
+            "voice flow"
+        );
+        assert_ne!(reopened.session_snapshot("it-IT").unwrap().2, version);
+    }
+    #[test]
+    fn validation_and_selection_failures_roll_back_version_and_data() {
+        let fixture = Fixture::new();
+        let group = fixture.group("One");
+        fixture.store.select_groups(vec![group]).unwrap();
+        let before = fixture.store.snapshot().unwrap();
+        assert!(fixture.store.select_groups(vec![999]).is_err());
+        assert!(
+            fixture
+                .store
+                .save_term(configured(
+                    "Long",
+                    &["one two three four five six seven eight"],
+                    vec![],
+                    "*"
+                ))
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .save_term(configured("Bad", &["word"], vec![], "zz"))
+                .is_err()
+        );
+        assert_eq!(fixture.store.snapshot().unwrap(), before);
+        assert!(
+            fixture
+                .store
+                .delete_group(group)
+                .unwrap()
+                .selected_group_ids
+                .is_empty()
+        );
+        assert!(serde_json::from_value::<SaveTerm>(serde_json::json!({"id":null,"text":"Bad","groupIds":[],"variants":[],"invented":true})).is_err());
+    }
+    #[test]
+    fn management_surfaces_intersecting_conflicts_but_not_disjoint_languages() {
+        let fixture = Fixture::new();
+        let mut a = configured("First", &["variant"], vec![], "it");
+        a.rule.context.before = Some("x".into());
+        let mut b = configured("Second", &["variant"], vec![], "it");
+        b.rule.context.after = Some("y".into());
+        fixture.store.save_term(a).unwrap();
+        assert_eq!(fixture.store.save_term(b).unwrap().conflicts.len(), 2);
+        assert_eq!(
+            output(
+                fixture.store.session_snapshot("it-IT").unwrap().0,
+                "x variant y"
+            ),
+            "x variant y"
+        );
+        let other = Fixture::new();
+        other
+            .store
+            .save_term(configured("First", &["variant"], vec![], "it"))
+            .unwrap();
+        assert!(
+            other
+                .store
+                .save_term(configured("Second", &["variant"], vec![], "en"))
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+    }
+    #[test]
+    fn v1_migration_preserves_terms_without_inventing_variants_and_is_idempotent() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.root).unwrap();
+        let path = fixture.root.join("dictionary.sqlite3");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE terms(id INTEGER PRIMARY KEY AUTOINCREMENT,text TEXT NOT NULL,text_key TEXT NOT NULL UNIQUE);CREATE TABLE groups(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,name_key TEXT NOT NULL UNIQUE);CREATE TABLE memberships(term_id INTEGER REFERENCES terms(id) ON DELETE CASCADE,group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,PRIMARY KEY(term_id,group_id));INSERT INTO terms VALUES(7,'VoiceFlow','voiceflow');PRAGMA user_version=1;").unwrap();
+        drop(old);
+        let migrated = fixture.store.snapshot().unwrap();
+        assert_eq!(migrated.terms[0].id, 7);
+        assert!(migrated.terms[0].rule.variants.is_empty());
+        assert_eq!(migrated.version, 1);
+        assert_eq!(DictionaryStore::new(path).snapshot().unwrap(), migrated);
+        assert!(
+            fixture
+                .store
+                .session_snapshot("it-IT")
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+    #[test]
+    fn failed_v2_migration_rolls_back_schema_and_can_be_retried() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.root).unwrap();
+        let path = fixture.root.join("dictionary.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE terms(id INTEGER PRIMARY KEY,text TEXT,text_key TEXT); CREATE TABLE dictionary_state(existing TEXT); PRAGMA user_version=1;").unwrap();
+        assert!(fixture.store.snapshot().is_err());
+        assert_eq!(
+            connection
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        assert!(connection.prepare("SELECT rule_json FROM terms").is_err());
+        connection.execute_batch("DROP TABLE dictionary_state; CREATE TABLE groups(id INTEGER PRIMARY KEY,name TEXT,name_key TEXT);CREATE TABLE memberships(term_id INTEGER,group_id INTEGER);").unwrap();
+        assert!(fixture.store.snapshot().is_ok());
+    }
+    #[test]
+    fn independently_opened_stores_migrate_once_under_concurrent_startup() {
+        let fixture = Fixture::new();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let store = DictionaryStore::new(fixture.root.join("dictionary.sqlite3"));
+                scope.spawn(move || {
+                    store
+                        .save_term(configured(&format!("Term{index}"), &[], vec![], "*"))
                         .unwrap();
                 });
             }

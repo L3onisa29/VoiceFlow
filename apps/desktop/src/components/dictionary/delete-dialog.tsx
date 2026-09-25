@@ -50,7 +50,7 @@ export function DeleteDialog({
           </AlertDialogTitle>
           <AlertDialogDescription className="break-words">
             {target.kind === "group"
-              ? `Il gruppo “${target.label}” verrà eliminato. Le parole restano nel dizionario e negli altri gruppi.`
+              ? `Il gruppo “${target.label}” verrà eliminato. Le parole restano nel dizionario e negli altri gruppi. Le varianti rimaste senza gruppi saranno disponibili in tutte le prossime dettature.`
               : `La parola “${target.label}” verrà eliminata dal dizionario e da tutti i suoi gruppi.`}
           </AlertDialogDescription>
         </AlertDialogHeader>

@@ -1,3 +1,4 @@
+use crate::dictionary::{Dictionary, Match};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -12,6 +13,8 @@ pub enum FormatMode {
 
 pub const MUTABLE_WORDS: usize = 7;
 pub const RETAINED_WORDS: usize = MUTABLE_WORDS + 1;
+/// Seven mutable words, up to seven frozen dependency words and left context.
+pub const DICTIONARY_RETAINED_WORDS: usize = MUTABLE_WORDS * 2 + 1;
 
 #[derive(Clone)]
 struct Word {
@@ -26,7 +29,10 @@ struct Atom<'a> {
     command: bool,
 }
 
-/// Keep seven revisable words and one frozen-source word of lookbehind.
+/// Keep seven revisable words and bounded frozen-source dependency context.
+/// With terminology enabled, up to seven frozen words wait for a complete
+/// phrase/command decision. One additional original word serves left context.
+/// With terminology disabled, the original one-word lookbehind path is used.
 /// Its rendering waits until the next source word is frozen too, so a deletion
 /// never commits while the word supporting it can still be revised.
 /// Confirmed output and frozen source are immutable. Revisions to the seven-word
@@ -34,6 +40,9 @@ struct Atom<'a> {
 pub struct TextProcessor {
     mode: FormatMode,
     cleanup: bool,
+    dictionary: Dictionary,
+    frozen: VecDeque<Word>,
+    source_before: Option<String>,
     pending: VecDeque<Word>,
     lookbehind: Option<Word>,
     confirmed: String,
@@ -51,6 +60,9 @@ impl TextProcessor {
         Self {
             mode,
             cleanup,
+            dictionary: Dictionary::default(),
+            frozen: VecDeque::new(),
+            source_before: None,
             pending: VecDeque::new(),
             lookbehind: None,
             confirmed: String::new(),
@@ -60,6 +72,13 @@ impl TextProcessor {
             released_offset: 0,
             after_command: false,
             utterance_start: true,
+        }
+    }
+
+    pub fn with_dictionary(mode: FormatMode, cleanup: bool, dictionary: Dictionary) -> Self {
+        Self {
+            dictionary,
+            ..Self::new(mode, cleanup)
         }
     }
 
@@ -104,6 +123,7 @@ impl TextProcessor {
             self.parsed_offset = 0;
             self.released_offset = 0;
             self.utterance_start = true;
+            self.source_before = None;
         }
         Ok(())
     }
@@ -152,6 +172,10 @@ impl TextProcessor {
     }
 
     fn release(&mut self, all: bool) {
+        if !self.dictionary.is_empty() {
+            self.release_dictionary(all);
+            return;
+        }
         while !self.pending.is_empty() && (all || self.pending.len() > MUTABLE_WORDS) {
             let mut word = self.pending.pop_front().unwrap();
             self.released_offset = word.end;
@@ -181,6 +205,86 @@ impl TextProcessor {
         }
     }
 
+    fn dictionary_prefix(
+        &self,
+        words: &VecDeque<Word>,
+        before: Option<&str>,
+    ) -> (usize, String, bool, bool) {
+        let first = &words[0];
+        let source: Vec<_> = words
+            .iter()
+            .map(|word| (word.separator.as_str(), word.text.as_str()))
+            .collect();
+        let mut protected = vec![false; words.len()];
+        if matches!(self.mode, FormatMode::SpokenCommands) {
+            for i in 0..words.len().saturating_sub(1) {
+                if let Some(text) =
+                    command(&words[i].text, &words[i + 1].text, &words[i + 1].separator)
+                {
+                    if i == 0 {
+                        return (2, text.into(), true, false);
+                    }
+                    protected[i] = true;
+                    protected[i + 1] = true;
+                }
+            }
+        }
+        if let Some(found) = self.dictionary.apply(&source, before, &protected) {
+            match found {
+                Match::Replace { words, text } => return (words, text, false, false),
+                Match::Conflict { words: count } => {
+                    let mut text = first.text.clone();
+                    for word in words.iter().take(count).skip(1) {
+                        text.push_str(&word.separator);
+                        text.push_str(&word.text);
+                    }
+                    return (count, text, false, false);
+                }
+            }
+        }
+        if self.cleanup
+            && let Some(next) = words.get(1)
+            && false_start(&first.text, &next.text, &next.separator)
+        {
+            return (1, String::new(), false, true);
+        }
+        (1, first.text.clone(), false, false)
+    }
+
+    fn release_dictionary(&mut self, all: bool) {
+        while !self.pending.is_empty() && (all || self.pending.len() > MUTABLE_WORDS) {
+            let word = self.pending.pop_front().unwrap();
+            self.released_offset = word.end;
+            if !word.text.is_empty() {
+                self.frozen.push_back(word);
+            }
+            self.commit_dictionary(false);
+        }
+        if all {
+            self.commit_dictionary(true);
+        }
+    }
+
+    fn commit_dictionary(&mut self, all: bool) {
+        while !self.frozen.is_empty()
+            && (all || self.frozen.len() >= self.dictionary.required_frozen_words())
+        {
+            let (count, text, command, deleted) =
+                self.dictionary_prefix(&self.frozen, self.source_before.as_deref());
+            let separator = self.frozen[0].separator.clone();
+            for _ in 0..count {
+                self.source_before = Some(self.frozen.pop_front().unwrap().text);
+            }
+            if deleted {
+                if let Some(next) = self.frozen.front_mut() {
+                    next.separator = separator;
+                }
+            } else {
+                self.commit(&separator, &text, command);
+            }
+        }
+    }
+
     fn commit(&mut self, separator: &str, text: &str, command: bool) {
         let previous = self.confirmed.chars().last();
         render(
@@ -204,7 +308,48 @@ impl TextProcessor {
         let mut after_command = self.after_command;
         let mut utterance_start = self.utterance_start;
         let mut previous = self.confirmed.chars().last();
-        for atom in self.atoms() {
+        if !self.dictionary.is_empty() {
+            let mut words: VecDeque<Word> = self
+                .frozen
+                .iter()
+                .chain(self.pending.iter())
+                .filter(|word| !word.text.is_empty())
+                .cloned()
+                .collect();
+            let mut before = self.source_before.clone();
+            while !words.is_empty() {
+                let (count, text, command, deleted) =
+                    self.dictionary_prefix(&words, before.as_deref());
+                let first = words.front().unwrap().clone();
+                for _ in 0..count {
+                    before = Some(words.pop_front().unwrap().text);
+                }
+                if deleted {
+                    if let Some(next) = words.front_mut() {
+                        next.separator = first.separator;
+                    }
+                    continue;
+                }
+                render(
+                    &mut partial,
+                    &Atom {
+                        separator: &first.separator,
+                        text: &text,
+                        command,
+                    },
+                    &mut after_command,
+                    utterance_start,
+                    previous,
+                );
+                previous = partial.chars().last().or(previous);
+                utterance_start = false;
+            }
+        }
+        for atom in if self.dictionary.is_empty() {
+            self.atoms()
+        } else {
+            Vec::new()
+        } {
             if atom.text.is_empty() {
                 continue;
             }
@@ -241,10 +386,13 @@ impl TextProcessor {
         self.pending.len()
     }
 
-    /// Includes the single frozen-source word whose output is still dependent
-    /// on the revisable tail. Excludes an unfinished word.
+    /// All retained complete source words, including frozen dependencies and
+    /// terminology left context. Excludes an unfinished word.
     pub fn retained_words(&self) -> usize {
-        self.pending.len() + usize::from(self.lookbehind.is_some())
+        self.pending.len()
+            + self.frozen.len()
+            + usize::from(self.lookbehind.is_some())
+            + usize::from(self.source_before.is_some())
     }
 }
 
