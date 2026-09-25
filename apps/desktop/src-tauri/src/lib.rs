@@ -1,5 +1,6 @@
 mod capture;
 mod hud;
+mod output_audio;
 mod platform;
 mod service;
 mod settings;
@@ -139,7 +140,6 @@ pub fn run() {
                     "open" => show(app),
                     "quit" => {
                         let _ = app.state::<Service>().send(Command::Quit);
-                        app.exit(0);
                     }
                     _ => {}
                 })
@@ -155,6 +155,19 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("VoiceFlow could not start");
+        .build(tauri::generate_context!())
+        .expect("VoiceFlow could not start")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
+                // Native Quit must release capture too. The worker then calls
+                // app.exit(0), whose explicit exit code is allowed through.
+                api.prevent_exit();
+                if let Err(error) = app.state::<Service>().send(Command::Quit) {
+                    eprintln!("Chiusura di VoiceFlow non riuscita: {error}");
+                }
+            }
+        });
 }

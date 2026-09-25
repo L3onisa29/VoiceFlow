@@ -1,3 +1,4 @@
+use crate::output_audio::OutputProtection;
 use anyhow::{Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, bounded};
@@ -8,6 +9,8 @@ use std::sync::{
 
 pub struct Capture {
     _stream: cpal::Stream,
+    // Fields drop in declaration order: stop capture before restoring playback.
+    output: OutputProtection,
     pub frames: Receiver<Vec<f32>>,
     pub failed: Arc<AtomicBool>,
     pub sample_rate: usize,
@@ -26,6 +29,7 @@ impl Capture {
         let failed = Arc::new(AtomicBool::new(false));
         let on_error = Arc::clone(&failed);
         let callback_failed = Arc::clone(&failed);
+        let output = OutputProtection::start(Arc::clone(&failed))?;
         let send = move |data: &[f32]| {
             // Never block the CoreAudio thread. An overrun fails visibly rather
             // than silently losing words or growing an unbounded audio queue.
@@ -75,6 +79,7 @@ impl Capture {
         stream.play()?;
         Ok(Self {
             _stream: stream,
+            output,
             frames,
             failed,
             sample_rate,
@@ -84,6 +89,7 @@ impl Capture {
     pub fn finish(self) -> Result<Receiver<Vec<f32>>> {
         self._stream.pause()?;
         drop(self._stream);
+        self.output.finish()?;
         anyhow::ensure!(
             !self.failed.load(Ordering::Acquire),
             "Acquisizione audio incompleta. Recupera il testo parziale."

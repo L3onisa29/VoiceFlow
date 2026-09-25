@@ -156,7 +156,13 @@ impl Worker {
                 }
                 recv(self.receiver) -> cmd => {
                     match cmd {
-                        Ok(Command::Quit) | Err(_) => break,
+                        Ok(Command::Quit) => {
+                            // Restore the speaker state before Tauri terminates.
+                            self.active = None;
+                            self.app.exit(0);
+                            break;
+                        }
+                        Err(_) => break,
                         Ok(command) => if let Err(error) = self.command(command) {
                             if self.active.is_some() { self.update(|s| s.message = Some(error.to_string())); }
                             else { self.fail(error); }

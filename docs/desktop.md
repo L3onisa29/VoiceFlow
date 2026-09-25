@@ -37,6 +37,16 @@ threads. No NVIDIA GPU, CUDA, Python process or API key is needed.
 - Pause releases the microphone, drains and commits the decoder tail, and freezes
   the timer. Resume starts a fresh capture/resampler while retaining the text.
   Finish works while paused. There is no pause timeout or recording duration cap.
+- While capturing, VoiceFlow mutes the built-in speakers when they are the
+  default output, so playback does not enter the microphone. Bluetooth and
+  wired headphones are left alone. CoreAudio transport and stream terminal
+  types identify the output, independently of its name or system language.
+  Output changes are checked every 50 ms while recording. Pause, finish, cancel,
+  capture errors and normal app exit restore the mute state before decoding
+  the remaining audio. Speakers that were already muted stay muted. Playback
+  continues silently; media players are not paused and volume is not changed.
+  External speakers and apps routed to an output other than the system default
+  are not silenced. A forced process termination cannot run the restoration.
 - The app captures the focused element at **stop**, then checks its PID and AX
   identity again after finalization. Web editors exposed as AXWebArea or AXGroup
   are accepted. Secure text fields and VoiceFlow itself are excluded.
