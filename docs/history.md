@@ -26,7 +26,7 @@ Nel dialogo dello storico, **Salva correzione** crea una revisione esplicita con
 
 Eliminare una sessione rimuove atomicamente la sua riga, tutti gli originali e risultati, le revisioni e le conferme tramite chiavi esterne con cancellazione a cascata. SQLite usa `foreign_keys=ON` e `secure_delete=ON`. Non rimangono copie testuali nelle tabelle di evidenza B1. Questo non promette cancellazione da backup del Mac o da servizi esterni a cui il testo sia stato inviato.
 
-Le integrazioni B2/C/D devono mantenere il riferimento alla sessione/revisione sorgente e cancellare anche le proprie copie testuali derivate o usare riferimenti senza copie. Non possono presentare come cancellati dati già accettati da un fornitore esterno senza una capacità effettiva di rimozione. Le regole approvate future richiedono una policy esplicita per i testi e le evidenze provenienti da sessioni eliminate.
+Le integrazioni B2/C/D devono mantenere il riferimento alla sessione/revisione sorgente e cancellare anche le proprie copie testuali derivate o usare riferimenti senza copie. Non possono presentare come cancellati dati già accettati da un fornitore esterno senza una capacità effettiva di rimozione. C2 elimina le proposte non approvate che citano una sessione cancellata e tutti i relativi payload. Le definizioni già approvate, inclusi i loro esempi e versioni, restano regole indipendenti secondo la policy esplicita mostrata all'approvazione; i riferimenti e i testi delle fonti vengono rimossi. Vedi [Suggerimenti](suggestions.md).
 
 ## Interfaccia e misure
 

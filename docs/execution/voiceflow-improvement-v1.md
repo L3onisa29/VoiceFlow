@@ -19,8 +19,8 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | A | VF-01 marcatori | Verifica manuale pendente | `cf987b9`; controlli indipendenti passati |
 | B1 | VF-02 storico e feedback | Verifica manuale pendente | `39ef4ef`; verifica indipendente senza difetti bloccanti |
 | B2 | VF-03 dizionario operativo | Verifica manuale pendente | `1ac4fb0`; verifica indipendente e 5.360 casi aggiuntivi |
-| C1 | VF-04 catalogo | Verifica manuale pendente | Seconda verifica indipendente passata dopo riparazione |
-| C2 | VF-05 suggerimenti | In sviluppo | |
+| C1 | VF-04 catalogo | Verifica manuale pendente | `d501551`; seconda verifica passata dopo riparazione |
+| C2 | VF-05 suggerimenti | Verifica manuale pendente | Seconda verifica passata; commit in preparazione |
 | D1 | VF-06 analisi | Da iniziare | |
 | D2 | VF-07 scheduler | Da iniziare | |
 | E | VF-09 boosting | Da iniziare | |
@@ -83,3 +83,17 @@ Prima verifica indipendente: difetto riprodotto nelle condizioni sul sorgente do
 Il revisore ha inoltre riprodotto una condizione destra che attraversava un punto fermo. Esito `NOT APPROVED`. Un nuovo contesto di riparazione ha separato `rendering_separator` dai separatori sorgente immutabili in anteprima e consolidamento, e bloccato il contesto destro attraverso la punteggiatura terminale. Due regressioni aggiunte: 10 test catalogo, 104 workspace passati e 4 ignorati, clippy/fmt passati. Riproduttore del revisore ricompilato: entrambi i difetti risolti e 25.515 confronti builtin conservati. Nuova verifica indipendente in corso, nessun avanzamento a C2 prima dell'esito.
 
 Seconda verifica indipendente: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`. Entrambi i difetti verificati risolti sul sorgente attuale, 25.515 confronti baseline passati, prove aggiuntive di catalogo vuoto, segmenti vuoti/marcatori, reset e pulizia disabilitata passate. Workspace 104/4, clippy/fmt, diff e manifest passati. Nessun blocco al lotto C2; prova reale e build firmata integrate restano pendenti.
+
+### C2 / VF-05
+
+Implementati revisione e pubblicazione atomica delle proposte, archivio delle versioni e snapshot combinati, con UI shadcn. [Report C2](../verification/voiceflow-v1-c2.md). Proposte ed evidenze restano separate dalle regole approvate; cancellazione delle sorgenti coordinata e conservazione delle definizioni approvate spiegata nell’app. Contratto di ingestione per D1 documentato con schema.
+
+Implementatore: 116 test Rust passati e 4 ignorati preesistenti, fmt/clippy, typecheck/UI build, 3 test firma; UI C2 6 gruppi, B2 6 e B1 7 passati. Il revisore indipendente ha ripetuto i controlli e riprodotto un difetto: un rifiuto basato su una revisione ricordata si riapre aggiungendo il risultato elaborato della stessa sessione. Nessuna nuova sessione o conferma. Il lotto attende l’esito finale della revisione e una riparazione in un contesto distinto.
+
+Prima verifica C2: `NOT APPROVED`. Due blocchi riprodotti via API pubblica e SQLite temporaneo: riapertura dalla vista elaborata della medesima sessione e accettazione di `voice flow` dentro `voice flow\u{0301}` come evidenza su parole complete. Verificatore: 116/4 Rust, fmt/clippy, typecheck/build UI, firma 3, UI C2/B2/B1 6/6/7 e manifest passati. Avviata riparazione circoscritta con regressioni; D1 attende nuova verifica indipendente.
+
+Ricognizione E: la release NVIDIA `v0.1.0` pubblica un archivio CPU macOS arm64 da 3.299.661 byte, SHA-256 `971661d38d4bf97a63c528d13041a964316d25068d8df045e5b4839848092f25`, e una variante Metal. Verificato il catalogo ufficiale GitHub Releases via API in sola lettura; non è necessario installare CMake per tentare il runtime nativo. Nessun runtime aggiuntivo eseguito in questa ricognizione.
+
+Riparazione C2: modificati solo il modulo suggerimenti e il report. Quattro regressioni aggiunte, tre fallivano prima della correzione; 16 test mirati e 120 workspace passati, 4 ignorati, fmt/clippy passati. Il probe indipendente originale, ricompilato, mantiene il rifiuto e respinge il falso confine Unicode. Avviato un nuovo contesto di verifica in sola lettura.
+
+Seconda verifica C2: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`. Probe originali ricompilati e passati; ulteriori 72 casi di confine, 6 casi di output umano e 6 permutazioni delle evidenze passati. Workspace 120/4, fmt/clippy, diff e manifest passati. Evidenze UI/TypeScript/firma della prima verifica riutilizzate perché invariate. Nessun blocco riproducibile; prove ASR/WebView/focus/incolla reali e build firmata finale ancora pendenti. D1 può procedere sui contratti verificati.

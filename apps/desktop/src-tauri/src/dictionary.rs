@@ -16,30 +16,30 @@ use voiceflow_core::dictionary::{
 #[derive(Clone)]
 pub struct DictionaryStore(Arc<Mutex<PathBuf>>);
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Term {
-    id: i64,
-    text: String,
-    group_ids: Vec<i64>,
+    pub(crate) id: i64,
+    pub(crate) text: String,
+    pub(crate) group_ids: Vec<i64>,
     #[serde(flatten)]
-    rule: TermRule,
+    pub(crate) rule: TermRule,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Group {
-    id: i64,
-    name: String,
+    pub(crate) id: i64,
+    pub(crate) name: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DictionarySnapshot {
-    terms: Vec<Term>,
-    groups: Vec<Group>,
-    selected_group_ids: Vec<i64>,
-    version: i64,
-    conflicts: Vec<i64>,
+    pub(crate) terms: Vec<Term>,
+    pub(crate) groups: Vec<Group>,
+    pub(crate) selected_group_ids: Vec<i64>,
+    pub(crate) version: i64,
+    pub(crate) conflicts: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,7 +103,10 @@ impl DictionaryStore {
         Self(Arc::new(Mutex::new(path)))
     }
 
-    fn access<T>(&self, operation: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn access<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
         let path = self
             .0
             .lock()
@@ -126,19 +129,13 @@ impl DictionaryStore {
             Connection::open(&*path).context("Impossibile aprire il dizionario")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            version <= 2,
+            (0..=2).contains(&version),
             "Questo dizionario richiede una versione più recente di VoiceFlow."
         );
         if version < 2 {
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Re-read after the write lock: another process may have migrated.
-            let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            ensure!(
-                version <= 2,
-                "Questo dizionario richiede una versione più recente di VoiceFlow."
-            );
             if version == 0 {
                 tx.execute_batch(
                     "CREATE TABLE IF NOT EXISTS terms (
@@ -167,9 +164,19 @@ impl DictionaryStore {
                 CREATE TABLE selected_groups(group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE);
                 PRAGMA user_version = 2;"#)?;
             }
-            tx.commit()?;
         }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS dictionary_versions (revision INTEGER PRIMARY KEY, definition_json TEXT NOT NULL);")?;
+        archive_snapshot(&tx)?;
+        tx.commit()?;
         operation(&mut connection)
+    }
+
+    pub(crate) fn path(&self) -> Result<PathBuf> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Dizionario occupato"))?
+            .clone())
     }
 
     pub fn snapshot(&self) -> Result<DictionarySnapshot> {
@@ -261,6 +268,7 @@ impl DictionaryStore {
                 [],
             )?;
             let snapshot = read_snapshot(&tx)?;
+            archive_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
         })
@@ -301,6 +309,7 @@ impl DictionaryStore {
                 [],
             )?;
             let snapshot = read_snapshot(&tx)?;
+            archive_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
         })
@@ -322,6 +331,7 @@ impl DictionaryStore {
                 [],
             )?;
             let snapshot = read_snapshot(&tx)?;
+            archive_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
         })
@@ -363,15 +373,38 @@ impl DictionaryStore {
                 [],
             )?;
             let snapshot = read_snapshot(&tx)?;
+            archive_snapshot(&tx)?;
             tx.commit()?;
             Ok(snapshot)
         })
     }
 }
 
-fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
+fn archive_snapshot(connection: &Connection) -> Result<()> {
+    let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM dictionary_versions WHERE revision=(SELECT revision FROM dictionary_state WHERE id=1))",[],|r|r.get(0))?;
+    if exists {
+        return Ok(());
+    }
+    let snapshot = read_snapshot(connection)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO dictionary_versions VALUES(?1, ?2)",
+        params![snapshot.version, serde_json::to_string(&snapshot)?],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
+    read_schema_snapshot(connection, "main")
+}
+
+pub(crate) fn read_schema_snapshot(
+    connection: &Connection,
+    schema: &str,
+) -> Result<DictionarySnapshot> {
     let groups = connection
-        .prepare("SELECT id, name FROM groups ORDER BY name_key, id")?
+        .prepare(&format!(
+            "SELECT id, name FROM {schema}.groups ORDER BY name_key, id"
+        ))?
         .query_map([], |row| {
             Ok(Group {
                 id: row.get(0)?,
@@ -380,7 +413,9 @@ fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut terms = connection
-        .prepare("SELECT id, text, rule_json FROM terms ORDER BY text_key, id")?
+        .prepare(&format!(
+            "SELECT id, text, rule_json FROM {schema}.terms ORDER BY text_key, id"
+        ))?
         .query_map([], |row| {
             Ok(Term {
                 id: row.get(0)?,
@@ -401,8 +436,9 @@ fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
         .enumerate()
         .map(|(index, term)| (term.id, index))
         .collect();
-    let mut statement = connection
-        .prepare("SELECT term_id, group_id FROM memberships ORDER BY term_id, group_id")?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT term_id, group_id FROM {schema}.memberships ORDER BY term_id, group_id"
+    ))?;
     for membership in
         statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
     {
@@ -412,11 +448,13 @@ fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
         }
     }
     let selected_group_ids = connection
-        .prepare("SELECT group_id FROM selected_groups ORDER BY group_id")?
+        .prepare(&format!(
+            "SELECT group_id FROM {schema}.selected_groups ORDER BY group_id"
+        ))?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<i64>>>()?;
     let version = connection.query_row(
-        "SELECT revision FROM dictionary_state WHERE id=1",
+        &format!("SELECT revision FROM {schema}.dictionary_state WHERE id=1"),
         [],
         |row| row.get(0),
     )?;
@@ -442,7 +480,7 @@ fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
 }
 
 impl DictionarySnapshot {
-    fn rules(&self, language: Option<&str>) -> Vec<Rule> {
+    pub(crate) fn rules(&self, language: Option<&str>) -> Vec<Rule> {
         self.terms
             .iter()
             .filter(|term| {

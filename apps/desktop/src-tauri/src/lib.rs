@@ -6,6 +6,7 @@ mod output_audio;
 mod platform;
 mod service;
 mod settings;
+pub mod suggestions;
 use service::{Command, Service, Snapshot};
 use tauri::{
     Manager, State,
@@ -125,6 +126,8 @@ pub fn run() {
             history::history_detail,
             history::history_edit,
             history::history_undo,
+            suggestions::suggestions_snapshot,
+            suggestions::suggestions_review,
             history::history_remember
         ])
         .setup(|app| {
@@ -137,6 +140,10 @@ pub fn run() {
             ));
             let history = history::HistoryStore::new(data.join("history.sqlite3"));
             app.manage(history.clone());
+            app.manage(suggestions::SuggestionStore::new(
+                history.clone(),
+                app.state::<dictionary::DictionaryStore>().inner().clone(),
+            ));
             let service = Service::new(
                 app.handle().clone(),
                 data.join("models/nemotron-3.5-streaming-int8"),

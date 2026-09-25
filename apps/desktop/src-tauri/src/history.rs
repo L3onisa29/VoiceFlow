@@ -151,7 +151,10 @@ impl HistoryStore {
         Self(Arc::new(Mutex::new(path)))
     }
 
-    fn access<T>(&self, operation: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    pub(crate) fn access<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
         let path = self
             .0
             .lock()
@@ -225,6 +228,7 @@ impl HistoryStore {
                  PRAGMA user_version = 2;",
             )?;
         }
+        crate::suggestions::migrate(&tx)?;
         tx.commit()?;
         operation(&mut connection)
     }

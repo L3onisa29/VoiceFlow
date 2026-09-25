@@ -382,7 +382,10 @@ export function TranscriptionHistory({
             <AlertDialogTitle>Eliminare la trascrizione?</AlertDialogTitle>
             <AlertDialogDescription>
               Originale, risultato, revisioni ed esempi ricordati verranno
-              rimossi da questo archivio locale insieme ai conteggi. Eventuali
+              rimossi da questo archivio locale insieme ai conteggi. Anche le
+              proposte non approvate e i riferimenti sorgente saranno rimossi.
+              Le definizioni già approvate, con i loro esempi e versioni,
+              restano regole indipendenti. Eventuali
               testi già inviati a servizi esterni non vengono cancellati da quei
               servizi. L'operazione non può essere annullata.
             </AlertDialogDescription>

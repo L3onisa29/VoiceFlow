@@ -53,3 +53,5 @@ cargo test -p voiceflow-core --locked dictionary::tests
 pnpm desktop:check
 pnpm desktop:ui
 ```
+
+Le revisioni sono archiviate da C2 in `dictionary_versions`, dalla configurazione presente al primo aggiornamento in avanti. Le regole terminologiche approvate nella pagina Suggerimenti vengono combinate con il dizionario manuale nello snapshot della sessione. La pubblicazione verifica anche i conflitti e gli esempi di queste regole; un ripristino dei suggerimenti non annulla le modifiche manuali al dizionario. Contratti e limiti in [Suggerimenti](suggestions.md).

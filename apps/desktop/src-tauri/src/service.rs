@@ -259,10 +259,11 @@ impl Worker {
                     .as_ref()
                     .ok_or_else(|| anyhow!("Carica prima il modello NVIDIA"))?;
                 let settings = self.snapshot.lock().unwrap().settings.clone();
-                let (mut processing, dictionary, dictionary_warning) = processing_snapshot(
-                    &settings,
-                    &self.app.state::<crate::dictionary::DictionaryStore>(),
-                )?;
+                let (mut processing, dictionary, cleanup_catalog, dictionary_warning) =
+                    reviewed_processing_snapshot(
+                        &settings,
+                        &self.app.state::<crate::suggestions::SuggestionStore>(),
+                    )?;
                 self.update(|s| {
                     s.phase = "loading".into();
                     s.message = None;
@@ -291,11 +292,12 @@ impl Worker {
                     s.level = 0.0;
                 });
                 let started = SystemTime::now().duration_since(UNIX_EPOCH)?;
-                let session = StreamingSession::with_dictionary(
+                let session = StreamingSession::with_rules(
                     decoder,
                     settings.format,
                     settings.cleanup,
                     dictionary,
+                    cleanup_catalog,
                 );
                 processing.cleanup_version = session.cleanup_version().into();
                 self.active = Some(Active {
@@ -458,6 +460,35 @@ impl Worker {
     }
 }
 
+fn reviewed_processing_snapshot(
+    settings: &Settings,
+    store: &crate::suggestions::SuggestionStore,
+) -> Result<(
+    ProcessingMetadata,
+    voiceflow_core::dictionary::Dictionary,
+    voiceflow_core::cleanup::CompiledCatalog,
+    Option<String>,
+)> {
+    let mut processing = processing_metadata(settings)?;
+    match store.session_snapshot(settings.language.code()) {
+        Ok(snapshot) => {
+            processing.groups = snapshot.groups;
+            processing.dictionary_version = Some(snapshot.dictionary_version);
+            processing.cleanup_version = snapshot.cleanup.version().into();
+            Ok((processing, snapshot.dictionary, snapshot.cleanup, None))
+        }
+        Err(error) => Ok((
+            processing,
+            voiceflow_core::dictionary::Dictionary::default(),
+            voiceflow_core::cleanup::CompiledCatalog::builtin(),
+            Some(format!(
+                "Regole personali non applicate a questa sessione: {error}"
+            )),
+        )),
+    }
+}
+
+#[cfg(test)]
 fn processing_snapshot(
     settings: &Settings,
     store: &crate::dictionary::DictionaryStore,
