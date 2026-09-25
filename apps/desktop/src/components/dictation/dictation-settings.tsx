@@ -1,5 +1,10 @@
 import { Globe2 } from "lucide-react";
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import {
+  Field,
+  FieldGroup,
+  FieldLabel,
+  FieldDescription,
+} from "@/components/ui/field";
 import {
   Select,
   SelectContent,
@@ -22,10 +27,10 @@ export function DictationSettings({
   onChange,
 }: DictationSettingsProps) {
   return (
-    <FieldGroup className="settings-grid">
-      <Field>
+    <FieldGroup className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+      <Field data-disabled={locked || !settings}>
         <FieldLabel htmlFor="language">
-          <Globe2 className="size-3.5" />
+          <Globe2 aria-hidden="true" />
           Lingua
         </FieldLabel>
         <Select
@@ -47,11 +52,11 @@ export function DictationSettings({
             </SelectGroup>
           </SelectContent>
         </Select>
-        <p className="field-hint">
+        <FieldDescription>
           Italiano e inglese, anche nella stessa giornata.
-        </p>
+        </FieldDescription>
       </Field>
-      <Field>
+      <Field data-disabled={locked || !settings}>
         <FieldLabel htmlFor="cleanup">Pulizia locale</FieldLabel>
         <Select
           disabled={locked || !settings}
@@ -71,12 +76,12 @@ export function DictationSettings({
             </SelectGroup>
           </SelectContent>
         </Select>
-        <p className="field-hint">
+        <FieldDescription>
           Riduce casi come "il la scheda" in italiano. Le ultime 7 parole
           restano modificabili. Nessuna correzione grammaticale.
-        </p>
+        </FieldDescription>
       </Field>
-      <Field>
+      <Field data-disabled={locked || !settings}>
         <FieldLabel htmlFor="format">Come vuoi il tuo testo</FieldLabel>
         <Select
           disabled={locked || !settings}
@@ -98,13 +103,13 @@ export function DictationSettings({
             </SelectGroup>
           </SelectContent>
         </Select>
-        <p className="field-hint">
+        <FieldDescription>
           {settings?.format === "spoken-commands"
             ? "Pronuncia “a capo”, “nuovo paragrafo” o “punto elenco”."
             : settings?.cleanup
               ? "Comandi vocali letterali. Pulizia locale attiva."
               : "Conserva le tue parole, con punteggiatura automatica."}
-        </p>
+        </FieldDescription>
       </Field>
     </FieldGroup>
   );

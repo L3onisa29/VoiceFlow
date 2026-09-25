@@ -1,3 +1,6 @@
+import { ShieldCheck } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+
 export function DictationHeader() {
   return (
     <header className="page-header">
@@ -6,10 +9,10 @@ export function DictationHeader() {
         <h1>Fai spazio alle parole.</h1>
         <p>Posiziona il cursore nella tua app. Detta e incolla con ⌥ Spazio.</p>
       </div>
-      <div className="privacy-chip">
-        <span />
+      <Badge variant="outline">
+        <ShieldCheck data-icon="inline-start" />
         Sul tuo Mac
-      </div>
+      </Badge>
     </header>
   );
 }

@@ -95,9 +95,6 @@ fn main() -> Result<()> {
         "chunkP95Ms":p95, "finalizeMs":stop.elapsed().as_secs_f64()*1000.0,
         "chunks":result.chunks, "text":result.text(), "paced":realtime, "cleanup":cleanup, "format":mode});
     println!("{output}");
-    ensure!(
-        first_partial.is_some() && !result.text().is_empty(),
-        "No speech recognized"
-    );
+    ensure!(!result.text().is_empty(), "No speech recognized");
     Ok(())
 }

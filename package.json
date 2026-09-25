@@ -13,6 +13,7 @@
     "model:download": "node scripts/download-model.ts",
     "test:rust": "cargo test --workspace --locked",
     "test:streaming": "cargo build --release --locked -p voiceflow-core --bin streaming-benchmark && node scripts/verify-streaming.ts",
+    "test:short-recordings": "cargo build --release --locked -p voiceflow-core --bin streaming-benchmark && node scripts/verify-short-recordings.ts",
     "test:signing": "node --test scripts/build-signing.test.ts"
   },
   "type": "module",

@@ -1,14 +1,68 @@
 use anyhow::{Result, anyhow, ensure};
+use core_foundation::{
+    base::TCFType,
+    string::{CFString, CFStringRef},
+};
 use crossbeam_channel::{Sender, bounded};
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectPropertyAddress,
     AudioObjectSetPropertyData, kAudioDevicePropertyMute, kAudioDevicePropertyStreams,
-    kAudioDevicePropertyTransportType, kAudioDeviceTransportTypeBuiltIn,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioStreamPropertyTerminalType,
-    kAudioStreamTerminalTypeLFESpeaker, kAudioStreamTerminalTypeReceiverSpeaker,
-    kAudioStreamTerminalTypeSpeaker,
+    kAudioDevicePropertyTransportType, kAudioDeviceTransportTypeBluetooth,
+    kAudioDeviceTransportTypeBluetoothLE, kAudioDeviceTransportTypeBuiltIn,
+    kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyDevices, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioStreamPropertyTerminalType, kAudioStreamTerminalTypeLFESpeaker,
+    kAudioStreamTerminalTypeReceiverSpeaker, kAudioStreamTerminalTypeSpeaker,
 };
+
+/// Opening a Bluetooth microphone switches headset playback to a low-quality
+/// duplex profile. Select the built-in mic for this app without changing the
+/// system default. A non-Bluetooth default (including USB mics) is respected.
+pub fn capture_input_name() -> Result<Option<String>> {
+    let input = CoreAudio::read(
+        kAudioObjectSystemObject as u32,
+        kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal,
+    )?;
+    ensure!(input != 0, "Nessun microfono disponibile");
+    let transport = CoreAudio::read(
+        input,
+        kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal,
+    )?;
+    if ![
+        kAudioDeviceTransportTypeBluetooth,
+        kAudioDeviceTransportTypeBluetoothLE,
+    ]
+    .contains(&transport)
+    {
+        return Ok(None);
+    }
+    for device in CoreAudio::objects(
+        kAudioObjectSystemObject as u32,
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+    )? {
+        if CoreAudio::read(
+            device,
+            kAudioDevicePropertyTransportType,
+            kAudioObjectPropertyScopeGlobal,
+        )? == kAudioDeviceTransportTypeBuiltIn
+            && !CoreAudio::objects(
+                device,
+                kAudioDevicePropertyStreams,
+                kAudioObjectPropertyScopeInput,
+            )?
+            .is_empty()
+        {
+            return CoreAudio::name(device).map(Some);
+        }
+    }
+    anyhow::bail!(
+        "Per mantenere la qualità delle cuffie Bluetooth, seleziona un microfono integrato o USB come ingresso audio di macOS."
+    );
+}
 use std::{
     ptr::{NonNull, null},
     sync::{
@@ -123,6 +177,30 @@ impl<B: OutputDevice> SpeakerMute<B> {
 struct CoreAudio;
 
 impl CoreAudio {
+    fn name(device: u32) -> Result<String> {
+        let mut address = Self::address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal);
+        let mut value: CFStringRef = null();
+        let mut size = size_of::<CFStringRef>() as u32;
+        // SAFETY: this property returns an owned CFStringRef into a correctly
+        // sized pointer slot. CoreAudio requires the caller to release it.
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&mut address),
+                0,
+                null(),
+                NonNull::from(&mut size),
+                NonNull::from(&mut value).cast(),
+            )
+        };
+        ensure!(
+            status == 0 && !value.is_null(),
+            "Nome del microfono non disponibile (CoreAudio {status})"
+        );
+        let name = unsafe { CFString::wrap_under_create_rule(value) };
+        Ok(name.to_string())
+    }
+
     fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress {
             mSelector: selector,

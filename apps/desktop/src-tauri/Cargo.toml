@@ -26,10 +26,11 @@ anyhow = "1"
 cpal = "0.16"
 crossbeam-channel = "0.5"
 arboard = { version = "3", default-features = false }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSObject", "NSArray"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSObject", "NSArray", "NSTimer", "NSDate", "block2"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSRunningApplication", "NSPanel", "NSWindow", "NSView", "NSResponder", "NSControl", "NSCell", "NSButton", "NSButtonCell", "NSTextField", "NSTextFieldCell", "NSFont", "NSFontDescriptor", "libc", "objc2-core-foundation", "NSColor", "NSBezierPath", "NSGraphics", "NSScreen", "NSEvent", "NSAppearance", "NSAccessibilityProtocols"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 block2 = "0.6"

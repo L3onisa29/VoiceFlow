@@ -1,5 +1,7 @@
-import { LoaderCircle, Square, Mic, Pause, Play, X } from "lucide-react";
+import { Square, Mic, Pause, Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Kbd, KbdGroup } from "@/components/ui/kbd";
+import { Spinner } from "@/components/ui/spinner";
 import type { DictationState, Permissions, Action } from "@/lib/desktop";
 
 type RecordingControlsProps = {
@@ -22,10 +24,10 @@ export function RecordingControls({
     state?.phase === "loading" || state?.phase === "finalizing";
   return (
     <section
-      className="recording-controls"
+      className="flex flex-wrap items-center justify-between gap-4"
       aria-label="Controlli registrazione"
     >
-      <div className="recording-main">
+      <div className="flex flex-wrap items-center gap-3">
         <Button
           size="lg"
           disabled={
@@ -38,7 +40,7 @@ export function RecordingControls({
           }
         >
           {processing ? (
-            <LoaderCircle className="animate-spin" data-icon="inline-start" />
+            <Spinner aria-label="Elaborazione" data-icon="inline-start" />
           ) : active ? (
             <Square data-icon="inline-start" />
           ) : (
@@ -74,13 +76,27 @@ export function RecordingControls({
             Annulla
           </Button>
         ) : (
-          <span className="shortcut-hint">
-            oppure <kbd>⌥</kbd>
-            <kbd>Spazio</kbd>
+          <span className="flex items-center gap-2 text-xs text-muted-foreground">
+            oppure{" "}
+            <KbdGroup aria-label="Opzione e Spazio">
+              <Kbd>⌥</Kbd>
+              <Kbd>Spazio</Kbd>
+            </KbdGroup>
           </span>
         )}
       </div>
-      <div className="audio-meter" aria-label="Livello microfono">
+      <div
+        className="audio-meter"
+        role="meter"
+        aria-label="Livello microfono"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={
+          recording
+            ? Math.round(Math.min(1, (state?.level ?? 0) * 12) * 100)
+            : 0
+        }
+      >
         {Array.from({ length: 17 }, (_, i) => (
           <span
             key={i}

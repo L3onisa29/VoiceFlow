@@ -9,15 +9,32 @@ link for unknown routes. Hash history keeps navigation within the bundled
 WebView document, without requiring server rewrites. See the
 [TanStack history documentation](https://tanstack.com/router/latest/docs/guide/history-types).
 
-The Tauri `.app` embeds React assets. CPAL captures the system microphone; Rust
+The Tauri `.app` embeds React assets. CPAL captures the selected microphone; Rust
 resamples audio to mono 16 kHz and feeds the NVIDIA decoder every 560 ms.
 Encoder caches persist between chunks. Tauri events update the preview while
 recording. Stopping drains queued audio and flushes decoder lookahead.
 
+Before the first audio chunk of each utterance, the NVIDIA adapter feeds two
+silent chunks to initialize encoder context, or four in automatic language mode.
+Without this pre-roll, immediate
+short words can disappear even after a complete stop flush. This also applies
+after pause and silence resets. It adds decoder work but no recording delay or
+recorded duration. `pnpm test:short-recordings` checks synthetic speech lasting
+0.27–1.01 seconds against the real local model, including pause/resume and silence
+boundaries in Italian and automatic language mode.
+The isolated 273 ms "Ciao" fixture still fails in automatic mode, including with
+the model's offline API; its regression assertion uses Italian. "Pronto" in Auto
+works on immediate stop but remains unreliable after a silence reset. Automatic
+mode reset assertions cover the two longer phrases. Short-word recognition is
+not guaranteed by the model, and this fix does not force a language or replay audio.
+
 There is no recording duration limit or 30-second transcription batch. The audio queue
-is bounded. A microphone error or processing overrun stops dictation with a
-visible error and preserves recognized text. Transcript memory grows with text,
-so available memory still matters in very long sessions.
+retains outstanding frames when inference falls behind, releasing each frame after
+processing. Stop closes capture, drains this finite backlog, flushes the resampler
+and decoder tail, then saves the concatenated transcript once. Previously decoded
+audio is not processed again. Memory usage grows with the backlog if inference
+stays slower than capture, and with transcript length. A microphone error stops
+dictation with a visible error and preserves recognized text.
 
 Two seconds of low audio energy commits the phrase and resets the decoder
 without ending dictation. This initial endpoint detector uses an RMS threshold,
@@ -29,6 +46,12 @@ threads. No NVIDIA GPU, CUDA, Python process or API key is needed.
 ### Interaction and storage
 
 - Grant Microphone access to VoiceFlow, and Accessibility for automatic paste.
+- If macOS selects a Bluetooth microphone, VoiceFlow uses the Mac's built-in
+  microphone instead. This keeps headphone playback out of the reduced-quality
+  Bluetooth duplex mode. Speak toward the Mac while listening through the
+  headphones. Other input defaults, including USB microphones, are respected.
+  VoiceFlow does not change the system input or output. If no built-in mic is
+  available, select a non-Bluetooth input in macOS before starting dictation.
 - `Option+Space` starts and stops dictation from another app.
 - `Control+Space` cancels during recording and is released afterwards.
 - A black/orange native nonactivating NSPanel shows elapsed time on the left,

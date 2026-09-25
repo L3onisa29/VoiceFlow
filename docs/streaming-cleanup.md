@@ -4,6 +4,14 @@ The desktop settings include **Pulizia locale**, off by default. Existing settin
 files without `cleanup` load with it off. Settings cannot change during a recording
 or pause. Cleanup and spoken formatting commands are independent options.
 
+Decoder markers such as `<unk>` and any other `<...>` span are always removed
+in the text buffer, including when local cleanup is off. The live preview and
+final transcript share this rule. Markers can contain spaces or arrive across
+multiple updates. An unfinished marker is hidden in the preview; an unmatched
+`<` is preserved at pause or stop. Removal keeps the decoder's original byte
+offsets and processes only the mutable tail. Ordinary text spacing is preserved;
+a standalone marker and its leading separator are discarded.
+
 The core keeps seven complete raw words mutable, plus the unfinished word. It
 also retains at most one preceding word with frozen source text. That word's
 rendering can still depend on the first mutable word: for example, revising
@@ -44,7 +52,8 @@ Confirmed and partial strings concatenate directly. Partial text owns its
 leading separator, including any newline; the UI must not insert an extra space.
 Copy, error recovery and final paste use this same processed transcript. Stop
 does not run the command formatter a second time. With cleanup off and faithful
-formatting, words and internal whitespace remain literal.
+formatting, words and internal whitespace remain literal except for decoder
+marker removal.
 
 The decoder adapter accepts cumulative snapshots, repeated snapshots and updates
 that extend an unfinished word. Revisions within the seven-word raw tail are

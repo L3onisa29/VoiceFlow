@@ -22,6 +22,7 @@ export const stateSchema = z.object({
   modelPresent: z.boolean(),
   finalText: z.string(),
   message: z.string().nullable(),
+  historyError: z.string().nullable().default(null),
   level: z.number(),
   elapsedSeconds: z.number(),
   device: z.string(),

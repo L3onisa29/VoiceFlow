@@ -1,4 +1,6 @@
 mod capture;
+mod dictionary;
+mod history;
 mod hud;
 mod output_audio;
 mod platform;
@@ -110,17 +112,31 @@ pub fn run() {
             pause_recording,
             cancel_recording,
             save_settings,
-            copy_transcript
+            copy_transcript,
+            dictionary::dictionary_snapshot,
+            dictionary::dictionary_save_term,
+            dictionary::dictionary_save_group,
+            dictionary::dictionary_delete_term,
+            dictionary::dictionary_delete_group,
+            history::history_page,
+            history::history_copy,
+            history::history_delete
         ])
         .setup(|app| {
             let data = app
                 .path()
                 .home_dir()?
                 .join("Library/Application Support/VoiceFlow");
+            app.manage(dictionary::DictionaryStore::new(
+                data.join("dictionary.sqlite3"),
+            ));
+            let history = history::HistoryStore::new(data.join("history.sqlite3"));
+            app.manage(history.clone());
             let service = Service::new(
                 app.handle().clone(),
                 data.join("models/nemotron-3.5-streaming-int8"),
                 data.join("desktop-settings.json"),
+                history,
             )?;
             app.manage(service.clone());
             let toggle: Shortcut = "Alt+Space".parse()?;

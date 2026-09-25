@@ -1,17 +1,24 @@
-use crate::{capture::Capture, platform, settings::Settings};
+use crate::{
+    capture::Capture,
+    history::{CompletedDictation, HistoryStore},
+    platform,
+    settings::Settings,
+};
 use anyhow::{Result, anyhow, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, select_biased, tick};
 use serde::Serialize;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, atomic::Ordering},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use voiceflow_core::{
     audio::StreamingResampler,
-    streaming::{MODEL_FILES, NvidiaDecoder, StreamingSession, Transcript, load_model},
+    streaming::{
+        MODEL_FILES, NvidiaDecoder, StreamingDecoder, StreamingSession, Transcript, load_model,
+    },
 };
 
 #[derive(Clone, Serialize)]
@@ -24,6 +31,7 @@ pub struct Snapshot {
     pub transcript: Transcript,
     pub final_text: String,
     pub message: Option<String>,
+    pub history_error: Option<String>,
     pub level: f32,
     pub elapsed_seconds: u64,
     pub device: String,
@@ -46,7 +54,12 @@ pub struct Service {
     snapshot: Arc<Mutex<Snapshot>>,
 }
 impl Service {
-    pub fn new(app: AppHandle, model_path: PathBuf, settings_path: PathBuf) -> Result<Self> {
+    pub fn new(
+        app: AppHandle,
+        model_path: PathBuf,
+        settings_path: PathBuf,
+        history: HistoryStore,
+    ) -> Result<Self> {
         let loaded = Settings::load(&settings_path);
         let message = loaded
             .as_ref()
@@ -62,6 +75,7 @@ impl Service {
             transcript: Transcript::default(),
             final_text: String::new(),
             message,
+            history_error: None,
             level: 0.0,
             elapsed_seconds: 0,
             device: "Microfono di sistema".into(),
@@ -82,6 +96,7 @@ impl Service {
                     snapshot,
                     model_path,
                     settings_path,
+                    history,
                     receiver,
                     cancel_receiver,
                     model: None,
@@ -109,6 +124,8 @@ impl Service {
     }
 }
 struct Active {
+    session_key: String,
+    created_at: i64,
     capture: Option<Capture>,
     resampler: StreamingResampler,
     session: StreamingSession<NvidiaDecoder>,
@@ -120,6 +137,7 @@ struct Worker {
     snapshot: Arc<Mutex<Snapshot>>,
     model_path: PathBuf,
     settings_path: PathBuf,
+    history: HistoryStore,
     receiver: Receiver<Command>,
     cancel_receiver: Receiver<()>,
     model: Option<parakeet_handle::Handle>,
@@ -239,6 +257,12 @@ impl Worker {
                     .as_ref()
                     .ok_or_else(|| anyhow!("Carica prima il modello NVIDIA"))?;
                 let settings = self.snapshot.lock().unwrap().settings.clone();
+                self.update(|s| {
+                    s.phase = "loading".into();
+                    s.message = None;
+                    s.level = 0.0;
+                    s.elapsed_seconds = 0;
+                });
                 let decoder = NvidiaDecoder::new(model, settings.language)?;
                 let capture = Capture::start()?;
                 let resampler = StreamingResampler::new(capture.sample_rate)?;
@@ -260,7 +284,10 @@ impl Worker {
                     s.elapsed_seconds = 0;
                     s.level = 0.0;
                 });
+                let started = SystemTime::now().duration_since(UNIX_EPOCH)?;
                 self.active = Some(Active {
+                    session_key: format!("{}-{}", std::process::id(), started.as_nanos()),
+                    created_at: started.as_millis() as i64,
                     capture: Some(capture),
                     resampler,
                     session: StreamingSession::with_processing(
@@ -379,20 +406,38 @@ impl Worker {
             }
         };
         let final_text = transcript.text();
-        // Persist before attempting delivery so any failure remains recoverable.
+        // Keep the finalized text available even if delivery fails.
         self.update(|s| {
             s.transcript = transcript;
             s.final_text = final_text.clone();
         });
-        let message = if final_text.is_empty() {
-            "Nessun parlato rilevato".into()
-        } else {
-            let target = target.ok_or_else(|| anyhow!(
+        let delivery = (|| -> Result<String> {
+            Ok(if final_text.is_empty() {
+                "Nessun parlato rilevato".into()
+            } else {
+                let target = target.ok_or_else(|| anyhow!(
                 "Nessun campo esterno accessibile. Consenti Accessibilità a VoiceFlow e posiziona il cursore nell’app di destinazione. Il testo è recuperabile con Copia testo."
             ))?;
-            platform::paste_text(&target, &final_text, || !self.cancel_receiver.is_empty())?;
-            "Incolla inviato al campo attivo".into()
-        };
+                platform::paste_text(&target, &final_text, || !self.cancel_receiver.is_empty())?;
+                "Incolla inviato al campo attivo".into()
+            })
+        })();
+        // A cancellation during finalization or delivery must not enter history.
+        if self.take_cancellation() {
+            return Ok(());
+        }
+        let settings = self.snapshot.lock().unwrap().settings.clone();
+        let language = settings.language.code();
+        let history_error = self.history.record(&CompletedDictation {
+            session_key: &active.session_key,
+            created_at: active.created_at,
+            text: &final_text,
+            duration_seconds: active.clock.elapsed(Instant::now()).as_secs_f64(),
+            language,
+        }).err().map(|error| format!("Trascrizione non salvata nello storico: {error:#}. Puoi recuperarla con Copia testo."));
+        self.update(|s| s.history_error = history_error);
+        let _ = self.app.emit("history-changed", ());
+        let message = delivery?;
         let _ = self.app.global_shortcut().unregister("Control+Space");
         self.update(|s| {
             s.phase = "complete".into();
@@ -404,14 +449,31 @@ impl Worker {
 impl Active {
     fn drain(&mut self, cancellation: &Receiver<()>) -> Result<()> {
         if let Some(capture) = self.capture.take() {
-            for frame in capture.finish()?.try_iter() {
-                ensure!(cancellation.is_empty(), "Dettatura annullata");
-                self.session.push(&self.resampler.push(&frame)?)?;
-            }
-            self.session.push(&self.resampler.finish()?)?;
+            drain_audio(
+                capture.finish()?,
+                &mut self.resampler,
+                &mut self.session,
+                cancellation,
+            )?;
         }
         Ok(())
     }
+}
+
+/// Capture must be stopped before draining so no producer can extend the queue.
+fn drain_audio<D: StreamingDecoder>(
+    frames: Receiver<Vec<f32>>,
+    resampler: &mut StreamingResampler,
+    session: &mut StreamingSession<D>,
+    cancellation: &Receiver<()>,
+) -> Result<()> {
+    for frame in frames.try_iter() {
+        ensure!(cancellation.is_empty(), "Dettatura annullata");
+        session.push(&resampler.push(&frame)?)?;
+    }
+    ensure!(cancellation.is_empty(), "Dettatura annullata");
+    session.push(&resampler.finish()?)?;
+    Ok(())
 }
 fn apply_cancellation(snapshot: &mut Snapshot, had_active: bool) {
     if had_active
@@ -459,6 +521,114 @@ impl RecordingClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct DelayedDecoder {
+        text: String,
+        utterance: usize,
+        voiced_samples: Arc<AtomicUsize>,
+    }
+    impl StreamingDecoder for DelayedDecoder {
+        fn chunk_samples(&self) -> usize {
+            8_960
+        }
+        fn feed(&mut self, samples: &[f32]) -> Result<()> {
+            let voiced = samples.iter().filter(|&&sample| sample != 0.0).count();
+            self.voiced_samples.fetch_add(voiced, Ordering::Relaxed);
+            self.text = if self.utterance == 0 {
+                "testo precedente"
+            } else if voiced > 0 {
+                "coda"
+            } else {
+                // The last token is only available after decoder lookahead.
+                "coda completa"
+            }
+            .into();
+            Ok(())
+        }
+        fn text(&self) -> String {
+            self.text.clone()
+        }
+        fn reset(&mut self) {
+            self.utterance += 1;
+            self.text.clear();
+        }
+    }
+
+    #[test]
+    fn stop_drains_backlog_and_delayed_tokens_into_one_history_entry() {
+        for rate in [16_000, 44_100, 48_000] {
+            let decoder = DelayedDecoder::default();
+            let voiced_samples = Arc::clone(&decoder.voiced_samples);
+            let mut session = StreamingSession::new(decoder);
+            session.push(&[0.25; 8_960]).unwrap();
+            session.flush_utterance().unwrap();
+            assert_eq!(session.snapshot().confirmed, "testo precedente");
+
+            let (sender, frames) = crate::capture::capture_frames();
+            for _ in 0..512 {
+                sender.try_send(vec![0.25; 317]).unwrap();
+            }
+            sender.try_send(vec![0.25; 11]).unwrap();
+            drop(sender); // Stop capture while the consumer still has a backlog.
+            let observer = frames.clone();
+            let (_cancel_sender, cancellation) = bounded(1);
+            let mut resampler = StreamingResampler::new(rate).unwrap();
+            drain_audio(frames, &mut resampler, &mut session, &cancellation).unwrap();
+            assert!(observer.is_empty());
+            let transcript = session.finish().unwrap();
+            assert!(transcript.finished);
+            assert!(transcript.partial.is_empty());
+            assert_eq!(transcript.text(), "testo precedente coda completa");
+            let expected_samples = 8_960 + (512 * 317 + 11) * 16_000 / rate;
+            assert!((transcript.audio_seconds * 16_000.0 - expected_samples as f64).abs() < 1e-6);
+            if rate == 16_000 {
+                assert_eq!(voiced_samples.load(Ordering::Relaxed), expected_samples);
+            }
+            let chunks = transcript.chunks;
+            assert_eq!(session.finish().unwrap().chunks, chunks);
+
+            let path = std::env::temp_dir().join(format!(
+                "voiceflow-stop-{}-{}-{rate}.sqlite3",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let store = HistoryStore::new(path.clone());
+            let text = transcript.text();
+            let entry = CompletedDictation {
+                session_key: "stopped-session",
+                created_at: 1,
+                text: &text,
+                duration_seconds: transcript.audio_seconds,
+                language: "it-IT",
+            };
+            store.record(&entry).unwrap();
+            store.record(&entry).unwrap();
+            assert_eq!(store.text(1).unwrap(), "testo precedente coda completa");
+            assert!(store.text(2).is_err(), "Stop duplicated the stored session");
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_during_drain_does_not_finalize_the_backlog() {
+        let (sender, frames) = crate::capture::capture_frames();
+        sender.try_send(vec![0.25; 8_960]).unwrap();
+        drop(sender);
+        let (cancel_sender, cancellation) = bounded(1);
+        cancel_sender.send(()).unwrap();
+        let mut session = StreamingSession::new(DelayedDecoder::default());
+        let mut resampler = StreamingResampler::new(16_000).unwrap();
+        assert!(drain_audio(frames, &mut resampler, &mut session, &cancellation).is_err());
+        assert_eq!(session.snapshot().audio_seconds, 0.0);
+        assert!(session.snapshot().text().is_empty());
+        assert!(!session.snapshot().finished);
+    }
+
     fn failed_snapshot() -> Snapshot {
         Snapshot {
             revision: 1,
@@ -474,6 +644,7 @@ mod tests {
                 "Acquisizione interrotta: audio incompleto. Il testo parziale è recuperabile."
                     .into(),
             ),
+            history_error: None,
             level: 0.0,
             elapsed_seconds: 5,
             device: "test".into(),

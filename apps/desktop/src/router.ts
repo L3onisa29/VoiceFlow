@@ -1,10 +1,16 @@
 import { createHashHistory, createRouter } from "@tanstack/react-router";
 import { Route as rootRoute } from "./routes/__root";
 import { Route as indexRoute } from "./routes";
+import { Route as dictionaryRoute } from "./routes/dictionary";
+import { Route as settingsRoute } from "./routes/settings";
 
 // Keep navigation inside the Tauri WebView's document, including on reload.
 export const router = createRouter({
-  routeTree: rootRoute.addChildren([indexRoute]),
+  routeTree: rootRoute.addChildren([
+    indexRoute,
+    dictionaryRoute,
+    settingsRoute,
+  ]),
   history: createHashHistory(),
 });
 

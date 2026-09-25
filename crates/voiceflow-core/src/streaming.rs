@@ -45,27 +45,52 @@ pub trait StreamingDecoder {
     fn reset(&mut self);
 }
 
-pub struct NvidiaDecoder(Nemotron);
+pub struct NvidiaDecoder {
+    model: Nemotron,
+    needs_preroll: bool,
+    preroll_chunks: usize,
+}
 impl NvidiaDecoder {
     pub fn new(handle: &NemotronHandle, language: Language) -> Result<Self> {
         let mut model = Nemotron::from_shared(handle);
         model.set_target_lang(language.code())?;
-        Ok(Self(model))
+        Ok(Self {
+            model,
+            needs_preroll: true,
+            preroll_chunks: if matches!(language, Language::Auto) {
+                4
+            } else {
+                2
+            },
+        })
     }
 }
 impl StreamingDecoder for NvidiaDecoder {
     fn chunk_samples(&self) -> usize {
-        self.0.chunk_samples()
+        self.model.chunk_samples()
     }
     fn feed(&mut self, samples: &[f32]) -> Result<()> {
-        self.0.transcribe_chunk(samples)?;
+        if self.needs_preroll {
+            // With empty encoder caches, Nemotron 3.5 can lose an immediate
+            // short word. Two silent chunks preserve the onset, including
+            // "Ciao" where one is insufficient. Auto needs four for "Pronto".
+            // Apply after every reset, outside the session's VAD, which skips silence.
+            // This is decoder context, not recorded audio or a wall-clock wait.
+            let silence = vec![0.0; self.model.chunk_samples()];
+            for _ in 0..self.preroll_chunks {
+                self.model.transcribe_chunk(&silence)?;
+            }
+            self.needs_preroll = false;
+        }
+        self.model.transcribe_chunk(samples)?;
         Ok(())
     }
     fn text(&self) -> String {
-        self.0.get_transcript()
+        self.model.get_transcript()
     }
     fn reset(&mut self) {
-        self.0.reset();
+        self.model.reset();
+        self.needs_preroll = true;
     }
 }
 
@@ -338,6 +363,25 @@ mod processing_tests {
         session.push(&[0.1; 8_960]).unwrap();
         assert!(session.processor.buffered_words() <= MUTABLE_WORDS);
         session.snapshot()
+    }
+
+    #[test]
+    fn decoder_markers_are_filtered_through_preview_pause_resume_and_stop() {
+        let mut session = session(
+            &["<un", "<unk> Ciao <noi", "<unk> Ciao <noise> mondo"],
+            FormatMode::Faithful,
+            false,
+        );
+        assert_eq!(step(&mut session).text(), "");
+        assert_eq!(step(&mut session).text(), "Ciao");
+        assert_eq!(step(&mut session).text(), "Ciao mondo");
+        session.flush_utterance().unwrap();
+        assert_eq!(session.snapshot().confirmed, "Ciao mondo");
+        session.decoder.updates.push_back("<unk> ancora <eos>");
+        assert_eq!(step(&mut session).text(), "Ciao mondo ancora");
+        let final_text = session.finish().unwrap();
+        assert_eq!(final_text.text(), "Ciao mondo ancora");
+        assert!(final_text.partial.is_empty());
     }
 
     #[test]

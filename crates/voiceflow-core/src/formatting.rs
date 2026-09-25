@@ -82,15 +82,12 @@ impl TextProcessor {
             let Some(start) = rest.find(|c: char| !c.is_whitespace()) else {
                 break;
             };
-            let end = rest[start..].find(char::is_whitespace).map(|n| start + n);
-            let end = match end {
-                Some(end) => end,
-                None if complete => rest.len(),
-                None => break,
+            let Some(end) = decoder_word_end(&rest[start..], complete).map(|n| start + n) else {
+                break;
             };
             self.pending.push_back(Word {
                 separator: rest[..start].to_owned(),
-                text: rest[start..end].to_owned(),
+                text: strip_decoder_markers(&rest[start..end], true),
                 end: cursor + end,
             });
             cursor += end;
@@ -99,7 +96,7 @@ impl TextProcessor {
             self.release(false);
         }
         self.accepted_tail = snapshot[self.released_offset..self.parsed_offset].to_owned();
-        self.incomplete = snapshot[self.parsed_offset..].to_owned();
+        self.incomplete = strip_decoder_markers(&snapshot[self.parsed_offset..], false);
         if complete {
             self.release(true);
             self.incomplete.clear();
@@ -112,7 +109,12 @@ impl TextProcessor {
     }
 
     fn atoms(&self) -> Vec<Atom<'_>> {
-        let words: Vec<_> = self.lookbehind.iter().chain(self.pending.iter()).collect();
+        let words: Vec<_> = self
+            .lookbehind
+            .iter()
+            .chain(self.pending.iter())
+            .filter(|word| !word.text.is_empty())
+            .collect();
         let mut atoms: Vec<Atom<'_>> = Vec::with_capacity(words.len());
         let mut i = 0;
         while i < words.len() {
@@ -153,6 +155,9 @@ impl TextProcessor {
         while !self.pending.is_empty() && (all || self.pending.len() > MUTABLE_WORDS) {
             let mut word = self.pending.pop_front().unwrap();
             self.released_offset = word.end;
+            if word.text.is_empty() {
+                continue;
+            }
             if let Some(previous) = self.lookbehind.take() {
                 if matches!(self.mode, FormatMode::SpokenCommands)
                     && let Some(text) = command(&previous.text, &word.text, &word.separator)
@@ -241,6 +246,48 @@ impl TextProcessor {
     pub fn retained_words(&self) -> usize {
         self.pending.len() + usize::from(self.lookbehind.is_some())
     }
+}
+
+/// Marker contents may contain whitespace. Keep raw byte offsets so decoder
+/// revisions still address the original snapshot, not the cleaned output.
+fn decoder_word_end(text: &str, complete: bool) -> Option<usize> {
+    let mut chars = text.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            return Some(index);
+        }
+        if ch == '<' {
+            if let Some(end) = text[index..].find('>') {
+                let end = index + end;
+                for (index, _) in chars.by_ref() {
+                    if index == end {
+                        break;
+                    }
+                }
+            } else if !complete {
+                return None;
+            }
+        }
+    }
+    complete.then_some(text.len())
+}
+
+/// Remove every <...> span. Hide an unfinished marker in live previews, but
+/// preserve an unmatched '<' when the utterance is finalized.
+fn strip_decoder_markers(mut text: &str, complete: bool) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    while let Some(start) = text.find('<') {
+        cleaned.push_str(&text[..start]);
+        let Some(end) = text[start..].find('>') else {
+            if complete {
+                cleaned.push_str(&text[start..]);
+            }
+            return cleaned;
+        };
+        text = &text[start + end + 1..];
+    }
+    cleaned.push_str(text);
+    cleaned
 }
 
 fn render(
@@ -341,6 +388,80 @@ mod tests {
         let mut processor = TextProcessor::new(FormatMode::Faithful, true);
         processor.update(text, true).unwrap();
         processor.parts().0.trim().to_owned()
+    }
+
+    #[test]
+    fn decoder_markers_are_removed_in_every_mode_without_linguistic_cleanup() {
+        for mode in [FormatMode::Faithful, FormatMode::SpokenCommands] {
+            for (input, expected) in [
+                ("<unk> Ciao <noise> mondo <eos>", "Ciao mondo"),
+                ("Ciao<unk>, <|noise|>perché<>?", "Ciao, perché?"),
+                ("<unk><noise>", ""),
+                ("uno <background noise> due", "uno due"),
+                ("uno\n<unk>\ndue", "uno\ndue"),
+                ("ciao <incompleto", "ciao <incompleto"),
+                ("2 < 3", "2 < 3"),
+            ] {
+                assert_eq!(format_transcript(input, mode), expected, "{input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_markers_never_leak_into_preview() {
+        let input = "Ciao<rumore è forte> mondo <unk>";
+        let mut processor = TextProcessor::new(FormatMode::Faithful, false);
+        for end in (0..=input.len()).filter(|&end| input.is_char_boundary(end)) {
+            processor.update(&input[..end], false).unwrap();
+            let (confirmed, partial) = processor.parts();
+            let preview = format!("{confirmed}{partial}");
+            assert!("Ciao mondo".starts_with(&preview), "{preview:?}");
+        }
+        processor.update(input, true).unwrap();
+        assert_eq!(processor.parts(), ("Ciao mondo", String::new()));
+    }
+
+    #[test]
+    fn marker_revisions_keep_raw_offsets_and_confirmed_text() {
+        let prefix = "<unk> uno due tre quattro cinque sei sette otto nove ";
+        let mut processor = TextProcessor::new(FormatMode::Faithful, false);
+        processor.update(&format!("{prefix}<un"), false).unwrap();
+        let confirmed = processor.parts().0.to_owned();
+        assert!(!confirmed.is_empty());
+        for tail in ["<unk> fine ", "parola fine ", "<noise> fine "] {
+            processor.update(&format!("{prefix}{tail}"), false).unwrap();
+            let (current, partial) = processor.parts();
+            assert!(current.starts_with(&confirmed));
+            assert_eq!(
+                format!("{current}{partial}"),
+                format_transcript(&format!("{prefix}{tail}"), FormatMode::Faithful)
+            );
+        }
+        processor
+            .update(&format!("{prefix}<noise> fine "), true)
+            .unwrap();
+        assert_eq!(
+            processor.parts().0,
+            "uno due tre quattro cinque sei sette otto nove fine"
+        );
+    }
+
+    #[test]
+    fn marker_only_words_do_not_break_commands_or_grow_the_window() {
+        let mut processor = TextProcessor::new(FormatMode::SpokenCommands, true);
+        let mut input = String::from("il <unk> la scheda a ");
+        for _ in 0..100 {
+            input.push_str("<noise> ");
+            processor.update(&input, false).unwrap();
+            assert!(processor.buffered_words() <= MUTABLE_WORDS);
+            assert!(processor.retained_words() <= RETAINED_WORDS);
+        }
+        input.push_str("capo fine ");
+        processor.update(&input, false).unwrap();
+        let (confirmed, partial) = processor.parts();
+        assert_eq!(format!("{confirmed}{partial}"), "la scheda\nfine");
+        processor.update(&input, true).unwrap();
+        assert_eq!(processor.parts(), ("la scheda\nfine", String::new()));
     }
 
     #[test]
