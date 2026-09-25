@@ -52,6 +52,31 @@ export function DictationSettings({
         </p>
       </Field>
       <Field>
+        <FieldLabel htmlFor="cleanup">Pulizia locale</FieldLabel>
+        <Select
+          disabled={locked || !settings}
+          value={settings?.cleanup ? "on" : "off"}
+          onValueChange={(value) => {
+            if (settings)
+              void onChange({ ...settings, cleanup: value === "on" });
+          }}
+        >
+          <SelectTrigger id="cleanup" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              <SelectItem value="off">Disattivata</SelectItem>
+              <SelectItem value="on">Riduci false partenze</SelectItem>
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+        <p className="field-hint">
+          Riduce casi come "il la scheda" in italiano. Le ultime 7 parole
+          restano modificabili. Nessuna correzione grammaticale.
+        </p>
+      </Field>
+      <Field>
         <FieldLabel htmlFor="format">Come vuoi il tuo testo</FieldLabel>
         <Select
           disabled={locked || !settings}
@@ -76,7 +101,9 @@ export function DictationSettings({
         <p className="field-hint">
           {settings?.format === "spoken-commands"
             ? "Pronuncia “a capo”, “nuovo paragrafo” o “punto elenco”."
-            : "Conserva le tue parole, con punteggiatura automatica."}
+            : settings?.cleanup
+              ? "Comandi vocali letterali. Pulizia locale attiva."
+              : "Conserva le tue parole, con punteggiatura automatica."}
         </p>
       </Field>
     </FieldGroup>

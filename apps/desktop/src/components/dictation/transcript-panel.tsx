@@ -36,7 +36,7 @@ export function TranscriptPanel({
     state?.finalText ||
     [state?.transcript.confirmed, state?.transcript.partial]
       .filter(Boolean)
-      .join(" ");
+      .join("");
   const words = text?.trim() ? text.trim().split(/\s+/).length : 0;
   const status = state ? phaseLabels[state.phase] : "Collegamento all’app";
   return (
@@ -60,7 +60,6 @@ export function TranscriptPanel({
             {state?.finalText || (
               <>
                 {state?.transcript.confirmed}
-                {state?.transcript.confirmed && " "}
                 <span className="partial-text">
                   {state?.transcript.partial}
                 </span>

@@ -1,4 +1,5 @@
 use crate::audio::SAMPLE_RATE;
+use crate::formatting::{FormatMode, TextProcessor};
 use anyhow::{Result, ensure};
 use parakeet_rs::{Nemotron, NemotronHandle, NemotronMode};
 use serde::{Deserialize, Serialize};
@@ -80,11 +81,9 @@ pub struct Transcript {
 }
 impl Transcript {
     pub fn text(&self) -> String {
-        [self.confirmed.trim(), self.partial.trim()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
+        format!("{}{}", self.confirmed, self.partial)
+            .trim()
+            .to_owned()
     }
 }
 
@@ -94,21 +93,31 @@ pub struct StreamingSession<D: StreamingDecoder> {
     decoder: D,
     pending: VecDeque<f32>,
     transcript: Transcript,
+    processor: TextProcessor,
     silence_samples: usize,
     speech_seen: bool,
 }
 impl<D: StreamingDecoder> StreamingSession<D> {
     pub fn new(decoder: D) -> Self {
+        Self::with_processing(decoder, FormatMode::Faithful, false)
+    }
+    pub fn with_processing(decoder: D, mode: FormatMode, cleanup: bool) -> Self {
         Self {
             decoder,
             pending: VecDeque::new(),
             transcript: Transcript::default(),
+            processor: TextProcessor::new(mode, cleanup),
             silence_samples: 0,
             speech_seen: false,
         }
     }
     pub fn snapshot(&self) -> Transcript {
-        self.transcript.clone()
+        let (confirmed, partial) = self.processor.parts();
+        Transcript {
+            confirmed: confirmed.to_owned(),
+            partial,
+            ..self.transcript.clone()
+        }
     }
     pub fn push(&mut self, samples: &[f32]) -> Result<()> {
         ensure!(!self.transcript.finished, "Session already finished");
@@ -141,18 +150,17 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         self.decoder.feed(samples)?;
         self.transcript.inference_seconds += started.elapsed().as_secs_f64();
         self.transcript.chunks += 1;
-        self.transcript.partial = self.decoder.text();
+        self.processor.update(&self.decoder.text(), false)?;
         if self.silence_samples >= SAMPLE_RATE * 2 {
-            self.commit();
+            self.commit()?;
             self.decoder.reset();
             self.speech_seen = false;
             self.silence_samples = 0;
         }
         Ok(())
     }
-    fn commit(&mut self) {
-        self.transcript.confirmed = self.transcript.text();
-        self.transcript.partial.clear();
+    fn commit(&mut self) -> Result<()> {
+        self.processor.update(&self.decoder.text(), true)
     }
     pub fn finish(&mut self) -> Result<Transcript> {
         if self.transcript.finished {
@@ -177,7 +185,7 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         for _ in 0..3 {
             self.decode(&vec![0.0; size])?;
         }
-        self.commit();
+        self.commit()?;
         self.decoder.reset();
         self.speech_seen = false;
         self.silence_samples = 0;
@@ -280,5 +288,181 @@ mod tests {
         assert!(session.push(&[f32::NAN]).is_err());
         assert_eq!(session.snapshot().audio_seconds, 0.0);
         assert!(session.pending.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod processing_tests {
+    use super::*;
+    use crate::formatting::MUTABLE_WORDS;
+
+    struct Snapshots {
+        updates: VecDeque<&'static str>,
+        current: String,
+        fail: bool,
+    }
+    impl StreamingDecoder for Snapshots {
+        fn chunk_samples(&self) -> usize {
+            8_960
+        }
+        fn feed(&mut self, _: &[f32]) -> Result<()> {
+            ensure!(!self.fail, "test decoder failure");
+            if let Some(text) = self.updates.pop_front() {
+                self.current = text.into();
+            }
+            Ok(())
+        }
+        fn text(&self) -> String {
+            self.current.clone()
+        }
+        fn reset(&mut self) {
+            self.current.clear();
+        }
+    }
+    fn session(
+        updates: &[&'static str],
+        mode: FormatMode,
+        cleanup: bool,
+    ) -> StreamingSession<Snapshots> {
+        StreamingSession::with_processing(
+            Snapshots {
+                updates: updates.iter().copied().collect(),
+                current: String::new(),
+                fail: false,
+            },
+            mode,
+            cleanup,
+        )
+    }
+    fn step(session: &mut StreamingSession<Snapshots>) -> Transcript {
+        session.push(&[0.1; 8_960]).unwrap();
+        assert!(session.processor.buffered_words() <= MUTABLE_WORDS);
+        session.snapshot()
+    }
+
+    #[test]
+    fn real_session_processes_fragmented_words_commands_and_cleanup_before_stop() {
+        let mut session = session(
+            &[
+                "il la sch",
+                "il la sch",
+                "il la scheda a",
+                "il la scheda a cap",
+                "il la scheda a capo ",
+                "il la scheda a capo della dell’acquisizione fine",
+            ],
+            FormatMode::SpokenCommands,
+            true,
+        );
+        assert_eq!(step(&mut session).text(), "la sch");
+        assert_eq!(step(&mut session).text(), "la sch");
+        assert_eq!(step(&mut session).text(), "la scheda a");
+        assert_eq!(step(&mut session).text(), "la scheda a cap");
+        let newline = step(&mut session);
+        assert_eq!(
+            format!("{}{}", newline.confirmed, newline.partial),
+            "la scheda\n"
+        );
+        let live = step(&mut session);
+        assert_eq!(live.text(), "la scheda\ndell’acquisizione fine");
+        let final_text = session.finish().unwrap();
+        assert_eq!(live.text(), final_text.text());
+        assert!(final_text.partial.is_empty());
+        assert_eq!(session.finish().unwrap().text(), final_text.text());
+    }
+
+    #[test]
+    fn real_session_revises_cleanup_dependency_before_finalization() {
+        for (before, after) in [
+            (
+                "di di uno due tre quattro cinque sei ",
+                "di domani uno due tre quattro cinque sei ",
+            ),
+            (
+                "il la uno due tre quattro cinque sei ",
+                "il lo uno due tre quattro cinque sei ",
+            ),
+        ] {
+            let mut session = session(&[before, after], FormatMode::Faithful, true);
+            step(&mut session);
+            assert_eq!(step(&mut session).text(), after.trim());
+            assert_eq!(session.finish().unwrap().text(), after.trim());
+        }
+    }
+
+    #[test]
+    fn opt_off_is_literal_through_pause_resume_silence_and_finalization() {
+        let text = "il la scheda a capo molto molto importante.  Non cambiare 12 12.";
+        let mut session = session(&[text], FormatMode::Faithful, false);
+        assert_eq!(step(&mut session).text(), text);
+        session.flush_utterance().unwrap();
+        assert_eq!(session.snapshot().confirmed, text);
+        session.flush_utterance().unwrap();
+        assert_eq!(session.snapshot().confirmed, text);
+        session
+            .decoder
+            .updates
+            .push_back("quel ragionamento di prima non va bene");
+        step(&mut session);
+        session.push(&[0.0; 8_960 * 4]).unwrap();
+        assert!(session.snapshot().partial.is_empty());
+        let expected = format!("{text} quel ragionamento di prima non va bene");
+        assert_eq!(session.finish().unwrap().text(), expected);
+    }
+
+    #[test]
+    fn commands_remain_atomic_at_release_boundary_and_newlines_survive_pause() {
+        let mut session = session(
+            &[
+                "Prima a",
+                "Prima a capo uno due tre quattro cinque sei sette otto ",
+            ],
+            FormatMode::SpokenCommands,
+            false,
+        );
+        step(&mut session);
+        let live = step(&mut session);
+        assert_eq!(live.confirmed, "Prima\n");
+        assert_eq!(live.partial, "uno due tre quattro cinque sei sette otto");
+        session
+            .decoder
+            .updates
+            .push_back("Prima a capo uno due tre quattro cinque sei sette otto nuovo paragrafo");
+        step(&mut session);
+        session.flush_utterance().unwrap();
+        assert!(session.snapshot().confirmed.ends_with("\n\n"));
+        session.decoder.updates.push_back("punto elenco latte");
+        step(&mut session);
+        assert_eq!(
+            session.finish().unwrap().text(),
+            "Prima\nuno due tre quattro cinque sei sette otto\n\n• latte"
+        );
+    }
+
+    #[test]
+    fn incomplete_commands_flush_literally_and_do_not_join_across_pauses() {
+        let mut session = session(&["testo a"], FormatMode::SpokenCommands, true);
+        step(&mut session);
+        session.flush_utterance().unwrap();
+        session.decoder.updates.push_back("capo");
+        step(&mut session);
+        assert_eq!(session.finish().unwrap().text(), "testo a capo");
+    }
+
+    #[test]
+    fn failure_preserves_processed_preview_and_a_new_session_has_no_old_buffer() {
+        let mut failed = session(
+            &["il la scheda a capo fine"],
+            FormatMode::SpokenCommands,
+            true,
+        );
+        let before = step(&mut failed).text();
+        failed.decoder.fail = true;
+        assert!(failed.push(&[0.1; 8_960]).is_err());
+        assert_eq!(failed.snapshot().text(), before);
+        drop(failed);
+        let mut fresh = session(&["nuova sessione"], FormatMode::Faithful, false);
+        step(&mut fresh);
+        assert_eq!(fresh.finish().unwrap().text(), "nuova sessione");
     }
 }

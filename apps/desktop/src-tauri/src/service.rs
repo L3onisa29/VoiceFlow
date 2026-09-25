@@ -11,7 +11,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use voiceflow_core::{
     audio::StreamingResampler,
-    formatting::format_transcript,
     streaming::{MODEL_FILES, NvidiaDecoder, StreamingSession, Transcript, load_model},
 };
 
@@ -264,7 +263,11 @@ impl Worker {
                 self.active = Some(Active {
                     capture: Some(capture),
                     resampler,
-                    session: StreamingSession::new(decoder),
+                    session: StreamingSession::with_processing(
+                        decoder,
+                        settings.format,
+                        settings.cleanup,
+                    ),
                     emitted: Instant::now(),
                     clock: RecordingClock::new(Instant::now()),
                 });
@@ -375,8 +378,7 @@ impl Worker {
                 return Err(error);
             }
         };
-        let settings = self.snapshot.lock().unwrap().settings.clone();
-        let final_text = format_transcript(&transcript.text(), settings.format);
+        let final_text = transcript.text();
         // Persist before attempting delivery so any failure remains recoverable.
         self.update(|s| {
             s.transcript = transcript;

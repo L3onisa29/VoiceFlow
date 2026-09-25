@@ -4,6 +4,7 @@ import { z } from "zod";
 export const settingsSchema = z.object({
   language: z.enum(["auto", "italian", "english"]),
   format: z.enum(["faithful", "spoken-commands"]),
+  cleanup: z.boolean().default(false),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 export const stateSchema = z.object({

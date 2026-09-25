@@ -34,6 +34,8 @@ across updates built with the same identity.
   finish controls without taking focus from the destination editor.
 - Formatting can preserve the transcript or interpret spoken commands such as
   `a capo`, `nuovo paragrafo`, `punto elenco` and their English equivalents.
+- Optional [local streaming cleanup](docs/streaming-cleanup.md) reduces a small
+  set of Italian false starts in the live preview. It is off by default.
 
 Paste sends Command+V and never submits the destination form. If delivery fails,
 the transcript remains available to copy. T3 Code uses the standard paste path.

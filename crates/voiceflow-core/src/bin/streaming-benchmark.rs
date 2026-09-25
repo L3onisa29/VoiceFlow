@@ -3,6 +3,7 @@ use serde_json::json;
 use std::{env, time::Instant};
 use voiceflow_core::{
     audio::StreamingResampler,
+    formatting::FormatMode,
     streaming::{Language, NvidiaDecoder, StreamingSession, load_model},
 };
 
@@ -10,7 +11,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     ensure!(
         args.len() >= 3,
-        "Usage: streaming-benchmark MODEL_DIRECTORY AUDIO.wav [it|en|auto] [--realtime]"
+        "Usage: streaming-benchmark MODEL_DIRECTORY AUDIO.wav [it|en|auto] [--realtime] [--cleanup] [--spoken-commands]"
     );
     let language = match args.get(3).map(String::as_str).unwrap_or("auto") {
         "it" => Language::Italian,
@@ -19,6 +20,12 @@ fn main() -> Result<()> {
         _ => anyhow::bail!("Language must be it, en or auto"),
     };
     let realtime = args.iter().any(|a| a == "--realtime");
+    let cleanup = args.iter().any(|a| a == "--cleanup");
+    let mode = if args.iter().any(|a| a == "--spoken-commands") {
+        FormatMode::SpokenCommands
+    } else {
+        FormatMode::Faithful
+    };
     let started = Instant::now();
     let model = load_model(std::path::Path::new(&args[1]))?;
     let load_seconds = started.elapsed().as_secs_f64();
@@ -31,7 +38,8 @@ fn main() -> Result<()> {
         "Benchmark input must be mono PCM16 WAV"
     );
     let mut resampler = StreamingResampler::new(spec.sample_rate as usize)?;
-    let mut session = StreamingSession::new(NvidiaDecoder::new(&model, language)?);
+    let mut session =
+        StreamingSession::with_processing(NvidiaDecoder::new(&model, language)?, mode, cleanup);
     let mut first_partial = None;
     let mut first_partial_wall = None;
     let mut last_text = String::new();
@@ -85,7 +93,7 @@ fn main() -> Result<()> {
         "inferenceSeconds":result.inference_seconds, "realTimeFactor":result.inference_seconds/result.audio_seconds.max(0.001),
         "firstPartialAudioSeconds":first_partial, "firstPartialWallSeconds":first_partial_wall,
         "chunkP95Ms":p95, "finalizeMs":stop.elapsed().as_secs_f64()*1000.0,
-        "chunks":result.chunks, "text":result.text(), "paced":realtime});
+        "chunks":result.chunks, "text":result.text(), "paced":realtime, "cleanup":cleanup, "format":mode});
     println!("{output}");
     ensure!(
         first_partial.is_some() && !result.text().is_empty(),
