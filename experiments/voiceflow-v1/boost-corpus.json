@@ -1,0 +1,64 @@
+{
+  "version": "synthetic-boost-v1",
+  "provenance": "Authored text synthesized using macOS say into files only; not personal speech.",
+  "phrases": ["TanStack", "PostgreSQL", "Convex"],
+  "weights": [0, 2, 3],
+  "sessions": [
+    {
+      "id": "bc01",
+      "split": "calibration",
+      "language": "en",
+      "voice": "Samantha",
+      "text": "We use TanStack and PostgreSQL."
+    },
+    {
+      "id": "bc02",
+      "split": "calibration",
+      "language": "it",
+      "voice": "Alice",
+      "text": "Configuro Convex per il progetto."
+    },
+    {
+      "id": "bc03",
+      "split": "calibration",
+      "language": "en",
+      "voice": "Samantha",
+      "text": "The tan stackable box is on the grass."
+    },
+    {
+      "id": "bc04",
+      "split": "calibration",
+      "language": "it",
+      "voice": "Alice",
+      "text": "Marco non chiama Mario."
+    },
+    {
+      "id": "be01",
+      "split": "evaluation",
+      "language": "en",
+      "voice": "Samantha",
+      "text": "Deploy TanStack with Convex today."
+    },
+    {
+      "id": "be02",
+      "split": "evaluation",
+      "language": "it",
+      "voice": "Alice",
+      "text": "Collego PostgreSQL alla scheda numero quattro."
+    },
+    {
+      "id": "be03",
+      "split": "evaluation",
+      "language": "en",
+      "voice": "Samantha",
+      "text": "The complex convex shape is not a stack."
+    },
+    {
+      "id": "be04",
+      "split": "evaluation",
+      "language": "it",
+      "voice": "Alice",
+      "text": "Mario e Marina non cambiano il numero ventidue."
+    }
+  ]
+}

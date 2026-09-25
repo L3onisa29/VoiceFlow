@@ -1,0 +1,218 @@
+{
+  "version": "synthetic-v1",
+  "provenance": "Authored synthetic fixtures. Not personal speech or user evidence.",
+  "rules": [
+    {
+      "variant": "tan stack",
+      "preferred": "TanStack",
+      "proposalSession": "p01"
+    },
+    {
+      "variant": "post grass",
+      "preferred": "PostgreSQL",
+      "proposalSession": "p02"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "p01",
+      "split": "proposal",
+      "language": "it",
+      "tags": ["terminology"],
+      "input": "Uso tan stack oggi.",
+      "truth": "Uso TanStack oggi."
+    },
+    {
+      "id": "p02",
+      "split": "proposal",
+      "language": "en",
+      "tags": ["terminology"],
+      "input": "Install post grass locally.",
+      "truth": "Install PostgreSQL locally."
+    },
+    {
+      "id": "p03",
+      "split": "proposal",
+      "language": "it",
+      "tags": ["cleanup"],
+      "input": "il la scheda funziona",
+      "truth": "la scheda funziona"
+    },
+    {
+      "id": "p04",
+      "split": "proposal",
+      "language": "it",
+      "tags": ["cleanup"],
+      "input": "della dell’acquisizione",
+      "truth": "dell’acquisizione"
+    },
+    {
+      "id": "c01",
+      "split": "calibration",
+      "language": "it",
+      "tags": ["combined"],
+      "input": "il la scheda usa tan stack",
+      "truth": "la scheda usa TanStack"
+    },
+    {
+      "id": "c02",
+      "split": "calibration",
+      "language": "en",
+      "tags": ["terminology"],
+      "input": "Connect post grass now",
+      "truth": "Connect PostgreSQL now"
+    },
+    {
+      "id": "c03",
+      "split": "calibration",
+      "language": "it",
+      "tags": ["correct", "negation"],
+      "input": "non cambiare Marco e Mario",
+      "truth": "non cambiare Marco e Mario"
+    },
+    {
+      "id": "c04",
+      "split": "calibration",
+      "language": "it",
+      "tags": ["correct", "repetition"],
+      "input": "molto molto importante",
+      "truth": "molto molto importante"
+    },
+    {
+      "id": "e01",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["terminology"],
+      "input": "Configuro tan stack per il progetto",
+      "truth": "Configuro TanStack per il progetto"
+    },
+    {
+      "id": "e02",
+      "split": "evaluation",
+      "language": "en",
+      "tags": ["terminology"],
+      "input": "We deploy post grass today",
+      "truth": "We deploy PostgreSQL today"
+    },
+    {
+      "id": "e03",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["cleanup"],
+      "input": "il la scheda è pronta",
+      "truth": "la scheda è pronta"
+    },
+    {
+      "id": "e04",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["combined"],
+      "input": "il la scheda collega post grass",
+      "truth": "la scheda collega PostgreSQL"
+    },
+    {
+      "id": "e05",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["negation", "correct"],
+      "input": "quel ragionamento di prima non va bene",
+      "truth": "quel ragionamento di prima non va bene"
+    },
+    {
+      "id": "e06",
+      "split": "evaluation",
+      "language": "en",
+      "tags": ["negation", "correct"],
+      "input": "Do not delete the second backup",
+      "truth": "Do not delete the second backup"
+    },
+    {
+      "id": "e07",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["repetition", "correct"],
+      "input": "molto molto importante ripeto molto molto importante",
+      "truth": "molto molto importante ripeto molto molto importante"
+    },
+    {
+      "id": "e08",
+      "split": "evaluation",
+      "language": "en",
+      "tags": ["repetition", "correct"],
+      "input": "very very important and no no no",
+      "truth": "very very important and no no no"
+    },
+    {
+      "id": "e09",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["names", "correct"],
+      "input": "Marco Mario Maria e Marina arrivano domani",
+      "truth": "Marco Mario Maria e Marina arrivano domani"
+    },
+    {
+      "id": "e10",
+      "split": "evaluation",
+      "language": "en",
+      "tags": ["similar", "correct"],
+      "input": "The tan stackable box is beside the grass",
+      "truth": "The tan stackable box is beside the grass"
+    },
+    {
+      "id": "e11",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["numbers", "correct"],
+      "input": "Ordine 42 costa 19,95 euro versione 3.5",
+      "truth": "Ordine 42 costa 19,95 euro versione 3.5"
+    },
+    {
+      "id": "e12",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["commands"],
+      "input": "ciao a capo mondo",
+      "truth": "ciao\nmondo"
+    },
+    {
+      "id": "e13",
+      "split": "evaluation",
+      "language": "en",
+      "tags": ["commands"],
+      "input": "hello new line world",
+      "truth": "hello\nworld"
+    },
+    {
+      "id": "e14",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["markers", "fragmentation"],
+      "input": "ciao <unk> mondo",
+      "truth": "ciao mondo",
+      "snapshots": [
+        "ciao <u",
+        "ciao <unk",
+        "ciao <unk> mon",
+        "ciao <unk> mondo"
+      ]
+    },
+    {
+      "id": "e15",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["revision", "terminology"],
+      "input": "uso tan stack oggi",
+      "truth": "uso TanStack oggi",
+      "snapshots": ["uso tan stacco", "uso tan stack oggi"]
+    },
+    {
+      "id": "e16",
+      "split": "evaluation",
+      "language": "it",
+      "tags": ["long", "correct", "negation", "repetition"],
+      "input": "non cancellare 42 elementi molto molto importanti",
+      "truth": "non cancellare 42 elementi molto molto importanti",
+      "repeat": 128
+    }
+  ]
+}

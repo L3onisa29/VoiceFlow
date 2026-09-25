@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "REPLACE_WITH_SELECTED_SESSION_ID",
+  "split": "evaluation",
+  "source": "user-confirmed-text-only",
+  "originalAsr": "REPLACE_WITH_ORIGINAL_ASR",
+  "processedText": "REPLACE_WITH_SAVED_PROCESSED_TEXT",
+  "confirmedTruth": "REPLACE_WITH_PERSON_VERIFIED_INTENDED_TEXT",
+  "confirmedAt": "REPLACE_WITH_ISO_8601_TIME",
+  "correctionCategory": "asr-error",
+  "language": "it",
+  "selectedGroupIds": [],
+  "modelVersion": "REPLACE_WITH_EXACT_MODEL_ID_AND_ARTIFACT_HASHES",
+  "dictionaryVersion": "REPLACE_WITH_SAVED_VERSION",
+  "cleanupVersion": "REPLACE_WITH_SAVED_VERSION",
+  "formatMode": "spoken-commands",
+  "cleanupEnabled": true,
+  "audioStored": false
+}

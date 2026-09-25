@@ -22,9 +22,9 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | C1 | VF-04 catalogo | Verifica manuale pendente | `d501551`; seconda verifica passata dopo riparazione |
 | C2 | VF-05 suggerimenti | Verifica manuale pendente | `60cdfbd`; seconda verifica passata |
 | D1 | VF-06 analisi | Verifica manuale pendente | `6c5f2ae`; seconda verifica passata |
-| D2 | VF-07 scheduler | Verifica manuale pendente | Verifica indipendente passata; commit in preparazione |
-| E | VF-09 boosting | Da iniziare | |
-| Trasversale | VF-08 qualità | Da iniziare | Fixture distinte da parlato personale |
+| D2 | VF-07 scheduler | Verifica manuale pendente | `36e8883`; verifica indipendente passata |
+| E | VF-09 boosting | Completato con esito negativo sul beneficio | Verifica indipendente passata; runtime ONNX conservato |
+| Trasversale | VF-08 qualità | Verifica personale pendente | Corpus sintetico e misure verificati indipendentemente |
 
 ## Verifiche e problemi
 
@@ -127,3 +127,34 @@ D2, matrice dell’implementatore: workspace 163 passati/4 ignorati e UI schedul
 D2 pronto per revisione: [report](../verification/voiceflow-v1-d2.md), [guida e protocollo](../analysis-scheduler.md). Matrice finale 163/4 Rust, fmt/clippy, typecheck/build UI, firma 4/runtime 3, UI 5/7/7/6. Helper release arm64 compilato e avviato due volte su directory temporanea OFF: nessuno storico o provider creato. Pulizia scratch dopo crash coperta dai test. Verifica grafica a 1060×760 e minimo desktop 780×620. Limite dichiarato: sospensione simultanea dei tre controllori può oltrepassare la preemption; la dettatura procede con avviso dopo attesa limitata e conserva l’intenzione. Nessun guasto singolo testato presenta tale degrado. Nuovo revisore in sola lettura avviato.
 
 Verifica indipendente D2: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`, nessun blocco. Ripetuti 163/4 Rust, fmt/clippy, helper release, typecheck/UI build, firma 4/runtime 3, UI scheduler/analisi/storico/suggerimenti/dizionario 5/7/7/6/6 e manifest. Probe indipendenti sul vero helper release con provider finto e HOME/CODEX_HOME temporanee: kill dei controllori, figli orfani, storico occupato, scheduler corrotto, rilascio dei permessi, pulizia scratch e limiti reali di retry passati. Acquisizione cattura 0–281 ms nei guasti singoli provati, senza degrado. Tutti i processi fixture terminati. Restano LaunchAgent/CLI/WebView/audio reali e firma finale; E può procedere. MSRV 1.88 non eseguita, controlli su Rust 1.97.1.
+
+### E / VF-09 e VF-08
+
+Esperimento avviato dopo il commit D2 `36e8883`. L’implementatore ha scaricato e verificato il digest dell’archivio CPU macOS ufficiale v0.1.0; header e librerie della API C sono disponibili. Modello GGUF Q8 vincolato a revisione e SHA-256, download in corso. Preparazione di harness nativo separato dal prodotto e corpus sintetico di 24 sessioni con partizioni distinte. Nessun cambio del decoder dell’app, server o audio dal vivo.
+
+E pronto per verifica: [report VF-08/VF-09](../verification/voiceflow-v1-e.md) e [riproduzione](../../experiments/voiceflow-v1/README.md). Corpus 24 sessioni diviso 4/4/16: residui off/terminologia/pulizia/combinazione 16/4/12/0, nessuna modifica falsa nelle fixture. Native C ABI compilata ed eseguita su M1, modello e runtime verificati. Calibrazione 0/2/3 pari a 9 errori, peso positivo 2 fissato prima della valutazione. Audio heldout 4 sessioni/27 parole: ONNX 5, ONNX+correzioni 5, nativo senza boost 9, boost 9, nativo+correzioni 7 e combinazione 7. Campione italiano vuoto riprodotto nella CLI ufficiale e conteggiato. Decisione proposta: mantenere ONNX; niente boosting nel prodotto. Workspace 165/4, fmt/clippy/scoring/compilazione C++/manifest passati. Nuovo revisore indipendente avviato.
+
+Verifica indipendente E/VF-08: controlli automatici passati, valutazione personale pendente. Nuove inferenze native e ONNX riproducono esattamente gli errori riportati; calibrazione resta 9/9/9, peso invariato. Campione vuoto e finale unico riprodotti nella CLI ufficiale. Probe aggiuntivi su scoring, output mancante/duplicato, partizioni e provenienza passati. Hash runtime/modello/WAV/ONNX e manifest verificati. Workspace 165/4, fmt/clippy/compilazione C++ e benchmark passati; processore 22–44 ms senza anteprima e 58–449 ms con anteprima, limiti 7/15. VF-09 concluso nel perimetro sperimentale; nessun boosting introdotto nel prodotto. Un refuso non bloccante nel report viene corretto separatamente: la sessione lunga contiene 896 parole, non 1.024; fixture immutata. Build firmata e verifica integrata ancora da eseguire.
+
+## Verifica integrata finale
+
+Avviata in un nuovo contesto indipendente in sola lettura dei sorgenti. Comprende matrice Rust/TypeScript/UI, build macOS firmata di app e helper, verifica dell’identità stabile, contenuto del bundle, confronto con il processo aperto e integrità dei riferimenti. La correzione documentale E a 896 parole è stata applicata separatamente; corpus e codice invariati. Build e test includono il lavoro concorrente SQLite presente nel checkout, che resta escluso dai nostri commit. Nessuna prova manuale pendente viene assorbita dal successo della build.
+
+Esito integrato: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`, nessun blocco. Verificati HEAD `36e8883` con sorgenti E e modifiche SQLite esterne presenti nel checkout. Matrice finale: Rust 165 passati/4 ignorati; fmt/clippy; TypeScript/UI build; firma 4/runtime 3; UI storico/dizionario/suggerimenti/analisi/scheduler 7/6/6/7/5. Manifest 4/4 e diff passati. E ricalcolato: risultati identici esclusi i tempi; correzione a 896 parole verificata. Hash dei sorgenti E acquisiti per la verifica finale in `artifacts/final-verification/e-source-before.sha256`.
+
+`pnpm desktop:build` passato. Bundle `target/release/bundle/macos/VoiceFlow.app`, circa 29 MiB, due eseguibili arm64 con hardened runtime e identità di firma salvata. Requirement designato dell’app invariato. Firma app deep/strict e helper strict valide. App ID `com.voiceflow.desktop`, CDHash `e57bc512d7360daa9d6bee9d0bd25ce6ac7f5b0d`; helper ID `com.voiceflow.desktop.analysis`, CDHash `daabe81b44abb256bc9dfc8fe1c85445db3bc774`. Entitlement audio atteso solo sull’app; nessun modello, benchmark o runtime sperimentale incluso. Helper del bundle avviato due volte su directory temporanea OFF, 02:30–06:00, idle: nessuno storico, dizionario o provider creato.
+
+Il processo PID 84236 mappa ancora inode `200504025`; il nuovo eseguibile del bundle ha inode `200756700`. `desktop:verify-runtime` termina correttamente con codice 1 e segnala processo obsoleto. Nessun riavvio eseguito: questo non risolve né chiude la segnalazione reale dei marcatori.
+
+## Stato finale e prove ancora pendenti
+
+Implementazione A–D e verifiche automatiche concluse, esperimento E concluso senza integrazione del boosting. Il piano complessivo resta in **verifica manuale pendente**. Restano da eseguire:
+
+- Riapertura del bundle firmato e prova reale di nuova dettatura, anteprima, pausa/ripresa, stop, copia/incolla e storico, compresa la segnalazione `<unk>`.
+- Flussi nativi di correzione, gruppi, approvazione/disattivazione/ripristino dei suggerimenti e snapshot della sessione.
+- LaunchAgent e Codex reali dopo consenso esplicito nell’app, inclusa preemption durante una prova audio autorizzata.
+- Corpus personale VF-08 e qualità/latenza dell’intera dettatura. Le fixture e l’audio sintetico non li sostituiscono.
+
+Node 24.18.0, pnpm 11.5.0, Rust/Cargo 1.97.1. MSRV dichiarata 1.88 non eseguita. Warning chunk UI di circa 669 kB non bloccante. Limite operativo documentato: sospensione simultanea di tutti e tre i controllori dello scheduler può superare la preemption; la dettatura prosegue con avviso dopo attesa limitata. Nessun difetto bloccante rimasto nelle verifiche indipendenti.
+
+Riferimenti congelati invariati. Lavoro concorrente alle impostazioni SQLite conservato fuori dai nostri commit; build e test comprendono quelle modifiche. Nessun push, PR o worktree.
