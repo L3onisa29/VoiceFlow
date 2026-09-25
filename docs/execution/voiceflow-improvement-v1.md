@@ -23,7 +23,7 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | C2 | VF-05 suggerimenti | Verifica manuale pendente | `60cdfbd`; seconda verifica passata |
 | D1 | VF-06 analisi | Verifica manuale pendente | `6c5f2ae`; seconda verifica passata |
 | D2 | VF-07 scheduler | Verifica manuale pendente | `36e8883`; verifica indipendente passata |
-| E | VF-09 boosting | Completato con esito negativo sul beneficio | Verifica indipendente passata; runtime ONNX conservato |
+| E | VF-09 boosting | Completato con esito negativo sul beneficio | `ac02231`; verifica indipendente passata, ONNX conservato |
 | Trasversale | VF-08 qualità | Verifica personale pendente | Corpus sintetico e misure verificati indipendentemente |
 
 ## Verifiche e problemi
@@ -158,3 +158,5 @@ Implementazione A–D e verifiche automatiche concluse, esperimento E concluso s
 Node 24.18.0, pnpm 11.5.0, Rust/Cargo 1.97.1. MSRV dichiarata 1.88 non eseguita. Warning chunk UI di circa 669 kB non bloccante. Limite operativo documentato: sospensione simultanea di tutti e tre i controllori dello scheduler può superare la preemption; la dettatura prosegue con avviso dopo attesa limitata. Nessun difetto bloccante rimasto nelle verifiche indipendenti.
 
 Riferimenti congelati invariati. Lavoro concorrente alle impostazioni SQLite conservato fuori dai nostri commit; build e test comprendono quelle modifiche. Nessun push, PR o worktree.
+
+Commit sperimentale finale: `ac02231b8bfa351369c92b02f97086f34a906748`. Sorgenti verificati senza cambi funzionali successivi alla build; questo registro è aggiornato in un commit documentale conclusivo. Nel working tree restano soltanto i quattro file del lavoro concorrente, esclusi dai commit di esecuzione.
