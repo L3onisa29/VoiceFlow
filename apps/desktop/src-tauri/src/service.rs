@@ -1,10 +1,10 @@
 use crate::{
     capture::Capture,
-    history::{CompletedDictation, HistoryStore},
+    history::{CompletedDictation, HistoryStore, ProcessingMetadata},
     platform,
     settings::Settings,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded, select_biased, tick};
 use serde::Serialize;
 use std::{
@@ -131,6 +131,8 @@ struct Active {
     session: StreamingSession<NvidiaDecoder>,
     emitted: Instant,
     clock: RecordingClock,
+    language: String,
+    processing: ProcessingMetadata,
 }
 struct Worker {
     app: AppHandle,
@@ -257,6 +259,7 @@ impl Worker {
                     .as_ref()
                     .ok_or_else(|| anyhow!("Carica prima il modello NVIDIA"))?;
                 let settings = self.snapshot.lock().unwrap().settings.clone();
+                let processing = processing_metadata(&settings)?;
                 self.update(|s| {
                     s.phase = "loading".into();
                     s.message = None;
@@ -297,6 +300,8 @@ impl Worker {
                     ),
                     emitted: Instant::now(),
                     clock: RecordingClock::new(Instant::now()),
+                    language: settings.language.code().into(),
+                    processing,
                 });
             }
             Command::Stop => return self.stop(),
@@ -426,14 +431,14 @@ impl Worker {
         if self.take_cancellation() {
             return Ok(());
         }
-        let settings = self.snapshot.lock().unwrap().settings.clone();
-        let language = settings.language.code();
         let history_error = self.history.record(&CompletedDictation {
             session_key: &active.session_key,
             created_at: active.created_at,
             text: &final_text,
             duration_seconds: active.clock.elapsed(Instant::now()).as_secs_f64(),
-            language,
+            language: &active.language,
+            original_asr: active.session.original_utterances(),
+            processing: Some(&active.processing),
         }).err().map(|error| format!("Trascrizione non salvata nello storico: {error:#}. Puoi recuperarla con Copia testo."));
         self.update(|s| s.history_error = history_error);
         let _ = self.app.emit("history-changed", ());
@@ -445,6 +450,30 @@ impl Worker {
         });
         Ok(())
     }
+}
+
+pub(crate) fn processing_metadata(settings: &Settings) -> Result<ProcessingMetadata> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../models/nemotron-manifest.json"))?;
+    Ok(ProcessingMetadata {
+        model_id: voiceflow_core::streaming::MODEL_ID.into(),
+        model_revision: manifest["revision"]
+            .as_str()
+            .context("Revisione modello mancante")?
+            .into(),
+        model_provenance: "download-manifest; runtime files not rehashed".into(),
+        decoder_version: "parakeet-rs/0.3.8; preroll-v1".into(),
+        processor_version: "voiceflow-text-v1".into(),
+        format: match settings.format {
+            voiceflow_core::formatting::FormatMode::Faithful => "faithful",
+            voiceflow_core::formatting::FormatMode::SpokenCommands => "spoken-commands",
+        }
+        .into(),
+        cleanup: settings.cleanup,
+        groups: Vec::new(),
+        dictionary_version: None,
+        cleanup_version: "builtin-v1".into(),
+    })
 }
 impl Active {
     fn drain(&mut self, cancellation: &Receiver<()>) -> Result<()> {
@@ -628,6 +657,12 @@ mod tests {
                             text,
                             duration_seconds: 1.0,
                             language: "it",
+                            original_asr: if session_key == "new" {
+                                session.original_utterances()
+                            } else {
+                                None
+                            },
+                            processing: None,
                         })
                         .unwrap();
                 }
@@ -635,6 +670,10 @@ mod tests {
                 let reopened = HistoryStore::new(path.clone());
                 assert_eq!(reopened.text(1).unwrap(), "vecchio <unk> testo");
                 assert_eq!(reopened.text(2).unwrap(), final_text);
+                assert_eq!(
+                    reopened.detail(2).unwrap().original_asr.as_deref(),
+                    session.original_utterances()
+                );
                 std::fs::remove_file(path).unwrap();
             }
         }
@@ -689,11 +728,17 @@ mod tests {
                 text: &text,
                 duration_seconds: transcript.audio_seconds,
                 language: "it-IT",
+                original_asr: session.original_utterances(),
+                processing: None,
             };
             store.record(&entry).unwrap();
             store.record(&entry).unwrap();
             assert_eq!(store.text(1).unwrap(), "testo precedente coda completa");
             assert!(store.text(2).is_err(), "Stop duplicated the stored session");
+            assert_eq!(
+                store.detail(1).unwrap().original_asr.unwrap(),
+                ["testo precedente", "coda completa"]
+            );
             std::fs::remove_file(path).unwrap();
         }
     }

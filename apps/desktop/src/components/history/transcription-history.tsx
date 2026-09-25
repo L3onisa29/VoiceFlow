@@ -28,7 +28,6 @@ import {
   DialogHeader,
   DialogTitle,
   DialogDescription,
-  DialogFooter,
 } from "@/components/ui/dialog";
 import {
   Empty,
@@ -39,7 +38,7 @@ import {
 } from "@/components/ui/empty";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { HistoryEditor } from "@/components/history/history-editor";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useHistory } from "@/hooks/use-history";
@@ -334,13 +333,14 @@ export function TranscriptionHistory({
       <Dialog
         open={selected !== null}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !busy) {
             setSelected(null);
             setActionError(null);
           }
         }}
       >
         <DialogContent
+          className="sm:max-w-2xl"
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             returnFocus();
@@ -353,31 +353,14 @@ export function TranscriptionHistory({
                 `${date.format(selected.createdAt)} · ${selected.wordCount} parole · ${formatDuration(selected.durationSeconds)}`}
             </DialogDescription>
           </DialogHeader>
-          <ScrollArea
-            className="h-64"
-            viewportProps={{
-              tabIndex: 0,
-              "aria-label": "Testo della trascrizione",
-            }}
-          >
-            <p className="whitespace-pre-wrap wrap-anywhere pr-4 text-sm leading-relaxed">
-              {selected?.text}
-            </p>
-          </ScrollArea>
-          {actionError && (
-            <Alert variant="destructive">
-              <AlertDescription>{actionError}</AlertDescription>
-            </Alert>
+          {selected && (
+            <HistoryEditor
+              key={selected.id}
+              id={selected.id}
+              onChanged={refresh}
+              onBusy={setBusy}
+            />
           )}
-          <DialogFooter>
-            <Button
-              disabled={busy || !selected}
-              onClick={() => selected && void copy(selected.id)}
-            >
-              <Copy data-icon="inline-start" />
-              {copied === selected?.id ? "Copiato" : "Copia testo"}
-            </Button>
-          </DialogFooter>
         </DialogContent>
       </Dialog>
       <AlertDialog
@@ -398,9 +381,10 @@ export function TranscriptionHistory({
           <AlertDialogHeader>
             <AlertDialogTitle>Eliminare la trascrizione?</AlertDialogTitle>
             <AlertDialogDescription>
-              Il testo verrà rimosso da questo Mac. Anche i suoi conteggi
-              saranno rimossi dalle statistiche. L'operazione non può essere
-              annullata.
+              Originale, risultato, revisioni ed esempi ricordati verranno
+              rimossi da questo archivio locale insieme ai conteggi. Eventuali
+              testi già inviati a servizi esterni non vengono cancellati da quei
+              servizi. L'operazione non può essere annullata.
             </AlertDialogDescription>
           </AlertDialogHeader>
           {actionError && (

@@ -121,6 +121,7 @@ pub struct StreamingSession<D: StreamingDecoder> {
     processor: TextProcessor,
     silence_samples: usize,
     speech_seen: bool,
+    original_utterances: Vec<String>,
 }
 impl<D: StreamingDecoder> StreamingSession<D> {
     pub fn new(decoder: D) -> Self {
@@ -134,6 +135,7 @@ impl<D: StreamingDecoder> StreamingSession<D> {
             processor: TextProcessor::new(mode, cleanup),
             silence_samples: 0,
             speech_seen: false,
+            original_utterances: Vec::new(),
         }
     }
     pub fn snapshot(&self) -> Transcript {
@@ -185,7 +187,21 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         Ok(())
     }
     fn commit(&mut self) -> Result<()> {
-        self.processor.update(&self.decoder.text(), true)
+        let original = self.decoder.text();
+        self.processor.update(&original, true)?;
+        // A decoder snapshot replaces its own revisable utterance. Retain only
+        // the final snapshot before reset, never intermediate hypotheses.
+        if self.speech_seen {
+            self.original_utterances.push(original);
+        }
+        Ok(())
+    }
+    /// Exact ASR snapshots at utterance boundaries, including markers/commands.
+    /// Available for persistence only after successful finalization.
+    pub fn original_utterances(&self) -> Option<&[String]> {
+        self.transcript
+            .finished
+            .then_some(&self.original_utterances)
     }
     pub fn finish(&mut self) -> Result<Transcript> {
         if self.transcript.finished {
@@ -363,6 +379,60 @@ mod processing_tests {
         session.push(&[0.1; 8_960]).unwrap();
         assert!(session.processor.buffered_words() <= MUTABLE_WORDS);
         session.snapshot()
+    }
+
+    #[test]
+    fn original_asr_keeps_final_revised_utterances_before_processing() {
+        let mut session = session(
+            &["<unk> la sch", "<unk> il la scheda a capo fine"],
+            FormatMode::SpokenCommands,
+            true,
+        );
+        step(&mut session);
+        assert!(session.original_utterances().is_none());
+        step(&mut session);
+        session.flush_utterance().unwrap();
+        session.flush_utterance().unwrap();
+        session
+            .decoder
+            .updates
+            .push_back("molto molto importante non 42");
+        step(&mut session);
+        let final_text = session.finish().unwrap().text();
+        assert!(!final_text.contains("<unk>"));
+        assert!(final_text.contains("la scheda\nfine"));
+        let expected = [
+            "<unk> il la scheda a capo fine",
+            "molto molto importante non 42",
+        ];
+        assert_eq!(session.original_utterances().unwrap(), expected);
+        session.finish().unwrap();
+        assert_eq!(session.original_utterances().unwrap(), expected);
+    }
+
+    #[test]
+    fn silence_reset_and_empty_pause_never_duplicate_original_asr() {
+        let mut session = session(&["prima"], FormatMode::Faithful, false);
+        session.flush_utterance().unwrap();
+        step(&mut session);
+        session.push(&[0.0; 8_960 * 5]).unwrap();
+        session.flush_utterance().unwrap();
+        session.decoder.updates.push_back("seconda");
+        step(&mut session);
+        session.finish().unwrap();
+        assert_eq!(session.original_utterances().unwrap(), ["prima", "seconda"]);
+    }
+
+    #[test]
+    fn failure_has_no_completed_original_and_new_session_has_no_old_original() {
+        let mut failed = session(&["errore"], FormatMode::Faithful, false);
+        step(&mut failed);
+        failed.decoder.fail = true;
+        assert!(failed.finish().is_err());
+        assert!(failed.original_utterances().is_none());
+        let mut fresh = session(&[], FormatMode::Faithful, false);
+        fresh.finish().unwrap();
+        assert!(fresh.original_utterances().unwrap().is_empty());
     }
 
     #[test]

@@ -120,7 +120,11 @@ pub fn run() {
             dictionary::dictionary_delete_group,
             history::history_page,
             history::history_copy,
-            history::history_delete
+            history::history_delete,
+            history::history_detail,
+            history::history_edit,
+            history::history_undo,
+            history::history_remember
         ])
         .setup(|app| {
             let data = app
