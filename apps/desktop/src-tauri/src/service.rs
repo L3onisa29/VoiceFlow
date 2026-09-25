@@ -259,7 +259,7 @@ impl Worker {
                     .as_ref()
                     .ok_or_else(|| anyhow!("Carica prima il modello NVIDIA"))?;
                 let settings = self.snapshot.lock().unwrap().settings.clone();
-                let (processing, dictionary, dictionary_warning) = processing_snapshot(
+                let (mut processing, dictionary, dictionary_warning) = processing_snapshot(
                     &settings,
                     &self.app.state::<crate::dictionary::DictionaryStore>(),
                 )?;
@@ -291,17 +291,19 @@ impl Worker {
                     s.level = 0.0;
                 });
                 let started = SystemTime::now().duration_since(UNIX_EPOCH)?;
+                let session = StreamingSession::with_dictionary(
+                    decoder,
+                    settings.format,
+                    settings.cleanup,
+                    dictionary,
+                );
+                processing.cleanup_version = session.cleanup_version().into();
                 self.active = Some(Active {
                     session_key: format!("{}-{}", std::process::id(), started.as_nanos()),
                     created_at: started.as_millis() as i64,
                     capture: Some(capture),
                     resampler,
-                    session: StreamingSession::with_dictionary(
-                        decoder,
-                        settings.format,
-                        settings.cleanup,
-                        dictionary,
-                    ),
+                    session,
                     emitted: Instant::now(),
                     clock: RecordingClock::new(Instant::now()),
                     language: settings.language.code().into(),
@@ -492,7 +494,7 @@ pub(crate) fn processing_metadata(settings: &Settings) -> Result<ProcessingMetad
             .into(),
         model_provenance: "download-manifest; runtime files not rehashed".into(),
         decoder_version: "parakeet-rs/0.3.8; preroll-v1".into(),
-        processor_version: "voiceflow-text-v2".into(),
+        processor_version: "voiceflow-text-v3".into(),
         format: match settings.format {
             voiceflow_core::formatting::FormatMode::Faithful => "faithful",
             voiceflow_core::formatting::FormatMode::SpokenCommands => "spoken-commands",
@@ -501,7 +503,7 @@ pub(crate) fn processing_metadata(settings: &Settings) -> Result<ProcessingMetad
         cleanup: settings.cleanup,
         groups: Vec::new(),
         dictionary_version: None,
-        cleanup_version: "builtin-v1".into(),
+        cleanup_version: voiceflow_core::cleanup::BUILTIN_VERSION.into(),
     })
 }
 impl Active {

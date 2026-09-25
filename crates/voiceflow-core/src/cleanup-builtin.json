@@ -1,0 +1,538 @@
+{
+  "schemaVersion": 1,
+  "version": "cleanup-catalog-v1:builtin-1",
+  "rules": [
+    {
+      "id": "it-article-restart",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "remove-false-start",
+        "source": [
+          "il",
+          "la"
+        ]
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "il la scheda",
+          "output": "la scheda"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "il, la scheda",
+          "output": "il, la scheda"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-il",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "il"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "il il",
+          "output": "il"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "il, il",
+          "output": "il, il"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-lo",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "lo"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "lo lo",
+          "output": "lo"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "lo, lo",
+          "output": "lo, lo"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-la",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "la"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "la la",
+          "output": "la"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "la, la",
+          "output": "la, la"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-gli",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "gli"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "gli gli",
+          "output": "gli"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "gli, gli",
+          "output": "gli, gli"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-le",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "le"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "le le",
+          "output": "le"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "le, le",
+          "output": "le, le"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-un",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "un"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "un un",
+          "output": "un"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "un, un",
+          "output": "un, un"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-una",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "una"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "una una",
+          "output": "una"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "una, una",
+          "output": "una, una"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-di",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "di"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "di di",
+          "output": "di"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "di, di",
+          "output": "di, di"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-del",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "del"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "del del",
+          "output": "del"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "del, del",
+          "output": "del, del"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-della",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "della"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "della della",
+          "output": "della"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "della, della",
+          "output": "della, della"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-dello",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "dello"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "dello dello",
+          "output": "dello"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "dello, dello",
+          "output": "dello, dello"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-dei",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "dei"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "dei dei",
+          "output": "dei"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "dei, dei",
+          "output": "dei, dei"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-degli",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "degli"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "degli degli",
+          "output": "degli"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "degli, degli",
+          "output": "degli, degli"
+        }
+      ]
+    },
+    {
+      "id": "it-repeat-delle",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "repeat",
+        "word": "delle"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "delle delle",
+          "output": "delle"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "delle, delle",
+          "output": "delle, delle"
+        }
+      ]
+    },
+    {
+      "id": "it-elision-1",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "elision",
+        "first": "della",
+        "prefix": "dell'"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "della dell'acquisizione",
+          "output": "dell'acquisizione"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "della dell'Anna",
+          "output": "della dell'Anna"
+        }
+      ]
+    },
+    {
+      "id": "it-elision-2",
+      "version": 1,
+      "language": "*",
+      "operation": {
+        "kind": "elision",
+        "first": "della",
+        "prefix": "dell’"
+      },
+      "context": {
+        "before": null,
+        "after": null,
+        "exceptBefore": [],
+        "exceptAfter": []
+      },
+      "provenance": {
+        "source": "voiceflow-builtin-v1; legacy lowercase Italian forms",
+        "evidenceIds": []
+      },
+      "positiveExamples": [
+        {
+          "input": "della dell’acquisizione",
+          "output": "dell’acquisizione"
+        }
+      ],
+      "negativeExamples": [
+        {
+          "input": "della dell’Anna",
+          "output": "della dell’Anna"
+        }
+      ]
+    }
+  ]
+}

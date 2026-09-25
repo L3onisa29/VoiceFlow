@@ -1,4 +1,4 @@
-# Streaming text cleanup, first version
+# Streaming text cleanup and declarative catalog
 
 The desktop settings include **Pulizia locale**, off by default. Existing settings
 files without `cleanup` load with it off. Settings cannot change during a recording
@@ -12,8 +12,8 @@ multiple updates. An unfinished marker is hidden in the preview; an unmatched
 offsets and processes only the mutable tail. Ordinary text spacing is preserved;
 a standalone marker and its leading separator are discarded.
 
-The core keeps seven complete raw words mutable, plus the unfinished word. It
-also retains at most one preceding word with frozen source text. That word's
+The core keeps seven complete raw words mutable, plus the unfinished word. With
+only builtin cleanup, it also retains at most one preceding word with frozen source text. That word's
 rendering can still depend on the first mutable word: for example, revising
 `di di` to `di domani` must restore the first `di`. Once both source words leave
 the mutable window, their deletion or command can commit. Repeated false starts
@@ -35,8 +35,9 @@ It preserves the surviving spelling and punctuation. A punctuation mark after
 the first word or a line break between words blocks cleanup. Uppercase names,
 numbers, `un uno`, `che che`, `the The`, `molto molto importante`, negation and
 `quel ragionamento di prima non va bene` remain literal. `la dispositivo` stays
-as dictated. There is no English cleanup rule, grammar correction, semantic
-rewrite, dictionary, word boosting or additional model. Even a small whitelist
+as dictated. The builtin catalog has no English cleanup rule, grammar correction or semantic
+rewrite. The B2 terminology dictionary is separate. Cleanup adds no word boosting
+or additional model. Even a small whitelist
 can remove an intentional lowercase repetition; leave cleanup off when literal
 word preservation matters.
 
@@ -63,6 +64,46 @@ bounded by word count, not byte count. The accumulated transcript, ASR token
 history and UI snapshots still grow with the session. Only local rule checks
 operate on the bounded tail. Processing
 runs in the existing inference worker and adds no thread or audio queue.
+
+## Declarative catalog and session snapshots
+
+The 17 existing cleanup rules are data in `cleanup-builtin.json`. Their catalog
+version is `cleanup-catalog-v1:builtin-1`. They retain the exact previous behavior,
+including lowercase Italian matching regardless of the decoder language setting.
+No new learned rule activates automatically.
+
+The core accepts a separate immutable cleanup catalog through
+`TextProcessor::with_rules` and `StreamingSession::with_rules`. It supports exact
+false-start phrases of 2–7 words that delete only the first source word, the
+existing function-word repeat whitelist, and the existing apostrophe-prefix
+family. Every rule includes version, language, adjacent conditions/exceptions,
+provenance and checked positive/negative examples. Unknown operations, executable
+code, regex, generic repeated-word deletion and dependencies exceeding seven
+words are rejected. The limit is 256 rules including builtins. Each rule's examples
+validate that rule in isolation; publication must also check combined behavior.
+
+Commands take precedence, followed by dictionary matches or conflicts, then
+cleanup at the current original source position. No rewritten text reenters the
+matcher. New adjacency created by a deletion never becomes another match. Existing
+adjacent source matches can each remove one word. The survivor keeps its original
+spelling and punctuation. Conditions inspect source words, including words already
+rendered differently by the dictionary. A pause resets their context.
+
+Custom catalogs use the same bounded dependency retention as the B2 dictionary:
+seven revisable words and at most fifteen complete source words in total. Builtin
+cleanup without dictionary keeps its eight-word bound. Long dependencies and
+commands wait until their supporting source is frozen before committing output.
+With cleanup disabled, injected linguistic rules do not run; dictionary and
+spoken-command options remain independent.
+
+C2 owns approval, versioned publication, disabling and rollback. Compilation is
+validation, not approval. Only an explicitly published snapshot may be injected
+into a new dictation; running and paused sessions retain their catalog. History
+records the instantiated session's cleanup version, with processor version
+`voiceflow-text-v3`. See [C1 verification and integration contract](verification/voiceflow-v1-c1.md)
+for the schema limits, API, priority and tests. The core does not infer whether an
+explicit lowercase phrase is a name or intentional wording; review remains
+necessary even when a candidate passes structural validation.
 
 ## Reproduce verification
 

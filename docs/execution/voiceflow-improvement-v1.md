@@ -18,9 +18,9 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | --- | --- | --- | --- |
 | A | VF-01 marcatori | Verifica manuale pendente | `cf987b9`; controlli indipendenti passati |
 | B1 | VF-02 storico e feedback | Verifica manuale pendente | `39ef4ef`; verifica indipendente senza difetti bloccanti |
-| B2 | VF-03 dizionario operativo | Verifica manuale pendente | Verifica indipendente passata, 5.360 casi aggiuntivi |
-| C1 | VF-04 catalogo | In sviluppo | |
-| C2 | VF-05 suggerimenti | Da iniziare | |
+| B2 | VF-03 dizionario operativo | Verifica manuale pendente | `1ac4fb0`; verifica indipendente e 5.360 casi aggiuntivi |
+| C1 | VF-04 catalogo | Verifica manuale pendente | Seconda verifica indipendente passata dopo riparazione |
+| C2 | VF-05 suggerimenti | In sviluppo | |
 | D1 | VF-06 analisi | Da iniziare | |
 | D2 | VF-07 scheduler | Da iniziare | |
 | E | VF-09 boosting | Da iniziare | |
@@ -54,6 +54,8 @@ Obiettivo prima delle nuove regole: mantenere la finestra limitata e il lavoro p
 
 CLI locale `codex-cli 0.157.0`, risolta da PATH tramite nvm. `codex exec --help` conferma `--output-schema`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--sandbox read-only`, stdin e `--output-last-message`. `codex features list` espone `shell_tool`, `unified_exec`, `multi_agent` e `skill_search`: il lotto D deve limitare esplicitamente strumenti e configurazione, non affidarsi solo al prompt. Nessuna richiesta di analisi effettuata. Verificata la [documentazione ufficiale non interattiva](https://learn.chatgpt.com/docs/non-interactive-mode).
 
+La [configuration reference ufficiale](https://learn.chatgpt.com/docs/config-file/config-reference) conferma i controlli `features.shell_tool`, `features.unified_exec`, `web_search` e persistenza della cronologia. La CLI installata espone inoltre `apps`, `plugins`, `hooks`, `in_app_browser` e `skill_search`, da considerare nell'isolamento dell'analizzatore. Non è stato letto né modificato il contenuto della configurazione o delle credenziali dell'utente.
+
 Riaperti i riferimenti NVIDIA [customization](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/docs/asr/customization.md) e [configuration](https://github.com/NVIDIA/NeMo-Speech.cpp/blob/main/docs/asr/configuration.md): RNNT e CTC hanno meccanismi/pesi diversi, da verificare sul runtime prima di misurare un vantaggio. Questa ricognizione non completa l'esperimento E.
 
 ### B1 / VF-02
@@ -69,3 +71,15 @@ Implementazione in verifica indipendente, [report B2](../verification/voiceflow-
 Prime prove dell'implementatore: UI B2 6 gruppi e regressione UI B1 7 gruppi passati. Misura sintetica finale del solo aggiornamento, 100.000 parole: fedele 14,52 ms, pulizia 14,95 ms, 1.000 varianti 31,81 ms, 4.096 varianti 32,97 ms. Con richiesta di anteprima a ogni parola: 59,70 / 63,76 / 451,33 / 457,54 ms. RSS circa 10,75 MB. Da confermare nella revisione; non sono misure di ASR né del parlato personale.
 
 Verifica indipendente: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`, nessun blocco. 93 test Rust, 4 ignorati preesistenti, fmt/clippy, typecheck/UI build, firma 3 test e UI B2/B1 ripetuti. Ulteriori 5.360 casi eseguibili contro il sorgente reale passati, con frammentazione, revisioni consentite, venti offset di confine, frasi lunghe, comandi, condizioni, conflitti e testi di controllo. Benchmark ripetuto: 4.096 regole 33,10 ms aggiornamenti e 457,31 ms con anteprima; limiti 7/15 rispettati. Rimangono prova ASR/WebView/incolla reale e build firmata finale. C1 può procedere sui contratti automatici verificati.
+
+### C1 / VF-04
+
+Catalogo dichiarativo implementato, in preparazione per verifica indipendente. Regole builtin estratte in dati, schema con operazioni finite, lingua, condizioni/eccezioni, provenienza, versione ed esempi positivi/negativi. Nessun codice o regex arbitrario. Iniezione di catalogo immutabile nel processore e nella sessione, con versione effettiva riportata nei metadati; pubblicazione e UI saranno C2.
+
+Implementatore: 102 test Rust passati, 4 ignorati preesistenti, clippy/fmt, typecheck/UI build e 3 test firma. Esempi eseguiti sul processore, revisione di frasi lunghe, interazioni con dizionario/comandi, pausa/ripresa e grezzo ASR verificati. Benchmark esteso a 256 regole di pulizia combinate con 4.096 varianti; limiti 7 parole modificabili e 15 trattenute rispettati. Nessuna prova reale con audio.
+
+Prima verifica indipendente: difetto riprodotto nelle condizioni sul sorgente dopo una cancellazione. Il processore trasferisce un separatore al token sopravvissuto e lo usa anche per decidere la regola successiva, confondendo presentazione e sorgente originale. Il caso con newline modifica l'applicazione di `before`/`exceptBefore`. C2 attende riparazione e nuova verifica in un contesto distinto.
+
+Il revisore ha inoltre riprodotto una condizione destra che attraversava un punto fermo. Esito `NOT APPROVED`. Un nuovo contesto di riparazione ha separato `rendering_separator` dai separatori sorgente immutabili in anteprima e consolidamento, e bloccato il contesto destro attraverso la punteggiatura terminale. Due regressioni aggiunte: 10 test catalogo, 104 workspace passati e 4 ignorati, clippy/fmt passati. Riproduttore del revisore ricompilato: entrambi i difetti risolti e 25.515 confronti builtin conservati. Nuova verifica indipendente in corso, nessun avanzamento a C2 prima dell'esito.
+
+Seconda verifica indipendente: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`. Entrambi i difetti verificati risolti sul sorgente attuale, 25.515 confronti baseline passati, prove aggiuntive di catalogo vuoto, segmenti vuoti/marcatori, reset e pulizia disabilitata passate. Workspace 104/4, clippy/fmt, diff e manifest passati. Nessun blocco al lotto C2; prova reale e build firmata integrate restano pendenti.

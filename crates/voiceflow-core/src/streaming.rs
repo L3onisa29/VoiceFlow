@@ -149,6 +149,21 @@ impl<D: StreamingDecoder> StreamingSession<D> {
             ..Self::with_processing(decoder, mode, cleanup)
         }
     }
+    pub fn with_rules(
+        decoder: D,
+        mode: FormatMode,
+        cleanup: bool,
+        dictionary: crate::dictionary::Dictionary,
+        cleanup_catalog: crate::cleanup::CompiledCatalog,
+    ) -> Self {
+        Self {
+            processor: TextProcessor::with_rules(mode, cleanup, dictionary, cleanup_catalog),
+            ..Self::with_processing(decoder, mode, cleanup)
+        }
+    }
+    pub fn cleanup_version(&self) -> &str {
+        self.processor.cleanup_version()
+    }
     pub fn snapshot(&self) -> Transcript {
         let (confirmed, partial) = self.processor.parts();
         Transcript {
@@ -431,6 +446,75 @@ mod processing_tests {
         assert_eq!(
             active.finish().unwrap().text(),
             "VoiceFlow VoiceFlow non 42"
+        );
+    }
+
+    #[test]
+    fn declarative_cleanup_snapshot_survives_revisions_pause_and_stop() {
+        use crate::cleanup::{CompiledCatalog, Example, Operation};
+        let mut definition = CompiledCatalog::builtin().definition().clone();
+        definition.version = "fixture-published-2".into();
+        let mut rule = definition.rules[0].clone();
+        rule.id = "fixture-new-variant".into();
+        rule.operation = Operation::RemoveFalseStart {
+            source: vec!["vorrei".into(), "volevo".into()],
+        };
+        rule.positive_examples = vec![Example {
+            input: "vorrei volevo".into(),
+            output: "volevo".into(),
+        }];
+        definition.rules.push(rule);
+        let compiled = CompiledCatalog::compile(definition.clone(), "it").unwrap();
+        let mut active = StreamingSession::with_rules(
+            Snapshots {
+                updates: [
+                    "vorrei volevo ",
+                    "vorrei chiedere ",
+                    "vorrei volevo chiedere",
+                ]
+                .into_iter()
+                .collect(),
+                current: String::new(),
+                fail: false,
+            },
+            FormatMode::Faithful,
+            true,
+            crate::dictionary::Dictionary::default(),
+            compiled,
+        );
+        assert_eq!(active.cleanup_version(), "fixture-published-2");
+        assert_eq!(step(&mut active).text(), "volevo");
+        assert_eq!(step(&mut active).text(), "vorrei chiedere");
+        assert_eq!(step(&mut active).text(), "volevo chiedere");
+        active.flush_utterance().unwrap();
+        definition.rules.clear();
+        definition.version = "fixture-next-session-3".into();
+        let next_snapshot = CompiledCatalog::compile(definition, "it").unwrap();
+        assert!(next_snapshot.is_empty());
+        active.decoder.updates.push_back("vorrei");
+        step(&mut active);
+        active.flush_utterance().unwrap();
+        active
+            .decoder
+            .updates
+            .push_back("volevo chiedere vorrei volevo sapere");
+        step(&mut active);
+        assert_eq!(
+            active.finish().unwrap().text(),
+            "volevo chiedere vorrei volevo chiedere volevo sapere"
+        );
+        assert_eq!(active.cleanup_version(), "fixture-published-2");
+        assert_eq!(
+            active.original_utterances().unwrap(),
+            [
+                "vorrei volevo chiedere",
+                "vorrei",
+                "volevo chiedere vorrei volevo sapere"
+            ]
+        );
+        assert_eq!(
+            active.finish().unwrap().text(),
+            "volevo chiedere vorrei volevo chiedere volevo sapere"
         );
     }
 

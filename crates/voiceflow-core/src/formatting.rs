@@ -1,3 +1,4 @@
+use crate::cleanup::CompiledCatalog;
 use crate::dictionary::{Dictionary, Match};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -30,9 +31,9 @@ struct Atom<'a> {
 }
 
 /// Keep seven revisable words and bounded frozen-source dependency context.
-/// With terminology enabled, up to seven frozen words wait for a complete
+/// With terminology or custom cleanup, up to seven frozen words wait for a complete
 /// phrase/command decision. One additional original word serves left context.
-/// With terminology disabled, the original one-word lookbehind path is used.
+/// With only builtin cleanup, the original one-word lookbehind path is used.
 /// Its rendering waits until the next source word is frozen too, so a deletion
 /// never commits while the word supporting it can still be revised.
 /// Confirmed output and frozen source are immutable. Revisions to the seven-word
@@ -41,8 +42,12 @@ pub struct TextProcessor {
     mode: FormatMode,
     cleanup: bool,
     dictionary: Dictionary,
+    cleanup_catalog: CompiledCatalog,
     frozen: VecDeque<Word>,
     source_before: Option<String>,
+    // A deletion transfers its leading separator only to rendered output.
+    // Source separators remain unchanged for later context matching.
+    rendering_separator: Option<String>,
     pending: VecDeque<Word>,
     lookbehind: Option<Word>,
     confirmed: String,
@@ -61,8 +66,10 @@ impl TextProcessor {
             mode,
             cleanup,
             dictionary: Dictionary::default(),
+            cleanup_catalog: CompiledCatalog::builtin(),
             frozen: VecDeque::new(),
             source_before: None,
+            rendering_separator: None,
             pending: VecDeque::new(),
             lookbehind: None,
             confirmed: String::new(),
@@ -80,6 +87,42 @@ impl TextProcessor {
             dictionary,
             ..Self::new(mode, cleanup)
         }
+    }
+
+    /// A session-owned immutable snapshot. The caller must publish/approve rules
+    /// before injecting them; compilation alone does not constitute approval.
+    pub fn with_rules(
+        mode: FormatMode,
+        cleanup: bool,
+        dictionary: Dictionary,
+        cleanup_catalog: CompiledCatalog,
+    ) -> Self {
+        Self {
+            dictionary,
+            cleanup_catalog,
+            ..Self::new(mode, cleanup)
+        }
+    }
+
+    pub fn cleanup_version(&self) -> &str {
+        self.cleanup_catalog.version()
+    }
+
+    fn extended_rules(&self) -> bool {
+        !self.dictionary.is_empty()
+            || (self.cleanup
+                && !self.cleanup_catalog.legacy_pairs()
+                && !self.cleanup_catalog.is_empty())
+    }
+
+    fn required_frozen_words(&self) -> usize {
+        self.dictionary
+            .required_frozen_words()
+            .max(if self.cleanup {
+                self.cleanup_catalog.required_frozen_words()
+            } else {
+                2
+            })
     }
 
     /// Accept an accumulated decoder snapshot. A word is complete only when a
@@ -159,7 +202,9 @@ impl TextProcessor {
             if self.cleanup
                 && let Some(previous) = atoms.iter_mut().rev().find(|atom| !atom.text.is_empty())
                 && !previous.command
-                && false_start(previous.text, atom.text, atom.separator)
+                && self
+                    .cleanup_catalog
+                    .pair(previous.text, atom.text, atom.separator)
             {
                 atom.separator = previous.separator;
                 // Preview only. Release retains source provenance separately.
@@ -172,7 +217,7 @@ impl TextProcessor {
     }
 
     fn release(&mut self, all: bool) {
-        if !self.dictionary.is_empty() {
+        if self.extended_rules() {
             self.release_dictionary(all);
             return;
         }
@@ -189,7 +234,11 @@ impl TextProcessor {
                     self.commit(&previous.separator, text, true);
                     continue;
                 }
-                if self.cleanup && false_start(&previous.text, &word.text, &word.separator) {
+                if self.cleanup
+                    && self
+                        .cleanup_catalog
+                        .pair(&previous.text, &word.text, &word.separator)
+                {
                     // Both source words are now frozen. Only this immediate
                     // deletion is final; the survivor remains as lookbehind.
                     // Repeat chains therefore need no additional history.
@@ -243,8 +292,10 @@ impl TextProcessor {
             }
         }
         if self.cleanup
-            && let Some(next) = words.get(1)
-            && false_start(&first.text, &next.text, &next.separator)
+            && self
+                .cleanup_catalog
+                .matching_rule(&source, before, &protected)
+                .is_some()
         {
             return (1, String::new(), false, true);
         }
@@ -266,19 +317,19 @@ impl TextProcessor {
     }
 
     fn commit_dictionary(&mut self, all: bool) {
-        while !self.frozen.is_empty()
-            && (all || self.frozen.len() >= self.dictionary.required_frozen_words())
+        while !self.frozen.is_empty() && (all || self.frozen.len() >= self.required_frozen_words())
         {
             let (count, text, command, deleted) =
                 self.dictionary_prefix(&self.frozen, self.source_before.as_deref());
-            let separator = self.frozen[0].separator.clone();
+            let separator = self
+                .rendering_separator
+                .take()
+                .unwrap_or_else(|| self.frozen[0].separator.clone());
             for _ in 0..count {
                 self.source_before = Some(self.frozen.pop_front().unwrap().text);
             }
             if deleted {
-                if let Some(next) = self.frozen.front_mut() {
-                    next.separator = separator;
-                }
+                self.rendering_separator = Some(separator);
             } else {
                 self.commit(&separator, &text, command);
             }
@@ -308,7 +359,7 @@ impl TextProcessor {
         let mut after_command = self.after_command;
         let mut utterance_start = self.utterance_start;
         let mut previous = self.confirmed.chars().last();
-        if !self.dictionary.is_empty() {
+        if self.extended_rules() {
             let mut words: VecDeque<Word> = self
                 .frozen
                 .iter()
@@ -317,23 +368,24 @@ impl TextProcessor {
                 .cloned()
                 .collect();
             let mut before = self.source_before.clone();
+            let mut rendering_separator = self.rendering_separator.clone();
             while !words.is_empty() {
                 let (count, text, command, deleted) =
                     self.dictionary_prefix(&words, before.as_deref());
-                let first = words.front().unwrap().clone();
+                let separator = rendering_separator
+                    .take()
+                    .unwrap_or_else(|| words[0].separator.clone());
                 for _ in 0..count {
                     before = Some(words.pop_front().unwrap().text);
                 }
                 if deleted {
-                    if let Some(next) = words.front_mut() {
-                        next.separator = first.separator;
-                    }
+                    rendering_separator = Some(separator);
                     continue;
                 }
                 render(
                     &mut partial,
                     &Atom {
-                        separator: &first.separator,
+                        separator: &separator,
                         text: &text,
                         command,
                     },
@@ -345,7 +397,7 @@ impl TextProcessor {
                 utterance_start = false;
             }
         }
-        for atom in if self.dictionary.is_empty() {
+        for atom in if !self.extended_rules() {
             self.atoms()
         } else {
             Vec::new()
@@ -387,7 +439,7 @@ impl TextProcessor {
     }
 
     /// All retained complete source words, including frozen dependencies and
-    /// terminology left context. Excludes an unfinished word.
+    /// rule left context. Excludes an unfinished word.
     pub fn retained_words(&self) -> usize {
         self.pending.len()
             + self.frozen.len()
@@ -490,33 +542,6 @@ fn command(first: &str, second: &str, separator: &str) -> Option<&'static str> {
     .into_iter()
     .find(|(a, b, _)| first.eq_ignore_ascii_case(a) && second.eq_ignore_ascii_case(b))
     .map(|(_, _, replacement)| replacement)
-}
-
-fn false_start(first: &str, second: &str, separator: &str) -> bool {
-    if separator.contains(['\n', '\r']) {
-        return false;
-    }
-    // Deliberately lowercase and Italian-only. No general repeated-word rule:
-    // "che che", English titles, emphasis, negation and names remain literal.
-    let second = second.trim_end_matches([',', '.', ':', ';', '!', '?']);
-    if first == "il" && second == "la" {
-        return true;
-    }
-    if first == second
-        && [
-            "il", "lo", "la", "gli", "le", "un", "una", "di", "del", "della", "dello", "dei",
-            "degli", "delle",
-        ]
-        .contains(&first)
-    {
-        return true;
-    }
-    first == "della"
-        && ["dell'", "dell’"].iter().any(|prefix| {
-            second
-                .strip_prefix(prefix)
-                .is_some_and(|tail| !tail.is_empty() && tail.chars().all(char::is_lowercase))
-        })
 }
 
 /// Batch callers use exactly the same rules and word window as live dictation.
