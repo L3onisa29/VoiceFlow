@@ -124,6 +124,8 @@ impl Executables {
 }
 pub struct CodexProvider {
     executables: Executables,
+    worker_group: bool,
+    scratch_parent: Option<PathBuf>,
 }
 impl CodexProvider {
     pub fn new(executables: Executables) -> Result<Self> {
@@ -131,14 +133,30 @@ impl CodexProvider {
             executable(&executables.codex) && executable(&executables.node),
             "Eseguibili Codex/Node non disponibili."
         );
-        Ok(Self { executables })
+        Ok(Self {
+            executables,
+            worker_group: false,
+            scratch_parent: None,
+        })
+    }
+    /// Only for the isolated scheduler execution group, which has an independent watchdog.
+    pub(crate) fn in_worker_group(
+        executables: Executables,
+        scratch_parent: PathBuf,
+    ) -> Result<Self> {
+        let mut provider = Self::new(executables)?;
+        provider.worker_group = true;
+        provider.scratch_parent = Some(scratch_parent);
+        Ok(provider)
     }
 }
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> std::io::Result<Self> {
-        let base = std::env::temp_dir();
+        Self::within(&std::env::temp_dir())
+    }
+    fn within(base: &Path) -> std::io::Result<Self> {
         loop {
             let path = base.join(format!(
                 "voiceflow-analysis-{}-{}",
@@ -315,16 +333,22 @@ impl Provider for CodexProvider {
         if cancel.cancelled() {
             return Err(ProviderError::Cancelled);
         }
-        let scratch = Scratch::new().map_err(|_| ProviderError::Io)?;
+        let scratch = match &self.scratch_parent {
+            Some(parent) => Scratch::within(parent),
+            None => Scratch::new(),
+        }
+        .map_err(|_| ProviderError::Io)?;
         let schema = scratch.0.join("output-schema.json");
         fs::write(
             &schema,
             include_str!("../../../../../docs/schemas/analysis-output-v1.json"),
         )
         .map_err(|_| ProviderError::Io)?;
-        let mut child = command(&self.executables, &scratch.0, &schema)
-            .spawn()
-            .map_err(|_| ProviderError::Unavailable)?;
+        let mut cmd = command(&self.executables, &scratch.0, &schema);
+        if self.worker_group {
+            cmd.process_group(unsafe { libc::getpgrp() });
+        }
+        let mut child = cmd.spawn().map_err(|_| ProviderError::Unavailable)?;
         let overflow = Arc::new(AtomicBool::new(false));
         let stdout = reader(
             child.stdout.take().ok_or(ProviderError::Io)?,
@@ -349,6 +373,13 @@ impl Provider for CodexProvider {
                 None
             };
             if let Some(error) = error {
+                if self.worker_group {
+                    // The worker reserves its budget before the request. Kill the entire
+                    // supervised execution group; recovery retains that reservation.
+                    unsafe {
+                        libc::kill(-libc::getpgrp(), libc::SIGKILL);
+                    }
+                }
                 terminate(&mut child);
                 break Err(error);
             }
@@ -364,6 +395,18 @@ impl Provider for CodexProvider {
                 }
             }
         };
+        while !writer.is_finished() || !stdout.is_finished() || !stderr.is_finished() {
+            if cancel.cancelled() || start.elapsed() >= timeout {
+                if self.worker_group {
+                    unsafe {
+                        libc::kill(-libc::getpgrp(), libc::SIGKILL);
+                    }
+                }
+                terminate(&mut child);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let written = writer.join();
         let out = stdout.join();
         let err = stderr.join();

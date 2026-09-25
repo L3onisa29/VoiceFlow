@@ -1,4 +1,5 @@
 import { AnalysisSettings } from "@/components/analysis/analysis-settings";
+import { SchedulerSettings } from "@/components/analysis/scheduler-settings";
 import { createRoute } from "@tanstack/react-router";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
@@ -69,6 +70,7 @@ export function SettingsPage() {
         </CardContent>
       </Card>
       <AnalysisSettings />
+      <SchedulerSettings />
       <Card role="region" aria-labelledby="model-settings">
         <CardHeader>
           <CardTitle>

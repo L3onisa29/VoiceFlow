@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  copyFileSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -18,6 +19,7 @@ import {
   desktopRuntimeMessage,
   inspectDesktopRuntime,
 } from "./desktop-runtime.ts";
+import { helperBuild, helperPackaging } from "./build-analysis-helper.ts";
 
 if (process.argv.includes("--check")) {
   if (
@@ -52,6 +54,11 @@ if (process.argv.includes("--check")) {
     throw new Error(
       "Il certificato salvato non è disponibile nel Portachiavi. Nessun ripiego su firma ad-hoc.",
     );
+  const helper = spawnSync("cargo", helperBuild, {
+    cwd: root,
+    stdio: "inherit",
+  });
+  if (helper.status !== 0) process.exit(helper.status || 1);
   const result = spawnSync(
     "pnpm",
     [
@@ -76,6 +83,20 @@ if (process.argv.includes("--check")) {
   );
   if (result.status !== 0) process.exit(result.status || 1);
   const bundle = join(root, "target/release/bundle/macos/VoiceFlow.app");
+  const packaging = helperPackaging(root, bundle, identity);
+  copyFileSync(packaging.source, packaging.destination);
+  for (const args of [packaging.signHelper, packaging.signBundle]) {
+    const signed = spawnSync("codesign", args, { encoding: "utf8" });
+    if (signed.status !== 0)
+      throw new Error(`Firma helper/bundle non riuscita: ${signed.stderr}`);
+  }
+  const helperVerified = spawnSync(
+    "codesign",
+    ["--verify", "--strict", packaging.destination],
+    { encoding: "utf8" },
+  );
+  if (helperVerified.status !== 0)
+    throw new Error(`Firma helper non valida: ${helperVerified.stderr}`);
   const verified = spawnSync(
     "codesign",
     ["--verify", "--deep", "--strict", bundle],

@@ -57,3 +57,7 @@ D2 deve possedere una sola prenotazione del worker, chiamare queste funzioni fuo
 D1 registra solo IPC per preferenze, stato ed esclusioni. Non espone un IPC di esecuzione dell'analisi e non avvia job. Finestra 02:30–06:00, LaunchAgent, coordinamento con la dettatura e politica di retry appartengono a D2.
 
 Lo schema completo della risposta è [analysis-output-v1.json](schemas/analysis-output-v1.json). Ogni elemento `candidates` usa il contratto C2. Il validatore locale applica anche i campi nullable obbligatori e i limiti dello schema prima della validazione semantica C2. Questo impedisce che il comportamento permissivo dei campi Rust `Option` accetti campi mancanti.
+
+## Pianificazione disponibile in D2
+
+Il helper, il LaunchAgent, la fascia locale e il coordinamento con la dettatura sono descritti in [Pianificazione locale dell'analisi](analysis-scheduler.md). L'attivazione richiede una seconda scelta esplicita nell'app, oltre al consenso D1. Il provider in quel processo usa il gruppo supervisionato del worker: una terminazione forzata conserva il budget riservato e rende necessario il recupero dei checkpoint dopo la prova del lock. Le directory CLI del worker vengono raccolte dal launcher o al successivo controllo sicuro dello stato. Il percorso D1 separato conserva la propria gestione del gruppo e dello scratch temporaneo.

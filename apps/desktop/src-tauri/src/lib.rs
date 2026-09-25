@@ -5,6 +5,7 @@ mod history;
 mod hud;
 mod output_audio;
 mod platform;
+pub mod scheduler;
 mod service;
 mod settings;
 pub mod suggestions;
@@ -133,6 +134,8 @@ pub fn run() {
             analysis::analysis_configure,
             analysis::analysis_exclude,
             analysis::analysis_excluded,
+            scheduler::scheduler_status,
+            scheduler::scheduler_configure,
             history::history_remember
         ])
         .setup(|app| {
@@ -145,6 +148,10 @@ pub fn run() {
             ));
             let history = history::HistoryStore::new(data.join("history.sqlite3"));
             app.manage(history.clone());
+            app.manage(scheduler::Scheduler::for_app(
+                data.clone(),
+                &app.path().home_dir()?,
+            )?);
             app.manage(analysis::AnalysisStore::new(
                 history.clone(),
                 app.state::<dictionary::DictionaryStore>().inner().clone(),

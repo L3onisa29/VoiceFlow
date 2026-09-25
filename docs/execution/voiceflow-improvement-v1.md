@@ -21,8 +21,8 @@ Riferimento: VF-2026-09-25-V1. Avvio: 25 settembre 2026.
 | B2 | VF-03 dizionario operativo | Verifica manuale pendente | `1ac4fb0`; verifica indipendente e 5.360 casi aggiuntivi |
 | C1 | VF-04 catalogo | Verifica manuale pendente | `d501551`; seconda verifica passata dopo riparazione |
 | C2 | VF-05 suggerimenti | Verifica manuale pendente | `60cdfbd`; seconda verifica passata |
-| D1 | VF-06 analisi | Verifica manuale pendente | Seconda verifica passata; commit in preparazione |
-| D2 | VF-07 scheduler | Da iniziare | |
+| D1 | VF-06 analisi | Verifica manuale pendente | `6c5f2ae`; seconda verifica passata |
+| D2 | VF-07 scheduler | Verifica manuale pendente | Verifica indipendente passata; commit in preparazione |
 | E | VF-09 boosting | Da iniziare | |
 | Trasversale | VF-08 qualità | Da iniziare | Fixture distinte da parlato personale |
 
@@ -115,3 +115,15 @@ Prima verifica D1: `NOT APPROVED`. Matrice 149/4, fmt/clippy, TypeScript/build/f
 Riparazione D1: validazione degli elementi CLI in ogni fase e distinzione esplicita fra rifiuto del candidato e errore infrastrutturale. Entrambe le regressioni fallivano prima del fix. Test mirati 32, workspace 152 passati/4 ignorati, fmt/clippy/typecheck/diff/manifest passati. Probe originali ricompilati: eventi strumenti respinti; guasto SQLite produce errore con fonte ancora pendente e retry disponibile. Regressione di guasto a metà lotto verifica deduplica senza riaprire rifiuti. Avviata seconda verifica indipendente.
 
 Seconda verifica D1: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`. Originali ricompilati, 48 ulteriori varianti di eventi e cinque prove avverse SQLite passate: rollback evidenze, guasto a metà lotto/riapertura/deduplica/rifiuto, JSON corrotto, finalizzazione fallita, candidato semanticamente invalido. Workspace 152/4, fmt/clippy/typecheck/diff/manifest passati. UI/build/firma invariati riutilizzati. Nessun blocco; restano CLI reale dopo consenso e WebView nativo. D2 può procedere.
+
+### D2 / VF-07
+
+Implementazione avviata sul commit D1 `6c5f2ae`. Worker separato con supervisione dei processi figli, lock di sistema per esclusione e intenzione di dettatura, finestra locale e configurazione LaunchAgent. Il recupero non si affida soltanto a PID salvati o lease persistenti. Previsti test con processi temporanei per crash, sospensione e cancellazione, orologio controllabile e adattatore launchctl simulato. Nessun LaunchAgent reale installato o attivato in sviluppo.
+
+D2, primi otto test dell’implementatore passati in 5,52 secondi. Test multiprocesso con esclusione, dettatura simulata, terminazione di launcher/esecutore e sospensione singola dei controllori, incluso provider con processo figlio. Rilevata e corretta una race nelle sonde del segnale di dettatura tramite lock condiviso per letture ed esclusivo per cattura. Prove aggiuntive di orologio e avvio simultaneo in corso. I bypass di tempo/provider sono confinati a `cfg(test)`.
+
+D2, matrice dell’implementatore: workspace 163 passati/4 ignorati e UI scheduler/D1/B1/C2 5/7/7/6 passati prima dell’ultimo affinamento della pulizia scratch. I test paralleli hanno richiesto attese limitate per descrittori CLOEXEC temporaneamente ereditati durante fork e un criterio timeout indipendente dall’arrivo del primo marker. La prova grafica viene corretta alla dimensione minima desktop supportata, 780×620: `document.scrollWidth` non basta a escludere ritaglio dei controlli nella shell a 390 px. Nessun requisito smartphone aggiunto.
+
+D2 pronto per revisione: [report](../verification/voiceflow-v1-d2.md), [guida e protocollo](../analysis-scheduler.md). Matrice finale 163/4 Rust, fmt/clippy, typecheck/build UI, firma 4/runtime 3, UI 5/7/7/6. Helper release arm64 compilato e avviato due volte su directory temporanea OFF: nessuno storico o provider creato. Pulizia scratch dopo crash coperta dai test. Verifica grafica a 1060×760 e minimo desktop 780×620. Limite dichiarato: sospensione simultanea dei tre controllori può oltrepassare la preemption; la dettatura procede con avviso dopo attesa limitata e conserva l’intenzione. Nessun guasto singolo testato presenta tale degrado. Nuovo revisore in sola lettura avviato.
+
+Verifica indipendente D2: `AUTOMATED CHECKS PASSED — MANUAL VERIFICATION PENDING`, nessun blocco. Ripetuti 163/4 Rust, fmt/clippy, helper release, typecheck/UI build, firma 4/runtime 3, UI scheduler/analisi/storico/suggerimenti/dizionario 5/7/7/6/6 e manifest. Probe indipendenti sul vero helper release con provider finto e HOME/CODEX_HOME temporanee: kill dei controllori, figli orfani, storico occupato, scheduler corrotto, rilascio dei permessi, pulizia scratch e limiti reali di retry passati. Acquisizione cattura 0–281 ms nei guasti singoli provati, senza degrado. Tutti i processi fixture terminati. Restano LaunchAgent/CLI/WebView/audio reali e firma finale; E può procedere. MSRV 1.88 non eseguita, controlli su Rust 1.97.1.

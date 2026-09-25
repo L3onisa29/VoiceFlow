@@ -57,3 +57,7 @@ La CLI installata `0.157.0` è stata ispezionata in sola lettura con help e list
 Le capacità sono disattivate preventivamente dagli argomenti CLI, con ambiente ridotto e directory temporanea. `read-only` da solo non limita le letture a quella directory. Il rifiuto di eventi strumenti è un controllo successivo, non un sostituto dei flag preventivi. Il comportamento effettivo della CLI remota rimane una verifica successiva all'attivazione esplicita nell'app; i test del provider usano eseguibili sostitutivi. Autenticazione/rete non disponibili producono un errore di provider, senza propagare stderr o testo del fornitore nell'archivio.
 
 Nessuna operazione su microfono, playback o sistema audio. Nessuno scheduler/LaunchAgent o job reale creato. Nessuna build firmata finale: resta al coordinatore dopo D/E, come concordato. La verifica nativa/manuale dei flussi precedenti resta separata.
+
+## Rettifica della prova a larghezza smartphone, emersa in D2
+
+L'ispezione visiva D2 ha mostrato che a 390 px la shell desktop mantiene la sidebar e può ritagliare il contenuto. Il controllo `document.scrollWidth` usato nella prova D1 non dimostra da solo che tutti i controlli siano leggibili: il claim di assenza di overflow mobile sopra non vale come accettazione visiva smartphone. Le prove funzionali D1 e le evidenze desktop restano valide. La finestra minima supportata dall'app è 780×620; D2 verifica i bordi reali di input e pulsanti a quella dimensione. Una navigazione smartphone non è richiesta dal piano.

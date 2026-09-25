@@ -133,6 +133,8 @@ struct Active {
     clock: RecordingClock,
     language: String,
     processing: ProcessingMetadata,
+    // Drop this last, after capture/decoder teardown, including cancellation and errors.
+    _analysis_permit: Option<crate::scheduler::CapturePermit>,
 }
 struct Worker {
     app: AppHandle,
@@ -270,6 +272,23 @@ impl Worker {
                     s.level = 0.0;
                     s.elapsed_seconds = 0;
                 });
+                // Independent from scheduler SQLite/launchctl. The intent is held across
+                // pause and finalization; process exit releases stale capture state.
+                let coordination = crate::scheduler::Coordination::new(
+                    self.settings_path
+                        .parent()
+                        .context("Directory impostazioni mancante")?,
+                );
+                let (analysis_permit, scheduler_warning) = match coordination.capture() {
+                    Ok(permit) => {
+                        let warning = permit.degraded().then(|| "Analizzatore non arrestato entro 1,5 secondi. Dettatura disponibile; disattiva la pianificazione.".into());
+                        (Some(permit), warning)
+                    }
+                    Err(error) => (
+                        None,
+                        Some(format!("Coordinamento analisi non disponibile: {error}")),
+                    ),
+                };
                 let decoder = NvidiaDecoder::new(model, settings.language)?;
                 let capture = Capture::start()?;
                 let resampler = StreamingResampler::new(capture.sample_rate)?;
@@ -286,7 +305,7 @@ impl Worker {
                     s.phase = "recording".into();
                     s.transcript = Transcript::default();
                     s.final_text.clear();
-                    s.message = dictionary_warning;
+                    s.message = scheduler_warning.or(dictionary_warning);
                     s.device = capture.device_name.clone();
                     s.elapsed_seconds = 0;
                     s.level = 0.0;
@@ -301,6 +320,7 @@ impl Worker {
                 );
                 processing.cleanup_version = session.cleanup_version().into();
                 self.active = Some(Active {
+                    _analysis_permit: analysis_permit,
                     session_key: format!("{}-{}", std::process::id(), started.as_nanos()),
                     created_at: started.as_millis() as i64,
                     capture: Some(capture),
