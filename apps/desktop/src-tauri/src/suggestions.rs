@@ -1,4 +1,4 @@
-//! Review boundary for analyzer hypotheses. No analyzer, network or automatic approval.
+//! Review boundary for analyzer hypotheses. Local policy can approve validated analysis findings atomically.
 use crate::{
     dictionary::{DictionarySnapshot, DictionaryStore},
     history::HistoryStore,
@@ -94,6 +94,8 @@ pub struct Proposal {
     pub evidence: Vec<Evidence>,
     pub conflicts: Vec<String>,
     pub approved_at: Option<i64>,
+    pub confidence: Option<u8>,
+    pub analysis_outcome: Option<String>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -214,6 +216,12 @@ fn canonical(candidate: &Candidate) -> Result<String> {
         &candidate.language,
         &candidate.group_ids,
     ))?)
+}
+pub(crate) fn candidate_hash(candidate: &Candidate) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&normalize(candidate.clone()))?)
+    ))
 }
 fn normalize(mut candidate: Candidate) -> Candidate {
     candidate.group_ids.sort_unstable();
@@ -567,7 +575,7 @@ fn validate_combination(dictionary: &DictionarySnapshot, rules: &[ApprovedRule])
     }
     Ok(())
 }
-fn evidence(connection: &Connection, reference: EvidenceRef) -> Result<Evidence> {
+pub(crate) fn evidence(connection: &Connection, reference: EvidenceRef) -> Result<Evidence> {
     ensure!(
         reference.session_id > 0
             && !(reference.revision_id.is_some() && reference.original_index.is_some()),
@@ -611,7 +619,7 @@ fn evidence(connection: &Connection, reference: EvidenceRef) -> Result<Evidence>
         human_confirmed,
     })
 }
-fn contains_example(source: &str, example: &str) -> bool {
+pub(crate) fn contains_example(source: &str, example: &str) -> bool {
     source.match_indices(example).any(|(offset, _)| {
         // Processor words are whitespace-delimited. Only terminal prose punctuation
         // may follow a match; combining marks and URL/code syntax remain in the token.
@@ -676,7 +684,7 @@ impl SuggestionStore {
         })
     }
     pub fn ingest(&self, request: IngestRequest) -> Result<ReviewSnapshot> {
-        self.ingest_scoped(request, None)?;
+        self.ingest_scoped(request, None, None, &|| false)?;
         self.snapshot()
     }
     /// Analysis capability validates the prepared allowlist and privacy within this transaction.
@@ -686,7 +694,7 @@ impl SuggestionStore {
         batch_id: i64,
         attempt_id: i64,
     ) -> std::result::Result<(), IngestFailure> {
-        self.ingest_scoped(request, Some((batch_id, attempt_id)))
+        self.ingest_scoped(request, Some((batch_id, attempt_id)), None, &|| false)
             .map_err(|error| {
                 if error.is::<CandidateRejection>() {
                     IngestFailure::InvalidCandidate
@@ -695,7 +703,50 @@ impl SuggestionStore {
                 }
             })
     }
-    fn ingest_scoped(&self, request: IngestRequest, scope: Option<(i64, i64)>) -> Result<()> {
+    pub(crate) fn ingest_finding(
+        &self,
+        finding: crate::analysis::findings::Finding,
+        batch_id: i64,
+        attempt_id: i64,
+        cancel: &dyn crate::analysis::Cancellation,
+    ) -> std::result::Result<(), IngestFailure> {
+        let result = if let Some(candidate) = finding.candidate.clone() {
+            self.ingest_scoped(
+                IngestRequest {
+                    candidate,
+                    evidence: finding.evidence.clone(),
+                },
+                Some((batch_id, attempt_id)),
+                Some(&finding),
+                cancel,
+            )
+        } else {
+            self.access(|connection| {
+                let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                crate::analysis::validate_scope(&tx,batch_id,&finding.evidence)?;
+                ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM analysis_attempts WHERE id=?1 AND batch_id=?2 AND state='running')",params![attempt_id,batch_id],|r|r.get::<_,bool>(0))?,"Tentativo non attivo.");
+                finding.validate(&tx).map_err(CandidateRejection)?;
+                ensure!(!cancel.cancelled(),"Analisi annullata.");
+                let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM analysis_findings WHERE attempt_id=?1 AND identity=?2)",params![attempt_id,finding.key()?],|r|r.get(0))?;
+                if !exists { finding.save(&tx,attempt_id,None,"no-change",None)?; }
+                tx.commit()?; Ok(())
+            })
+        };
+        result.map_err(|error| {
+            if error.is::<CandidateRejection>() {
+                IngestFailure::InvalidCandidate
+            } else {
+                IngestFailure::Infrastructure
+            }
+        })
+    }
+    fn ingest_scoped(
+        &self,
+        request: IngestRequest,
+        scope: Option<(i64, i64)>,
+        finding: Option<&crate::analysis::findings::Finding>,
+        cancel: &dyn crate::analysis::Cancellation,
+    ) -> Result<()> {
         ensure!(
             !request.evidence.is_empty() && request.evidence.len() <= 64,
             CandidateRejection(anyhow::anyhow!("Servono da 1 a 64 riferimenti reali."))
@@ -705,6 +756,11 @@ impl SuggestionStore {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let dictionary = crate::dictionary::read_schema_snapshot(&tx,"vocabulary")?;
             if let Some((id,attempt))=scope { crate::analysis::validate_scope(&tx,id,&request.evidence)?; ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM analysis_attempts WHERE id=?1 AND batch_id=?2 AND state='running')",params![attempt,id],|r|r.get::<_,bool>(0))?,"Tentativo non attivo."); }
+            if let (Some(finding),Some((_,attempt)))=(finding,scope) {
+                finding.validate(&tx).map_err(CandidateRejection)?;
+                let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM analysis_findings WHERE attempt_id=?1 AND identity=?2)",params![attempt,finding.key()?],|r|r.get(0))?;
+                if exists { return Ok(()); }
+            }
             validate(&candidate,&dictionary).map_err(CandidateRejection)?;
             for reference in &request.evidence { validate_evidence(&candidate,&evidence(&tx,reference.clone())?).map_err(CandidateRejection)?; }
             let identity = canonical(&candidate)?;
@@ -718,6 +774,7 @@ impl SuggestionStore {
             } else {
                 tx.execute("INSERT INTO suggestions(identity,candidate_json,state) VALUES(?1,?2,'proposed')",params![identity,serde_json::to_string(&candidate)?])?; tx.last_insert_rowid()
             };
+            if created { tx.execute("INSERT INTO suggestion_auto_origin VALUES(?1,?2)",params![id,finding.is_some_and(|f|f.confidence.is_some())])?; }
             let mut inserted=0;
             let mut new_source=false;
             for r in &request.evidence {
@@ -734,6 +791,11 @@ impl SuggestionStore {
                 tx.execute("INSERT INTO analysis_attempt_proposals(attempt_id,proposal_id,relation,revision) VALUES(?1,?2,?3,?4) ON CONFLICT(attempt_id,proposal_id) DO UPDATE SET revision=excluded.revision,relation=CASE WHEN analysis_attempt_proposals.relation='created' THEN 'created' WHEN analysis_attempt_proposals.relation='updated' OR excluded.relation='updated' THEN 'updated' ELSE 'existing' END",params![attempt,id,relation,revision])?;
                 tx.execute("UPDATE analysis_attempts SET accepted=accepted+1 WHERE id=?1",[attempt])?;
             }
+            if let (Some(finding),Some((batch,attempt)))=(finding,scope) {
+                let (outcome,publication)=auto_publish(&tx,&dictionary,id,batch,attempt,finding,cancel)?;
+                finding.save(&tx,attempt,Some(id),outcome,publication)?;
+            }
+            ensure!(!cancel.cancelled(),"Analisi annullata.");
             tx.commit()?; Ok(())
         })
     }
@@ -818,6 +880,13 @@ impl SuggestionStore {
             let version=current(&tx)?;
             ensure!(request.expected_version==version && request.dictionary_version==dictionary.version,"Le regole sono cambiate. Aggiorna prima di confermare.");
             let mut active=rules_at(&tx,version)?;
+            if let Some(id)=request.id {
+                let identity:String=tx.query_row("SELECT identity FROM suggestions WHERE id=?1",[id],|r|r.get(0))?;
+                remember_veto(&tx,&identity)?;
+            }
+            if matches!(request.action,ReviewAction::Restore{..}) {
+                for rule in &active { remember_veto(&tx,&canonical(&rule.candidate)?)?; }
+            }
             let mut publication=None;
             if let ReviewAction::Restore {version:target}=request.action {
                 ensure!(target>=0 && target<version,"Scegli una versione precedente.");
@@ -854,6 +923,10 @@ impl SuggestionStore {
                 let next=tx.last_insert_rowid();tx.execute("UPDATE suggestion_state SET version=?1 WHERE id=1",[next])?;
                 // Invalidate stale cards after rollback as well as direct mutations.
                 tx.execute("UPDATE suggestions SET revision=revision+1 WHERE approved_at IS NOT NULL",[])?;
+            }
+            if let Some(id)=request.id {
+                let identity:String=tx.query_row("SELECT identity FROM suggestions WHERE id=?1",[id],|r|r.get(0))?;
+                remember_veto(&tx,&identity)?;
             }
             // Audit stores metadata only: rejected/source text must not survive source deletion.
             tx.execute("INSERT INTO suggestion_actions VALUES(?1,?2,?3,?4,?5)",params![request.request_key,request.id,action_identity,current(&tx)?,now()?])?;
@@ -945,6 +1018,112 @@ impl SuggestionStore {
         })
     }
 }
+fn identity_hash(identity: &str) -> String {
+    format!("{:x}", Sha256::digest(identity.as_bytes()))
+}
+pub(crate) fn remember_veto(c: &Connection, identity: &str) -> Result<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO suggestion_human_veto VALUES(?1)",
+        [identity_hash(identity)],
+    )?;
+    Ok(())
+}
+fn auto_publish(
+    c: &Connection,
+    dictionary: &DictionarySnapshot,
+    id: i64,
+    batch: i64,
+    attempt: i64,
+    finding: &crate::analysis::findings::Finding,
+    cancel: &dyn crate::analysis::Cancellation,
+) -> Result<(&'static str, Option<i64>)> {
+    let config = crate::analysis::settings(c)?.0;
+    if !c.query_row(
+        "SELECT eligible FROM suggestion_auto_origin WHERE proposal_id=?1",
+        [id],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(("blocked-legacy", None));
+    }
+    if finding.confidence.is_none() {
+        return Ok(("manual-unknown", None));
+    }
+    if finding.confidence.is_some_and(|v| v <= 90) {
+        return Ok(("manual-confidence", None));
+    }
+    if !config.auto_approve_high_confidence {
+        return Ok(("manual-policy", None));
+    }
+    let (json, identity, state, approved): (String, String, String, Option<i64>) = c.query_row(
+        "SELECT candidate_json,identity,state,approved_at FROM suggestions WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let veto: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM suggestion_human_veto WHERE identity=?1)",
+        [identity_hash(&identity)],
+        |r| r.get(0),
+    )?;
+    if veto || state == "rejected" || state == "deferred" {
+        return Ok(("blocked-human", None));
+    }
+    let version = current(c)?;
+    let mut active = rules_at(c, version)?;
+    if active.iter().any(|r| r.id == id) {
+        return Ok(("already-active", Some(version)));
+    }
+    if approved.is_some() {
+        return Ok(("blocked-human", None));
+    }
+    let candidate: Candidate = serde_json::from_str(&json)?;
+    // Old unscored hypotheses cannot acquire a score by being re-presented by the provider.
+    if candidate != normalize(finding.candidate.clone().context("Regola mancante")?) {
+        return Ok(("blocked-changed", None));
+    }
+    for evidence in read_evidence(c, id)? {
+        if c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM analysis_exclusions WHERE session_id=?1)",
+            [evidence.reference.session_id],
+            |r| r.get::<_, bool>(0),
+        )? || validate_evidence(&candidate, &evidence).is_err()
+        {
+            return Ok(("blocked-evidence", None));
+        }
+    }
+    active.push(ApprovedRule { id, candidate });
+    if validate_combination(dictionary, &active).is_err() {
+        return Ok(("blocked-conflict", None));
+    }
+    // Recheck within the publication transaction, after expensive compiler validation.
+    crate::analysis::validate_scope(c, batch, &finding.evidence)?;
+    ensure!(
+        crate::analysis::settings(c)?.0.auto_approve_high_confidence && !cancel.cancelled(),
+        "Analisi annullata."
+    );
+    ensure!(c.query_row("SELECT EXISTS(SELECT 1 FROM analysis_attempts WHERE id=?1 AND batch_id=?2 AND state='running')",params![attempt,batch],|r|r.get::<_,bool>(0))?,"Tentativo non attivo.");
+    c.execute("INSERT INTO suggestion_publications(previous_version,action,created_at,rules_json,dictionary_version,builtin_version) VALUES(?1,?2,?3,?4,?5,?6)",params![version,format!("auto-approve:{id}"),now()?,serde_json::to_string(&active)?,dictionary.version,voiceflow_core::cleanup::BUILTIN_VERSION])?;
+    let next = c.last_insert_rowid();
+    c.execute("UPDATE suggestion_state SET version=?1 WHERE id=1", [next])?;
+    c.execute(
+        "UPDATE suggestions SET state='approved',approved_at=?1,rejection_reason=NULL WHERE id=?2",
+        params![now()?, id],
+    )?;
+    c.execute(
+        "UPDATE suggestions SET revision=revision+1 WHERE approved_at IS NOT NULL",
+        [],
+    )?;
+    c.execute(
+        "INSERT INTO suggestion_actions VALUES(?1,?2,?3,?4,?5)",
+        params![
+            format!("analysis-auto:{attempt}:{}", finding.key()?),
+            id,
+            "auto-approve",
+            next,
+            now()?
+        ],
+    )?;
+    Ok(("auto-approved", Some(next)))
+}
 fn with_conflicts(mut snapshot: ReviewSnapshot) -> ReviewSnapshot {
     let active: Vec<_> = snapshot
         .proposals
@@ -992,6 +1171,10 @@ fn read_snapshot(
             state
         };
         let conflicts = vec![];
+        let scored: Option<(Option<u8>, String)> = connection.query_row(
+            "SELECT confidence,outcome FROM analysis_findings WHERE proposal_id=?1 AND candidate_hash=?2 ORDER BY id DESC LIMIT 1",
+            params![id,candidate_hash(&candidate)?], |r| Ok((r.get(0)?,r.get(1)?))
+        ).optional()?;
         proposals.push(Proposal {
             id,
             revision,
@@ -1001,6 +1184,8 @@ fn read_snapshot(
             evidence: read_evidence(connection, id)?,
             conflicts,
             approved_at,
+            confidence: scored.as_ref().and_then(|(confidence, _)| *confidence),
+            analysis_outcome: scored.map(|(_, outcome)| outcome),
         });
     }
     let publications=connection.prepare("SELECT version,previous_version,action,created_at,rules_json FROM suggestion_publications ORDER BY version DESC")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,String>(4)?)))?.collect::<rusqlite::Result<Vec<(i64,Option<i64>,String,i64,String)>>>()?.into_iter().map(|(version,previous_version,action,created_at,json)|Ok(Publication{version,previous_version,action,created_at,proposal_ids:serde_json::from_str::<Vec<ApprovedRule>>(&json)?.into_iter().map(|r|r.id).collect()})).collect::<Result<_>>()?;
@@ -1697,8 +1882,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let s = f.store.snapshot().unwrap();
-        assert!(!s.proposals[0].evidence[0].human_confirmed);
+        assert!(f.store.snapshot().unwrap().proposals.is_empty());
         assert!(
             f.act(
                 &s,

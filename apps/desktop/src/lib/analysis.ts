@@ -3,6 +3,7 @@ import { z } from "zod";
 
 export const analysisSettingsSchema = z.object({
   enabled: z.boolean(),
+  autoApproveHighConfidence: z.boolean().default(false),
   maxSources: z.number().int().min(1).max(100),
   maxInputBytes: z.number().int().min(4096).max(262144),
   maxRequestsPerDay: z.number().int().min(1).max(20),

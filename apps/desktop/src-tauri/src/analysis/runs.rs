@@ -75,6 +75,7 @@ pub struct RunDetail {
     pub run: RunSummary,
     pub sources: Vec<RunSource>,
     pub proposals: Vec<RunProposal>,
+    pub findings: Vec<findings::FindingResult>,
 }
 const SELECT: &str =
     "SELECT b.id,a.id,COALESCE(a.state,b.state),b.created_at,a.started_at,a.ended_at,
@@ -124,8 +125,9 @@ impl AnalysisStore {
                 tx.prepare("SELECT e.session_id,e.revision_id,EXISTS(SELECT 1 FROM analysis_exclusions x WHERE x.session_id=e.session_id) FROM analysis_batch_sources s JOIN analysis_events e ON e.id=s.event_id WHERE s.batch_id=?1 ORDER BY e.session_id,COALESCE(e.revision_id,0)")?.query_map([key.batch_id],source_row)?.collect::<rusqlite::Result<Vec<_>>>()?
             };
             let proposals=tx.prepare("SELECT proposal_id,relation,revision FROM analysis_attempt_proposals WHERE attempt_id=?1 ORDER BY id")?.query_map([key.attempt_id],|r|Ok(RunProposal{proposal_id:r.get(0)?,relation:r.get(1)?,revision:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let findings=findings::read(&tx,key.attempt_id)?;
             tx.commit()?;
-            Ok(RunDetail{run,sources,proposals})
+            Ok(RunDetail{run,sources,proposals,findings})
         })
     }
 }

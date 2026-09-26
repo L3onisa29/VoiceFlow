@@ -2,13 +2,13 @@
 
 La pagina Suggerimenti separa le ipotesi di analisi, gli esempi ricordati nello storico e le regole approvate. Una riscrittura libera rimane un esempio. Non genera automaticamente una sostituzione.
 
-Ogni proposta mostra categoria, prima/dopo, operazione, lingua, gruppi, condizioni, eccezioni, motivazione, frasi di controllo, riferimenti allo storico e conflitti. Il numero di riferimenti conta le fonti collegate; il numero di sessioni usa ID distinti. Nessuno dei due è una frequenza di occorrenze. Le correzioni umane sono conteggiate solo se ricordate e non annullate. Un risultato già prodotto dal processore non è una conferma umana.
+Ogni proposta mostra l'ultima confidenza disponibile, la fascia e l'esito dell'analisi, oltre a categoria, prima/dopo, operazione, lingua, gruppi, condizioni, eccezioni, motivazione, frasi di controllo, riferimenti allo storico e conflitti. Il numero di riferimenti conta le fonti collegate; il numero di sessioni usa ID distinti. Nessuno dei due è una frequenza di occorrenze. Le correzioni umane sono conteggiate solo se ricordate e non annullate. Un risultato già prodotto dal processore non è una conferma umana.
 
 ## Revisione
 
 - **Approva** apre la definizione da autorizzare. **Approva e pubblica** verifica le regole combinate e crea una nuova versione atomica. La regola vale dalla prossima sessione.
 - **Modifica** cambia una proposta ancora non approvata. Consente termini, varianti, operazioni di pulizia supportate, lingua, gruppi, condizioni, eccezioni, motivazione ed esempi. Il salvataggio non attiva regole. Gli esempi aggiunti possono essere rimossi, mantenendone almeno uno positivo e uno di controllo.
-- **Rifiuta** richiede un motivo. La stessa proposta con le stesse fonti resta rifiutata. Una nuova sessione o una diversa revisione umana ricordata possono riaprirla. Un'altra vista della stessa sessione, per esempio originale e risultato elaborato, non basta.
+- **Rifiuta** richiede un motivo. La stessa proposta con le stesse fonti resta rifiutata. Una nuova sessione o una diversa revisione umana ricordata possono riaprirla per revisione manuale; il veto all'approvazione automatica rimane. Un'altra vista della stessa sessione, per esempio originale e risultato elaborato, non basta.
 - **Rimanda** conserva la proposta per una revisione successiva.
 - **Disattiva** pubblica una versione senza quella regola. L'approvazione precedente rimane tracciata. **Riattiva** richiede una nuova pubblicazione esplicita.
 - **Ripristina** crea una nuova versione con le regole approvate di una pubblicazione precedente. Si può tornare alla sola pulizia incorporata. Il dizionario modificato manualmente conserva la propria versione e viene ricontrollato insieme alla configurazione da ripristinare.
@@ -27,9 +27,9 @@ Eliminare una sessione elimina tutte le proposte non approvate che la citano, an
 
 L'approvazione rende la definizione una regola indipendente dell'utente. La finestra di approvazione dichiara che motivazione, esempi e versioni della definizione rimangono disponibili dopo la cancellazione delle fonti. I testi completi delle fonti non sono copiati nelle evidenze o nell'audit. Gli hash SHA-256 delle richieste permettono il retry senza conservare vecchi payload di modifica o motivi di rifiuto nascosti. Le definizioni approvate rimangono anche quando disattivate, per riproducibilità e ripristino.
 
-Annullare una correzione aggiorna subito la sua etichetta di conferma umana. Una proposta non approvata sostenuta da quella revisione non può essere approvata finché la revisione non è nuovamente valida. Una regola già autorizzata conserva la propria approvazione indipendente.
+Annullare una correzione elimina le proposte non approvate sostenute da quella revisione, anche se hanno altre fonti, insieme a motivazioni, esempi, riferimenti, audit e rilievi collegati. I veti manuali persistono come hash. Una regola già autorizzata conserva la propria approvazione indipendente; i riferimenti e i rilievi della revisione annullata vengono rimossi.
 
-Questo lotto non invia testi a servizi esterni e non esegue analisi. L'integrazione D dovrà documentare separatamente gli invii autorizzati a OpenAI: la cancellazione locale non dimostra la cancellazione presso il fornitore.
+La pagina Suggerimenti non invia testi a servizi esterni. Gli invii autorizzati sono documentati in [Analisi](analysis.md): la cancellazione locale non dimostra la cancellazione presso il fornitore.
 
 ## Archivi e transazioni
 
@@ -37,7 +37,7 @@ Questo lotto non invia testi a servizi esterni e non esegue analisi. L'integrazi
 
 `suggestion_publications` conserva l'insieme completo delle definizioni approvate, la versione precedente, azione, data, revisione del dizionario verificata e versione del catalogo incorporato. `suggestion_catalogs` archivia la definizione incorporata. La migrazione aggiuntiva dello storico ha una propria versione e avviene nella transazione della migrazione B1; gli archivi del dizionario vengono inizializzati nella transazione di migrazione del dizionario. Schema incompleto o versione futura generano un errore, senza sostituire i dati.
 
-La validazione del processore e il calcolo dei conflitti avvengono fuori dai lock di scrittura. La pubblicazione rilegge sotto transazione immediata versione delle proposte, versione pubblicata, revisione del dizionario e validità corrente delle evidenze. Approvazione, pubblicazione, puntatore corrente e audit diventano visibili insieme. Il dizionario è allegato alla connessione SQLite per una lettura coerente e non riceve scritture dalla pubblicazione. Non è richiesta una transazione distribuita su due database scrivibili.
+Nel percorso manuale la validazione del processore e il calcolo dei conflitti avvengono fuori dai lock di scrittura. Il percorso automatico esegue gli stessi controlli dentro la transazione immediata di ingestione e pubblicazione, sul dizionario allegato corrente. La pubblicazione rilegge sotto transazione immediata versione delle proposte, versione pubblicata, revisione del dizionario e validità corrente delle evidenze. Approvazione, pubblicazione, puntatore corrente e audit diventano visibili insieme. Il dizionario è allegato alla connessione SQLite per una lettura coerente e non riceve scritture dalla pubblicazione. Non è richiesta una transazione distribuita su due database scrivibili.
 
 I metadati delle nuove sessioni conservano `dictionary-v2:<revisione>;suggestions-v1:<pubblicazione>` e `cleanup-review-v1:<pubblicazione>`, oppure la versione incorporata quando la pubblicazione è zero. `SuggestionStore::archived_session_snapshot` ricostruisce una combinazione archiviata senza attivarla.
 
@@ -54,7 +54,7 @@ Una richiesta contiene:
 - `candidate.reason`, `positiveExamples`, `negativeExamples`. I controlli hanno input e output uguali; gli esempi positivi devono mostrare una modifica. Tutti passano il processore isolato prima dell'ingestione.
 - `evidence`: 1–64 riferimenti. Ogni riferimento ha `sessionId`, `revisionId`, `originalIndex`. `revisionId` identifica una revisione della stessa sessione, ricordata e non annullata. `originalIndex` è l'indice zero-based di un segmento ASR salvato. Entrambi null indicano il risultato elaborato. Non possono essere valorizzati insieme.
 
-Un'evidenza deve contenere l'input di almeno un esempio positivo; una correzione umana deve contenere anche il relativo output. Le riscritture non sono scomposte dal backend in sostituzioni. L'analizzatore propone esplicitamente una regola circoscritta, che resta un'ipotesi fino all'approvazione nell'app.
+Un'evidenza deve contenere l'input di almeno un esempio positivo; una correzione umana deve contenere anche il relativo output. Le riscritture non sono scomposte dal backend in sostituzioni. L'analizzatore propone esplicitamente una regola circoscritta, che resta un'ipotesi fino all'approvazione manuale o al criterio automatico esplicitamente abilitato nell'app.
 
 Identità della proposta: definizione normalizzata, lingua e gruppi ordinati. Le varianti e le eccezioni sono ordinate e deduplicate. Una proposta uguale unisce riferimenti reali senza cambiare silenziosamente motivazione, esempi o definizione già revisionati. I nuovi riferimenti devono sostenere gli esempi della proposta esistente. Se l'analizzatore vuole cambiare la definizione deve produrre una proposta diversa; errori di ingestione non attivano niente. D1 deve decidere come presentare i lotti parzialmente invalidi; ogni chiamata `ingest` è atomica.
 
@@ -67,3 +67,19 @@ Identità della proposta: definizione normalizzata, lingua e gruppi ordinati. Le
 L'analizzatore usa [analysis-output-v1.json](schemas/analysis-output-v1.json), un envelope limitato a 16 candidati del contratto sopra. Il percorso interno `ingest_prepared` aggiunge, nella stessa transazione di ogni candidato, consenso attuale, versione privacy, appartenenza esatta al lotto e fingerprint delle fonti. Una sessione esistente ma non preparata non è un'evidenza ammessa. La riuscita restituita al worker corrisponde al commit dell'ingestione, senza dipendere da una successiva lettura dell'intera pagina di revisione.
 
 Output incompleto o invalido blocca l'intero lotto; candidati individuali invalidi in un envelope completo producono uno stato parziale e un conteggio esplicito. La policy di checkpoint, privacy e ripresa è descritta in [analysis.md](analysis.md). L'API pubblica C2 `ingest` e gli IPC di revisione mantengono il loro contratto.
+
+## Approvazione per confidenza
+
+Il criterio nelle Impostazioni è inizialmente disattivato. Quando attivo, soltanto
+nuovi rilievi con confidenza intera superiore a 90 possono essere pubblicati dopo
+validazione, controlli delle fonti e dei conflitti. La confidenza è una stima del
+provider sull'azione, non accuratezza misurata. Le fasce 75–90 alta, 50–74 media,
+0–49 bassa e i punteggi sconosciuti richiedono revisione manuale.
+
+Rifiuti, rinvii, modifiche, disattivazioni e ripristini manuali impediscono successive
+attivazioni automatiche della stessa definizione, anche quando una nuova fonte
+riapre la proposta. Le ipotesi precedenti senza punteggio non vengono convertite in
+regole automatiche. Gli esiti storici restano consultabili per tentativo in Analisi;
+`auto-approve:<id>` identifica le pubblicazioni automatiche. I rilievi di mantenimento
+non creano proposte vuote né nuove versioni. Le regole pubblicate valgono dalla
+prossima sessione e mantengono i normali comandi Disattiva e Ripristina.

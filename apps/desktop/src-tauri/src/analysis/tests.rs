@@ -1044,3 +1044,723 @@ fn version_one_attempt_migration_does_not_invent_missing_outcomes() {
     assert!(old.elapsed_ms.is_none());
     assert_eq!(reopened.runs(None, 20).unwrap().entries.len(), 1);
 }
+
+fn scored(id: i64, confidence: Value) -> Value {
+    let mut value = terminology(id, None);
+    value["name"] = json!("Grafia progetto");
+    value["text"] = json!("voice flow");
+    value["action"] = json!("replace");
+    value["reason"] = json!("Usa la grafia del progetto");
+    value["confidence"] = confidence;
+    value
+}
+#[test]
+fn confidence_contract_characterization() {
+    let f = Fixture::new();
+    f.enabled();
+    let id = f.record("uso voice flow");
+    let result = f.run(vec![scored(id, json!(91))]);
+    assert_eq!(result.accepted, 1);
+}
+
+fn enable_auto(f: &Fixture) {
+    f.store
+        .configure(
+            AnalysisSettings {
+                enabled: true,
+                auto_approve_high_confidence: true,
+                max_requests_per_day: 20,
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+}
+fn latest_findings(f: &Fixture) -> Vec<findings::FindingResult> {
+    let key = f.store.runs(None, 1).unwrap().entries[0].key.clone();
+    f.store.run_detail(key).unwrap().findings
+}
+#[test]
+fn confidence_boundaries_and_policy_default_off() {
+    for score in [0, 49, 50, 74, 75, 90, 91, 100] {
+        let f = Fixture::new();
+        enable_auto(&f);
+        let id = f.record("uso voice flow");
+        let before = f.suggestions().session_snapshot("it").unwrap();
+        assert_eq!(f.run(vec![scored(id, json!(score))]).accepted, 1);
+        let findings = latest_findings(&f);
+        assert_eq!(findings[0].confidence, Some(score));
+        assert_eq!(
+            findings[0].outcome,
+            if score > 90 {
+                "auto-approved"
+            } else {
+                "manual-confidence"
+            }
+        );
+        assert_eq!(f.suggestions().snapshot().unwrap().version > 0, score > 90);
+        assert_eq!(
+            before.dictionary_version,
+            "dictionary-v2:1;suggestions-v1:0"
+        );
+        if score > 90 {
+            assert_ne!(
+                before.dictionary_version,
+                f.suggestions()
+                    .session_snapshot("it")
+                    .unwrap()
+                    .dictionary_version
+            );
+        }
+    }
+    let f = Fixture::new();
+    f.enabled();
+    let id = f.record("uso voice flow");
+    f.run(vec![scored(id, json!(100))]);
+    assert_eq!(latest_findings(&f)[0].outcome, "manual-policy");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    let mut old = serde_json::to_value(AnalysisSettings::default()).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("autoApproveHighConfidence");
+    assert!(
+        !serde_json::from_value::<AnalysisSettings>(old)
+            .unwrap()
+            .auto_approve_high_confidence
+    );
+}
+#[test]
+fn confidence_invalid_scores_sources_and_actions_are_rejected() {
+    for score in [json!(-1), json!(101), json!(90.5), Value::Null, json!("91")] {
+        let f = Fixture::new();
+        enable_auto(&f);
+        let id = f.record("uso voice flow");
+        assert_eq!(f.run(vec![scored(id, score)]).rejected, 1);
+        assert!(latest_findings(&f).is_empty());
+        assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    }
+    for kind in [
+        "missing", "forged", "mismatch", "negative", "no-op", "outside",
+    ] {
+        let f = Fixture::new();
+        enable_auto(&f);
+        let id = f.record("uso voice flow");
+        let mut value = scored(id, json!(100));
+        match kind {
+            "missing" => {
+                value.as_object_mut().unwrap().remove("confidence");
+            }
+            "forged" => value["text"] = json!("testo inventato"),
+            "mismatch" => value["action"] = json!("remove"),
+            "negative" => {
+                value["candidate"]["negativeExamples"] =
+                    json!([{"input":"voice flow","output":"voice flow"}])
+            }
+            "no-op" => value["action"] = json!("keep"),
+            _ => value["evidence"][0]["sessionId"] = json!(999999),
+        }
+        assert_eq!(f.run(vec![value]).rejected, 1, "{kind}");
+        assert!(latest_findings(&f).is_empty());
+        assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    }
+}
+#[test]
+fn confidence_keep_legacy_and_privacy_deletion() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    let mut keep = scored(id, json!(100));
+    keep["action"] = json!("keep");
+    keep["candidate"] = Value::Null;
+    assert_eq!(f.run(vec![keep.clone(), keep]).accepted, 2);
+    let found = latest_findings(&f);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].outcome, "no-change");
+    assert!(f.suggestions().snapshot().unwrap().proposals.is_empty());
+    f.store.exclude(id, true).unwrap();
+    assert!(latest_findings(&f).is_empty());
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    f.run(vec![terminology(id, None)]);
+    assert!(latest_findings(&f).is_empty());
+    assert_eq!(
+        f.suggestions().snapshot().unwrap().proposals[0].confidence,
+        None
+    );
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    f.store
+        .history
+        .access(|c| {
+            c.execute("DELETE FROM transcriptions WHERE id=?1", [id])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(latest_findings(&f).is_empty());
+}
+#[test]
+fn confidence_auto_atomic_retry_manual_veto_and_historical_outcome() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    f.run(vec![scored(id, json!(91)), scored(id, json!(91))]);
+    assert_eq!(latest_findings(&f).len(), 1);
+    assert_eq!(f.suggestions().snapshot().unwrap().publications.len(), 1);
+    let key = f.store.runs(None, 1).unwrap().entries[0].key.clone();
+    let snapshot = f.suggestions().snapshot().unwrap();
+    let p = &snapshot.proposals[0];
+    f.suggestions()
+        .review(ReviewRequest {
+            id: Some(p.id),
+            expected_revision: Some(p.revision),
+            expected_version: snapshot.version,
+            dictionary_version: snapshot.dictionary_version,
+            request_key: "disable-auto".into(),
+            action: ReviewAction::Disable,
+        })
+        .unwrap();
+    let id2 = f.record("uso voice flow");
+    f.run(vec![scored(id2, json!(100))]);
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-human");
+    let historical = f.store.run_detail(key).unwrap();
+    assert_eq!(historical.findings[0].confidence, Some(91));
+    assert_eq!(historical.findings[0].outcome, "auto-approved");
+    assert_eq!(f.suggestions().snapshot().unwrap().publications.len(), 2);
+    for action in [
+        ReviewAction::Reject {
+            reason: "No".into(),
+        },
+        ReviewAction::Defer,
+    ] {
+        let f = Fixture::new();
+        enable_auto(&f);
+        let id = f.record("uso voice flow");
+        f.run(vec![scored(id, json!(75))]);
+        let snapshot = f.suggestions().snapshot().unwrap();
+        let p = &snapshot.proposals[0];
+        f.suggestions()
+            .review(ReviewRequest {
+                id: Some(p.id),
+                expected_revision: Some(p.revision),
+                expected_version: snapshot.version,
+                dictionary_version: snapshot.dictionary_version,
+                request_key: "manual-veto".into(),
+                action,
+            })
+            .unwrap();
+        let id = f.record("uso voice flow");
+        f.run(vec![scored(id, json!(100))]);
+        assert_eq!(latest_findings(&f)[0].outcome, "blocked-human");
+        assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    }
+}
+#[test]
+fn confidence_publication_and_finding_rollback_together() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    f.store.history.access(|c|{c.execute_batch("CREATE TRIGGER fail_finding BEFORE INSERT ON analysis_findings BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;Ok(())}).unwrap();
+    let result = f.run(vec![scored(id, json!(100))]);
+    assert_eq!(result.state, "failed");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    assert!(f.suggestions().snapshot().unwrap().proposals.is_empty());
+    f.store
+        .history
+        .access(|c| {
+            c.execute_batch("DROP TRIGGER fail_finding")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.run(vec![scored(id, json!(100))]).accepted, 1);
+    assert_eq!(f.suggestions().snapshot().unwrap().publications.len(), 1);
+}
+#[test]
+fn confidence_legacy_hypothesis_never_autoactivated_by_new_score() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    f.run(vec![terminology(id, None)]);
+    let id = f.record("uso voice flow");
+    f.run(vec![scored(id, json!(100))]);
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-legacy");
+    let id = f.record("uso voice flow");
+    f.run(vec![scored(id, json!(100))]);
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-legacy");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+}
+
+#[test]
+fn confidence_cancellation_revocation_mutation_and_conflict_guards() {
+    // Cancellation becomes true at the guard inside the publication transaction.
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    let calls = AtomicU64::new(0);
+    let result = f
+        .store
+        .run(
+            f.store.prepare().unwrap().unwrap(),
+            &Fake(|_: &str, _: &dyn Cancellation| {
+                Ok(ProviderReply {
+                    candidates: vec![scored(id, json!(100))],
+                })
+            }),
+            &|| calls.fetch_add(1, Ordering::Relaxed) >= 3,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(result.state, "cancelled");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+    assert!(latest_findings(&f).is_empty());
+    for change in ["revoke", "source", "exclude", "policy"] {
+        let f = Fixture::new();
+        enable_auto(&f);
+        let id = f.record("uso voice flow");
+        let revision = if change == "source" {
+            Some(f.correction(id, "uso VoiceFlow", "recognition"))
+        } else {
+            None
+        };
+        let result=f.store.run(f.store.prepare().unwrap().unwrap(),&Fake(|_:&str,_:&dyn Cancellation|{
+            match change {
+                "revoke"=>f.store.configure(AnalysisSettings::default(),false).unwrap(),
+                "policy"=>f.enabled(),
+                "exclude"=>f.store.exclude(id,true).unwrap(),
+                _=>{f.store.history.access(|c|{c.execute("UPDATE confirmed_corrections SET category='style' WHERE revision_id=?1",[revision])?;Ok(())}).unwrap();},
+            }
+            let mut value=scored(id,json!(100));value["evidence"][0]["revisionId"]=json!(revision);
+            Ok(ProviderReply{candidates:vec![value]})
+        }),&||false,1000).unwrap();
+        assert_ne!(result.accepted, 1, "{change}");
+        assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+        assert!(latest_findings(&f).is_empty());
+    }
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    let first = scored(id, json!(100));
+    let mut conflict = first.clone();
+    conflict["candidate"]["definition"]["preferred"] = json!("Voiceflow");
+    conflict["candidate"]["positiveExamples"][0]["output"] = json!("Voiceflow");
+    assert_eq!(f.run(vec![first, conflict]).accepted, 2);
+    assert_eq!(latest_findings(&f)[1].outcome, "blocked-conflict");
+    assert_eq!(f.suggestions().snapshot().unwrap().publications.len(), 1);
+}
+#[test]
+fn confidence_cleanup_and_manual_edit_or_rollback_cannot_be_overridden() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("volevo vorrei chiedere");
+    let mut value = cleanup(id);
+    value["name"] = json!("Falsa partenza");
+    value["text"] = json!("volevo vorrei chiedere");
+    value["reason"] = json!("Rimuovi la falsa partenza");
+    value["action"] = json!("remove");
+    value["confidence"] = json!(100);
+    assert_eq!(f.run(vec![value]).accepted, 1);
+    assert_eq!(latest_findings(&f)[0].outcome, "auto-approved");
+    let snapshot = f.suggestions().snapshot().unwrap();
+    f.suggestions()
+        .review(ReviewRequest {
+            id: None,
+            expected_revision: None,
+            expected_version: snapshot.version,
+            dictionary_version: snapshot.dictionary_version,
+            request_key: "restore-auto".into(),
+            action: ReviewAction::Restore { version: 0 },
+        })
+        .unwrap();
+    assert_eq!(
+        f.suggestions().snapshot().unwrap().proposals[0].state,
+        "disabled"
+    );
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    f.run(vec![scored(id, json!(90))]);
+    let snapshot = f.suggestions().snapshot().unwrap();
+    let p = &snapshot.proposals[0];
+    let mut candidate = p.candidate.clone();
+    if let crate::suggestions::Definition::Terminology { preferred, .. } = &mut candidate.definition
+    {
+        *preferred = "VoiceFLOW".into();
+    }
+    candidate.positive_examples[0].output = "VoiceFLOW".into();
+    f.suggestions()
+        .review(ReviewRequest {
+            id: Some(p.id),
+            expected_revision: Some(p.revision),
+            expected_version: snapshot.version,
+            dictionary_version: snapshot.dictionary_version,
+            request_key: "edit-veto".into(),
+            action: ReviewAction::Edit {
+                candidate: Box::new(candidate),
+            },
+        })
+        .unwrap();
+    let id = f.record("uso voice flow");
+    f.run(vec![scored(id, json!(100))]);
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-human");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+}
+#[test]
+fn confidence_dictionary_changed_during_provider_uses_current_atomic_snapshot() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    f.store.run(f.store.prepare().unwrap().unwrap(),&Fake(|_:&str,_:&dyn Cancellation|{
+        let term:crate::dictionary::SaveTerm=serde_json::from_value(json!({"id":null,"text":"VoiceFLOW","groupIds":[],"variants":["voice flow"],"language":"it","matching":"exact","context":{"before":null,"after":null,"exceptBefore":[],"exceptAfter":[]}})).unwrap();
+        f.store.dictionary.save_term(term).unwrap();
+        Ok(ProviderReply{candidates:vec![scored(id,json!(100))]})
+    }),&||false,1000).unwrap();
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-conflict");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+}
+
+#[test]
+fn confidence_partial_commit_crash_retry_preserves_attempt_outcomes() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow e il il progetto");
+    let first = scored(id, json!(91));
+    let mut second = cleanup(id);
+    second["candidate"]["definition"]["operation"] = json!({"kind":"repeat","word":"il"});
+    second["candidate"]["positiveExamples"] =
+        json!([{"input":"il il progetto","output":"il progetto"}]);
+    second["candidate"]["negativeExamples"] =
+        json!([{"input":"molto molto importante","output":"molto molto importante"}]);
+    second["name"] = json!("Ripetizione articolo");
+    second["text"] = json!("il il progetto");
+    second["reason"] = json!("Rimuovi l'articolo ripetuto");
+    second["action"] = json!("remove");
+    second["confidence"] = json!(100);
+    f.store.history.access(|c|{c.execute_batch("CREATE TRIGGER fail_second BEFORE INSERT ON analysis_findings WHEN (SELECT COUNT(*) FROM analysis_findings)>0 BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;Ok(())}).unwrap();
+    assert_eq!(f.run(vec![first.clone(), second.clone()]).state, "failed");
+    let key = f.store.runs(None, 1).unwrap().entries[0].key.clone();
+    assert_eq!(f.suggestions().snapshot().unwrap().publications.len(), 1);
+    f.store
+        .history
+        .access(|c| {
+            c.execute_batch("DROP TRIGGER fail_second")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.run(vec![first, second]).state, "completed");
+    assert_eq!(f.suggestions().snapshot().unwrap().publications.len(), 2);
+    assert_eq!(latest_findings(&f)[0].outcome, "already-active");
+    let old = f.store.run_detail(key).unwrap();
+    assert_eq!(old.findings.len(), 1);
+    assert_eq!(old.findings[0].outcome, "auto-approved");
+    assert_eq!(old.findings[0].confidence, Some(91));
+}
+#[test]
+fn confidence_keep_cannot_invent_preservation_of_corrected_text() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("uso voice flow");
+    let revision = f.correction(id, "uso VoiceFlow", "recognition");
+    let mut value = scored(id, json!(100));
+    value["action"] = json!("keep");
+    value["candidate"] = Value::Null;
+    value["evidence"][0]["revisionId"] = json!(revision);
+    assert_eq!(f.run(vec![value]).rejected, 1);
+    assert!(latest_findings(&f).is_empty());
+}
+
+#[test]
+fn confidence_repair_named_action_requires_every_correction() {
+    for unsupported_first in [true, false] {
+        let f = Fixture::new();
+        enable_auto(&f);
+        let unsupported = f.record("voice flow e altro e vf");
+        let bad_revision =
+            f.correction(unsupported, "voice flow e altro e VoiceFlow", "recognition");
+        let supported = f.record("voice flow e altro e vf");
+        let good_revision = f.correction(supported, "VoiceFlow e altro e VoiceFlow", "recognition");
+        let mut value = scored(unsupported, json!(100));
+        value["text"] = json!("voice flow e altro");
+        value["candidate"]["definition"]["variants"] = json!(["voice flow", "vf"]);
+        value["candidate"]["positiveExamples"] = json!([
+            {"input":"voice flow e altro", "output":"VoiceFlow e altro"},
+            {"input":"vf", "output":"VoiceFlow"}
+        ]);
+        let mut refs = vec![
+            json!({"sessionId":unsupported,"revisionId":bad_revision,"originalIndex":null}),
+            json!({"sessionId":supported,"revisionId":good_revision,"originalIndex":null}),
+        ];
+        if !unsupported_first {
+            refs.reverse();
+        }
+        value["evidence"] = json!(refs);
+        assert_eq!(f.run(vec![value]).rejected, 1);
+        f.store
+            .history
+            .access(|c| {
+                for table in [
+                    "suggestions",
+                    "suggestion_evidence",
+                    "analysis_findings",
+                    "analysis_finding_sources",
+                    "suggestion_actions",
+                    "suggestion_publications",
+                    "analysis_attempt_proposals",
+                ] {
+                    assert_eq!(
+                        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))?,
+                        0,
+                        "{table}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn confidence_repair_exclusion_scrubs_unapproved_multisource_and_preserves_veto() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let first = f.record("voice flow");
+    let second = f.record("voice flow");
+    let mut value = scored(first, json!(90));
+    value["evidence"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"sessionId":second,"revisionId":null,"originalIndex":null}));
+    assert_eq!(f.run(vec![value]).accepted, 1);
+    let snapshot = f.suggestions().snapshot().unwrap();
+    let proposal = &snapshot.proposals[0];
+    f.suggestions()
+        .review(ReviewRequest {
+            id: Some(proposal.id),
+            expected_revision: Some(proposal.revision),
+            expected_version: snapshot.version,
+            dictionary_version: snapshot.dictionary_version,
+            request_key: "privacy-rejection".into(),
+            action: ReviewAction::Reject {
+                reason: "Private correction".into(),
+            },
+        })
+        .unwrap();
+    f.store.exclude(first, true).unwrap();
+    f.store
+        .history
+        .access(|c| {
+            for table in [
+                "suggestions",
+                "suggestion_evidence",
+                "suggestion_actions",
+                "analysis_findings",
+                "analysis_finding_sources",
+                "suggestion_auto_origin",
+            ] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?,
+                    0,
+                    "{table}"
+                );
+            }
+            assert_eq!(
+                c.query_row(
+                    "SELECT COUNT(*) FROM analysis_attempt_proposals WHERE proposal_id IS NOT NULL",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT COUNT(*) FROM suggestion_human_veto WHERE length(identity)=64",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+    let third = f.record("voice flow");
+    assert_eq!(f.run(vec![scored(third, json!(100))]).accepted, 1);
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-human");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+}
+
+#[test]
+fn confidence_repair_privacy_cleanup_preserves_approved_definitions() {
+    for approved in [false, true] {
+        for operation in ["exclude", "delete", "forget", "undo", "revision-delete"] {
+            let f = Fixture::new();
+            enable_auto(&f);
+            let id = f.record("voice flow");
+            let revision = f.correction(id, "VoiceFlow", "recognition");
+            let mut value = scored(id, json!(if approved { 100 } else { 90 }));
+            value["evidence"][0]["revisionId"] = json!(revision);
+            assert_eq!(f.run(vec![value]).accepted, 1);
+            match operation {
+                "exclude" => f.store.exclude(id, true).unwrap(),
+                "delete" => f.store.history.delete(id).unwrap(),
+                "undo" => {
+                    let d = f.store.history.detail(id).unwrap();
+                    f.store
+                        .history
+                        .undo(
+                            serde_json::from_value(
+                                json!({"id":id,"expectedVersion":d.edit_version}),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    f.store
+                        .history
+                        .access(|c| {
+                            c.execute(
+                                if operation == "forget" {
+                                    "DELETE FROM confirmed_corrections WHERE revision_id=?1"
+                                } else {
+                                    "DELETE FROM history_revisions WHERE id=?1"
+                                },
+                                [revision],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            f.store
+                .history
+                .access(|c| {
+                    for table in [
+                        "analysis_findings",
+                        "analysis_finding_sources",
+                        "suggestion_evidence",
+                    ] {
+                        assert_eq!(
+                            c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                                .get::<_, i64>(0))?,
+                            0,
+                            "{operation}: {table}"
+                        );
+                    }
+                    for table in ["suggestions", "suggestion_publications"] {
+                        assert_eq!(
+                            c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                                .get::<_, i64>(0))?,
+                            i64::from(approved),
+                            "{operation}: {table}"
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            if approved {
+                let snapshot = f.suggestions().snapshot().unwrap();
+                assert_eq!(snapshot.proposals[0].state, "approved");
+                assert_eq!(
+                    snapshot.proposals[0].candidate.positive_examples[0].output,
+                    "VoiceFlow"
+                );
+                assert_eq!(snapshot.proposals[0].confidence, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn confidence_repair_manual_edit_and_reingestion_score_only_matching_candidate() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let source = f.record("voice flow");
+    f.run(vec![scored(source, json!(90))]);
+    let historical = f.store.runs(None, 1).unwrap().entries[0].key.clone();
+    let snapshot = f.suggestions().snapshot().unwrap();
+    let p = &snapshot.proposals[0];
+    let mut candidate = p.candidate.clone();
+    if let crate::suggestions::Definition::Terminology { preferred, .. } = &mut candidate.definition
+    {
+        *preferred = "VoiceFLOW".into();
+    }
+    candidate.positive_examples[0].output = "VoiceFLOW".into();
+    let edited = f
+        .suggestions()
+        .review(ReviewRequest {
+            id: Some(p.id),
+            expected_revision: Some(p.revision),
+            expected_version: snapshot.version,
+            dictionary_version: snapshot.dictionary_version,
+            request_key: "edit-score".into(),
+            action: ReviewAction::Edit {
+                candidate: Box::new(candidate),
+            },
+        })
+        .unwrap();
+    assert_eq!(edited.proposals[0].confidence, None);
+    assert_eq!(edited.proposals[0].analysis_outcome, None);
+    let id = f.record("voice flow");
+    let mut next = scored(id, json!(99));
+    next["candidate"]["definition"]["preferred"] = json!("VoiceFLOW");
+    next["candidate"]["positiveExamples"][0]["output"] = json!("VoiceFLOW");
+    assert_eq!(f.run(vec![next]).accepted, 1);
+    let current = f.suggestions().snapshot().unwrap();
+    assert_eq!(current.proposals[0].id, p.id);
+    assert_eq!(current.proposals[0].confidence, Some(99));
+    assert_eq!(
+        current.proposals[0].analysis_outcome.as_deref(),
+        Some("blocked-human")
+    );
+    assert_eq!(current.version, 0);
+    let old = f.store.run_detail(historical).unwrap();
+    assert_eq!(old.findings[0].confidence, Some(90));
+    assert_eq!(old.findings[0].result_text, "VoiceFlow");
+}
+
+#[test]
+fn confidence_repair_migration_scrubs_legacy_excluded_copy_without_losing_veto() {
+    let f = Fixture::new();
+    enable_auto(&f);
+    let id = f.record("voice flow");
+    f.run(vec![scored(id, json!(90))]);
+    let snapshot = f.suggestions().snapshot().unwrap();
+    let p = &snapshot.proposals[0];
+    f.suggestions()
+        .review(ReviewRequest {
+            id: Some(p.id),
+            expected_revision: Some(p.revision),
+            expected_version: snapshot.version,
+            dictionary_version: snapshot.dictionary_version,
+            request_key: "legacy-reject".into(),
+            action: ReviewAction::Reject {
+                reason: "Private reason".into(),
+            },
+        })
+        .unwrap();
+    f.store
+        .history
+        .access(|c| {
+            c.execute_batch(
+                "DROP TRIGGER analysis_scrub_excluded;
+            DELETE FROM suggestion_human_veto;
+            ALTER TABLE analysis_findings DROP COLUMN candidate_hash;",
+            )?;
+            c.execute(
+                "INSERT INTO analysis_exclusions(session_id) VALUES(?1)",
+                [id],
+            )?;
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM suggestions", [], |r| r
+                    .get::<_, i64>(0))?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(f.suggestions().snapshot().unwrap().proposals.is_empty());
+    let fresh = f.record("voice flow");
+    f.run(vec![scored(fresh, json!(100))]);
+    assert_eq!(latest_findings(&f)[0].outcome, "blocked-human");
+    assert_eq!(f.suggestions().snapshot().unwrap().version, 0);
+}

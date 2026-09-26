@@ -73,7 +73,7 @@ export function AnalysisSettings() {
       setDraft(result.settings);
       setNotice(
         value.enabled
-          ? "Consenso e limiti salvati. I suggerimenti richiedono la tua approvazione."
+          ? "Consenso, limiti e criterio di approvazione salvati."
           : "Analisi disattivata. I lotti in corso saranno interrotti.",
       );
     } catch (error) {
@@ -155,6 +155,32 @@ export function AnalysisSettings() {
                       definizioni pertinenti. L'analisi è facoltativa e
                       disattivata inizialmente. Puoi escludere ogni sessione dal
                       dettaglio dello storico.
+                    </FieldDescription>
+                  </div>
+                </Field>
+                <Field orientation="horizontal">
+                  <Checkbox
+                    id="analysis-auto-approve"
+                    checked={draft.autoApproveHighConfidence}
+                    disabled={busy}
+                    onCheckedChange={(checked) =>
+                      setDraft({
+                        ...draft,
+                        autoApproveHighConfidence: checked === true,
+                      })
+                    }
+                  />
+                  <div className="flex flex-col gap-2">
+                    <FieldLabel htmlFor="analysis-auto-approve">
+                      Approva automaticamente con confidenza superiore a 90
+                    </FieldLabel>
+                    <FieldDescription>
+                      91–100: approvazione automatica solo con evidenze valide,
+                      senza conflitti o veti manuali. 75–90 alta, 50–74 media,
+                      0–49 bassa: revisione manuale. La confidenza è una stima
+                      del provider sull'azione, non una misura dell'accuratezza
+                      ASR. Mantenere il testo non pubblica regole. Le ipotesi
+                      precedenti senza punteggio restano manuali.
                     </FieldDescription>
                   </div>
                 </Field>

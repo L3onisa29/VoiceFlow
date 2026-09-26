@@ -67,7 +67,12 @@ try {
   await page.goto("https://voiceflow.test/#/settings");
   const panel = page.getByRole("region", { name: "Analisi con OpenAI" });
   await panel.getByText("Analisi disattivata", { exact: true }).waitFor();
-  assert.equal(await panel.getByRole("checkbox").isChecked(), false);
+  assert.equal(
+    await panel
+      .getByRole("checkbox", { name: "Autorizzo l'invio", exact: false })
+      .isChecked(),
+    false,
+  );
   assert.equal(
     (
       await page.evaluate(() =>
@@ -79,7 +84,9 @@ try {
   pass(
     "Off by default; reading settings never sends consent or starts analysis",
   );
-  await panel.getByRole("checkbox").check();
+  await panel
+    .getByRole("checkbox", { name: "Autorizzo l'invio", exact: false })
+    .check();
   await panel.getByLabel("Fonti per lotto", { exact: true }).fill("12");
   await panel.getByLabel("Richieste al giorno", { exact: true }).fill("3");
   await panel.getByRole("button", { name: "Salva preferenze analisi" }).click();

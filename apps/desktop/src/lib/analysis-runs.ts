@@ -22,7 +22,27 @@ const pageSchema = z.object({
   entries: z.array(runSchema),
   nextCursor: keySchema.nullable(),
 });
+const findingSchema = z.object({
+  id,
+  name: z.string(),
+  text: z.string(),
+  resultText: z.string(),
+  reason: z.string(),
+  action: z.enum(["keep", "remove", "replace"]),
+  confidence: z.number().int().min(0).max(100).nullable(),
+  outcome: z.string(),
+  publication: id.nullable(),
+  proposalId: id.nullable(),
+  evidence: z.array(
+    z.object({
+      sessionId: id,
+      revisionId: id.nullable(),
+      originalIndex: count.nullable(),
+    }),
+  ),
+});
 const detailSchema = z.object({
+  findings: z.array(findingSchema).default([]),
   run: runSchema,
   sources: z.array(
     z.object({

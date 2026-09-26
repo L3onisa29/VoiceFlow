@@ -1,6 +1,6 @@
 # Analisi locale dei lotti con OpenAI
 
-L'analisi è disattivata inizialmente. In Impostazioni, `Analisi con OpenAI` richiede la selezione esplicita del consenso e il salvataggio delle preferenze. La dettatura resta locale. Il consenso riguarda l'invio a OpenAI degli originali ASR, dei risultati elaborati, delle correzioni ricordate e delle definizioni pertinenti selezionati per il lotto. Le nuove regole richiedono sempre l'approvazione nella pagina Suggerimenti.
+L'analisi è disattivata inizialmente. In Impostazioni, `Analisi con OpenAI` richiede la selezione esplicita del consenso e il salvataggio delle preferenze. La dettatura resta locale. Il consenso riguarda l'invio a OpenAI degli originali ASR, dei risultati elaborati, delle correzioni ricordate e delle definizioni pertinenti selezionati per il lotto. Il criterio facoltativo `Approva automaticamente con confidenza superiore a 90` è disattivato per default, anche negli archivi precedenti. Se attivo, i nuovi rilievi validi con punteggio 91–100 possono pubblicare regole; 0–90 e punteggi sconosciuti restano manuali.
 
 Nel dettaglio di ogni trascrizione, `Escludi questa sessione dall'analisi con OpenAI` esclude anche le sue correzioni. L'esclusione e la disattivazione invalidano i lotti pendenti e interrompono quelli in corso tramite il contratto di cancellazione. La verifica dentro l'ingestione impedisce che una risposta arrivata dopo la revoca aggiunga nuove proposte. Un invio già accettato da OpenAI può comunque essere elaborato. VoiceFlow non dichiara di cancellare dati ricevuti dal fornitore o di annullarne il costo.
 
@@ -16,11 +16,11 @@ Il contesto comprende proposte pertinenti, stato del rifiuto e definizioni appro
 
 ## Stato persistente e privacy
 
-Le tabelle `analysis_*` risiedono nello storico SQLite, con una versione di schema indipendente e migrazione transazionale. Non modificano l'archivio delle impostazioni di dettatura. Conservano consenso, esclusioni, ID delle fonti, fingerprint, stati, tentativi e contatori. Non conservano payload, prompt, risposte del modello, stderr o copie testuali delle evidenze. Il payload viene ricostruito in RAM. Eliminare una sessione elimina anche i relativi eventi e riferimenti dei checkpoint tramite chiavi esterne.
+Le tabelle `analysis_*` risiedono nello storico SQLite, con una versione di schema indipendente e migrazione transazionale. Non modificano l'archivio delle impostazioni di dettatura. Conservano consenso, esclusioni, ID delle fonti, fingerprint, stati, tentativi e contatori. Non conservano payload, prompt, risposte grezze del modello o stderr. I rilievi strutturati conservano solo nome, estratto verificato, risultato consigliato, motivazione, azione, stima, riferimenti ed esito. Eliminare o escludere qualsiasi fonte collegata elimina il rilievo completo; lo stesso vale per rimozione o annullamento della revisione ricordata. Il payload viene ricostruito in RAM. Eliminare una sessione elimina anche i relativi eventi e riferimenti dei checkpoint tramite chiavi esterne.
 
 Ogni tentativo viene registrato e riserva il timeout prima di chiamare il provider. I contatori comprendono anche errori, spawn falliti e timeout: non sono il numero di richieste accettate da OpenAI. I byte indicano il payload preparato per quei tentativi, non una ricevuta di consegna remota. Il tempo misurato è separato da quello riservato. Dopo un crash il tempo effettivo è sconosciuto e il budget conserva la prenotazione massima; non viene inventata una durata misurata.
 
-Un errore dell'intero output non importa candidati e non avanza i checkpoint. Un output JSON completo può avere candidati invalidi: ciascun candidato è una transazione atomica separata, quelli validi vengono importati e il lotto termina `partial` con conteggi accettati/rifiutati. Anche questo lotto avanza le fonti ancora valide, evitando retry continui sugli stessi dati invalidi. Un retry dopo interruzione può ripresentare candidati già importati, ma C2 li deduplica e non riapre un rifiuto senza una nuova fonte identificabile. Nessun percorso di analisi chiama `review`, pubblica o attiva regole.
+Un errore dell'intero output non importa candidati e non avanza i checkpoint. Un output JSON completo può avere candidati invalidi: ciascun rilievo è una transazione atomica separata, quelli validi vengono importati e il lotto termina `partial` con conteggi accettati/rifiutati. Anche questo lotto avanza le fonti ancora valide, evitando retry continui sugli stessi dati invalidi. Un retry dopo interruzione può ripresentare candidati già importati, ma C2 li deduplica e non riapre un rifiuto senza una nuova fonte identificabile. Il provider non chiama `review`. Una decisione locale, autorizzata dall'impostazione corrente, può pubblicare una regola validata nella stessa transazione che salva proposta, riferimenti, rilievo, esito e audit.
 
 Un errore di archiviazione o infrastruttura durante l'ingestione interrompe invece il lotto come `failed`, con codice `ingest-storage`. Non incrementa i rifiuti semantici e non avanza alcun checkpoint del lotto. I candidati già committati restano disponibili, il tentativo resta nel budget e `prepare()` ripresenta lo stesso lotto per un retry entro i limiti. Il confine C2 distingue esplicitamente gli errori di validazione dagli altri errori, senza confrontare messaggi testuali. Se fallisce anche il salvataggio dell'esito, `run()` restituisce un errore; il tentativo può restare `running` e richiede `recover_interrupted()` dopo la verifica della prenotazione del worker. Anche in quel caso la transazione finale non consuma le fonti.
 
@@ -78,3 +78,51 @@ IPC asincroni con `spawn_blocking`:
 - `analysis_run_detail({ key: { batchId, attemptId } })`: metadati del tentativo, riferimenti alle sessioni e alle proposte. `attemptId: null` identifica soltanto un lotto ancora senza tentativi; se nel frattempo è partito, la lettura richiede di aggiornare l'elenco.
 
 La pagina rilegge i dati quando riceve focus e ogni 3 secondi durante un'esecuzione, altrimenti ogni 30 secondi. Ogni ciclo attende quello precedente; cambio pagina/selezione e smontaggio ignorano risposte obsolete e cancellano i timer. Un errore lascia visibili gli ultimi dati con un avviso e permette di riprovare. La lettura non abilita consenso, pianificazione o pubblicazione.
+
+## Rilievi, confidenza e criterio automatico
+
+Il contratto [analysis-output-v1.json](schemas/analysis-output-v1.json) richiede
+`name`, `text`, `reason`, `action`, `confidence`, `candidate` ed `evidence` per
+ogni elemento di `candidates`. `confidence` è un intero 0–100, stima del provider
+sull'azione proposta. Non misura l'accuratezza ASR. Il testo coincide con un
+estratto verificabile di ogni fonte citata e con l'input modificato di un esempio
+positivo quando viene proposta una regola. Nome, testo e motivazione sono limitati
+rispettivamente a 120, 2048 e 2000 caratteri, senza caratteri di controllo.
+
+`keep` richiede `candidate: null` e salva un esito senza pubblicazione. `remove`
+richiede una pulizia supportata; `replace` una regola terminologica. Esempi,
+condizioni ed eccezioni restano verificati dal compilatore. Il formato precedente
+con soli `candidate` ed `evidence` resta accettato con confidenza sconosciuta;
+i rilievi nuovi con punteggio assente o invalido vengono rifiutati. Le ipotesi nate
+senza punteggio conservano per sempre la revisione manuale, anche dopo nuove stime.
+
+Le fasce visibili sono 91–100 molto alta, 75–90 alta, 50–74 media e 0–49 bassa.
+Solo la prima può essere automatica. Un punteggio 90 resta manuale. Il punteggio
+storico e l'esito appartengono al tentativo, non cambiano quando una proposta viene
+modificata o una regola disattivata. La pagina Suggerimenti mostra confidenza ed
+esito dell'ultimo rilievo il cui hash del candidato normalizzato corrisponde
+esattamente al candidato corrente. Dopo una modifica manuale senza un rilievo
+corrispondente, la confidenza è sconosciuta e l'esito non viene attribuito alla
+proposta modificata. Una successiva analisi dello stesso candidato può fornire
+una nuova stima, senza riscrivere lo storico né rimuovere i veti manuali.
+
+La transazione immediata rilegge consenso, criterio, tentativo attivo, fingerprint
+delle fonti e dizionario allegato. Ricontrolla cancellazione e fonti dopo la
+validazione combinata. La stessa transazione pubblica versione, regole, audit ed
+esito: un errore SQLite li annulla insieme. Il controllo del compilatore avviene
+sotto questa transazione per impedire modifiche concorrenti del dizionario.
+I duplicati nello stesso tentativo usano un hash del rilievo; i retry successivi
+riconoscono le regole già attive senza una seconda pubblicazione.
+
+Rifiuto, rinvio, modifica, disattivazione e ripristino manuali registrano un veto
+persistente sull'identità normalizzata della regola, conservata soltanto come
+hash SHA-256. Una nuova fonte può riaprire la proposta per revisione ma non
+rimuove il veto automatico. Anche l'identità precedente a una modifica mantiene
+il veto. I record manuali precedenti senza tipo di azione recuperabile vengono
+trattati conservativamente come veto. Le regole approvate, anche automaticamente,
+restano definizioni indipendenti dopo la cancellazione delle fonti e si possono
+disattivare o ripristinare. Le sessioni già avviate conservano il proprio snapshot.
+
+L'elaborazione resta in lotti con massimo 16 rilievi per risposta e i limiti di
+fonti, byte, durata, tentativi e checkpoint già descritti. Non vengono introdotti
+invii aggiuntivi o streaming di JSON parziale.

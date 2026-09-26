@@ -13,7 +13,14 @@
         "additionalProperties": false,
         "properties": {
           "candidate": {
-            "$ref": "#/$defs/candidate"
+            "anyOf": [
+              {
+                "$ref": "#/$defs/candidate"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "evidence": {
             "type": "array",
@@ -22,13 +29,50 @@
             },
             "minItems": 1,
             "maxItems": 64
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "action": {
+            "enum": [
+              "keep",
+              "remove",
+              "replace"
+            ]
+          },
+          "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
           }
         },
-        "required": ["candidate", "evidence"]
+        "required": [
+          "candidate",
+          "evidence",
+          "name",
+          "text",
+          "reason",
+          "action",
+          "confidence"
+        ]
       }
     }
   },
-  "required": ["candidates"],
+  "required": [
+    "candidates"
+  ],
   "$defs": {
     "context": {
       "type": "object",
@@ -79,7 +123,12 @@
           "maxItems": 32
         }
       },
-      "required": ["before", "after", "exceptBefore", "exceptAfter"]
+      "required": [
+        "before",
+        "after",
+        "exceptBefore",
+        "exceptAfter"
+      ]
     },
     "operation": {
       "anyOf": [
@@ -101,7 +150,10 @@
               "maxItems": 7
             }
           },
-          "required": ["kind", "source"]
+          "required": [
+            "kind",
+            "source"
+          ]
         },
         {
           "type": "object",
@@ -116,7 +168,10 @@
               "maxLength": 100
             }
           },
-          "required": ["kind", "word"]
+          "required": [
+            "kind",
+            "word"
+          ]
         },
         {
           "type": "object",
@@ -129,15 +184,25 @@
               "const": "della"
             },
             "prefix": {
-              "enum": ["dell'", "dell’"]
+              "enum": [
+                "dell'",
+                "dell\u2019"
+              ]
             }
           },
-          "required": ["kind", "first", "prefix"]
+          "required": [
+            "kind",
+            "first",
+            "prefix"
+          ]
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "phrase"],
+          "required": [
+            "kind",
+            "phrase"
+          ],
           "properties": {
             "kind": {
               "const": "repeat-phrase"
@@ -181,7 +246,10 @@
               "maxItems": 32
             },
             "matching": {
-              "enum": ["exact", "unicode-lowercase"]
+              "enum": [
+                "exact",
+                "unicode-lowercase"
+              ]
             },
             "context": {
               "$ref": "#/$defs/context"
@@ -209,7 +277,11 @@
               "$ref": "#/$defs/context"
             }
           },
-          "required": ["category", "operation", "context"]
+          "required": [
+            "category",
+            "operation",
+            "context"
+          ]
         }
       ]
     },
@@ -228,7 +300,10 @@
           "maxLength": 2048
         }
       },
-      "required": ["input", "output"]
+      "required": [
+        "input",
+        "output"
+      ]
     },
     "candidate": {
       "type": "object",
@@ -238,7 +313,11 @@
           "$ref": "#/$defs/definition"
         },
         "language": {
-          "enum": ["*", "it", "en"]
+          "enum": [
+            "*",
+            "it",
+            "en"
+          ]
         },
         "groupIds": {
           "type": "array",
@@ -315,7 +394,11 @@
           ]
         }
       },
-      "required": ["sessionId", "revisionId", "originalIndex"]
+      "required": [
+        "sessionId",
+        "revisionId",
+        "originalIndex"
+      ]
     }
   }
 }

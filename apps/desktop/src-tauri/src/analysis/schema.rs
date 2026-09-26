@@ -12,6 +12,20 @@ fn schema() -> &'static Value {
     })
 }
 pub(super) fn candidate(value: &Value) -> bool {
+    if value
+        .as_object()
+        .is_some_and(|o| o.len() == 2 && o.contains_key("candidate") && o.contains_key("evidence"))
+    {
+        return matches(
+            &value["candidate"],
+            &schema()["$defs"]["candidate"],
+            schema(),
+        ) && matches(
+            &value["evidence"],
+            &schema()["properties"]["candidates"]["items"]["properties"]["evidence"],
+            schema(),
+        );
+    }
     matches(
         value,
         &schema()["properties"]["candidates"]["items"],

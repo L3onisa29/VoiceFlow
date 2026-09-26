@@ -26,6 +26,12 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
+import {
+  confidenceBand,
+  confidenceMeaning,
+  findingActions,
+  findingOutcomes,
+} from "@/lib/confidence";
 import { HistoryEditor } from "@/components/history/history-editor";
 import {
   analysisApi,
@@ -162,8 +168,8 @@ export function AnalysisPage() {
           <p className="eyebrow">ATTIVITÀ E RISULTATI</p>
           <h1>Analisi</h1>
           <p>
-            Ogni tentativo conserva il proprio esito. Le proposte richiedono la
-            tua approvazione.
+            Ogni tentativo conserva rilievi ed esiti. La pubblicazione segue il
+            criterio di confidenza nelle Impostazioni.
           </p>
         </div>
         <Button
@@ -212,8 +218,9 @@ export function AnalysisPage() {
                 </Badge>
               </div>
               <p className="text-sm text-muted-foreground">
-                {status.analysis.pendingSources} fonti pendenti. Il Mac deve
-                essere acceso e l'utente connesso. Lo stato del job non
+                {status.analysis.pendingSources} fonti pendenti · fino a{" "}
+                {status.analysis.settings.maxSources} fonti per lotto. Il Mac
+                deve essere acceso e l'utente connesso. Lo stato del job non
                 certifica un'analisi riuscita.
               </p>
             </>
@@ -382,6 +389,84 @@ export function AnalysisPage() {
                     </Button>
                   ))}
                 </div>
+                <h3>Rilievi e decisioni</h3>
+                <p className="text-sm text-muted-foreground">
+                  {confidenceMeaning} Ogni esito descrive questo tentativo; la
+                  regola attuale può essere stata disattivata o ripristinata.
+                </p>
+                {detail.findings.length === 0 && (
+                  <p>
+                    Nessun rilievo disponibile. I dati precedenti non hanno
+                    punteggi retroattivi; eliminazioni ed esclusioni rimuovono i
+                    rilievi delle fonti.
+                  </p>
+                )}
+                {detail.findings.map((finding) => (
+                  <Card
+                    key={finding.id}
+                    aria-label={`Rilievo: ${finding.name}`}
+                  >
+                    <CardHeader>
+                      <CardTitle>{finding.name}</CardTitle>
+                      <CardDescription>{finding.reason}</CardDescription>
+                    </CardHeader>
+                    <CardContent className="flex flex-col gap-3">
+                      <div className="flex flex-wrap gap-2">
+                        <Badge
+                          variant="outline"
+                          className="max-w-full whitespace-normal"
+                        >
+                          {findingActions[finding.action]}
+                        </Badge>
+                        <Badge
+                          variant="secondary"
+                          className="max-w-full whitespace-normal"
+                        >
+                          {finding.confidence === null
+                            ? "Confidenza sconosciuta"
+                            : `Confidenza ${finding.confidence}/100`}{" "}
+                          · {confidenceBand(finding.confidence)}
+                        </Badge>
+                        <Badge
+                          variant="outline"
+                          className="max-w-full whitespace-normal"
+                        >
+                          {findingOutcomes[finding.outcome] ?? finding.outcome}
+                        </Badge>
+                      </div>
+                      <dl className="flex flex-col gap-1 text-sm">
+                        <dt>Testo della fonte</dt>
+                        <dd>{finding.text}</dd>
+                        <dt>Risultato consigliato</dt>
+                        <dd>{finding.resultText}</dd>
+                      </dl>
+                      <p className="text-sm text-muted-foreground">
+                        Fonti:{" "}
+                        {finding.evidence
+                          .map(
+                            (e) =>
+                              `sessione #${e.sessionId}${e.revisionId === null ? "" : `, revisione #${e.revisionId}`}${e.originalIndex === null ? "" : `, segmento ASR ${e.originalIndex + 1}`}`,
+                          )
+                          .join("; ")}
+                      </p>
+                      {finding.publication !== null && (
+                        <p className="text-sm">
+                          Versione al momento dell'esito: {finding.publication}
+                        </p>
+                      )}
+                      {finding.proposalId !== null && (
+                        <Button asChild variant="outline">
+                          <Link
+                            to="/suggestions"
+                            search={{ proposal: finding.proposalId }}
+                          >
+                            Apri proposta #{finding.proposalId}
+                          </Link>
+                        </Button>
+                      )}
+                    </CardContent>
+                  </Card>
+                ))}
                 <h3>Proposte collegate</h3>
                 <p className="text-sm text-muted-foreground">
                   {detail.proposals.length} proposte distinte. Più candidati

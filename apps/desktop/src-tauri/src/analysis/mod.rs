@@ -1,4 +1,5 @@
 //! Local, incremental analysis. The provider receives RAM-only payloads and cannot publish rules.
+pub(crate) mod findings;
 mod provider;
 pub mod runs;
 pub use runs::{RunDetail, RunKey, RunPage};
@@ -33,6 +34,8 @@ impl std::error::Error for DailyLimit {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnalysisSettings {
     pub enabled: bool,
+    #[serde(default)]
+    pub auto_approve_high_confidence: bool,
     pub max_sources: u32,
     pub max_input_bytes: u32,
     pub max_requests_per_day: u32,
@@ -43,6 +46,7 @@ impl Default for AnalysisSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_approve_high_confidence: false,
             max_sources: 20,
             max_input_bytes: 65_536,
             max_requests_per_day: 2,
@@ -158,7 +162,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         INSERT INTO analysis_schema SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM analysis_schema);",
     )?;
     ensure!(
-        (1..=2).contains(
+        (1..=3).contains(
             &c.query_row("SELECT version FROM analysis_schema", [], |r| r
                 .get::<_, i64>(0))?
         ),
@@ -180,6 +184,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS analysis_forget AFTER DELETE ON confirmed_corrections BEGIN DELETE FROM analysis_events WHERE revision_id=OLD.revision_id; END;
         CREATE TRIGGER IF NOT EXISTS analysis_undo AFTER UPDATE OF reverted ON history_revisions WHEN NEW.reverted=1 BEGIN DELETE FROM analysis_events WHERE revision_id=NEW.id; END;")?;
     runs::migrate(c)?;
+    findings::migrate(c)?;
     let inserted = c.execute(
         "INSERT OR IGNORE INTO analysis_settings(id,json) VALUES(1,?1)",
         [serde_json::to_string(&AnalysisSettings::default())?],
@@ -194,7 +199,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
     c.prepare("SELECT id,session_id,revision_id,done FROM analysis_events LIMIT 0")?;
     Ok(())
 }
-fn settings(c: &Connection) -> Result<(AnalysisSettings, i64)> {
+pub(crate) fn settings(c: &Connection) -> Result<(AnalysisSettings, i64)> {
     let (json, version): (String, i64) = c.query_row(
         "SELECT json,privacy_version FROM analysis_settings WHERE id=1",
         [],
@@ -442,14 +447,23 @@ impl AnalysisStore {
                             rejected += 1;
                             continue;
                         }
-                        let request = match serde_json::from_value::<IngestRequest>(value) {
-                            Ok(request) => request,
-                            Err(_) => {
-                                rejected += 1;
-                                continue;
+                        let result = if value.get("name").is_none() {
+                            // Preserve the old ingest contract without inventing finding text or a score.
+                            match serde_json::from_value::<IngestRequest>(value) {
+                                Ok(request) => {
+                                    suggestions.ingest_prepared(request, batch.id, attempt)
+                                }
+                                Err(_) => Err(IngestFailure::InvalidCandidate),
+                            }
+                        } else {
+                            match findings::Finding::parse(value) {
+                                Ok(request) => {
+                                    suggestions.ingest_finding(request, batch.id, attempt, cancel)
+                                }
+                                Err(_) => Err(IngestFailure::InvalidCandidate),
                             }
                         };
-                        match suggestions.ingest_prepared(request, batch.id, attempt) {
+                        match result {
                             Ok(()) => accepted += 1,
                             Err(IngestFailure::InvalidCandidate) => rejected += 1,
                             Err(IngestFailure::Infrastructure) => {

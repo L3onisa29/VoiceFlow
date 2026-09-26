@@ -1,3 +1,8 @@
+import {
+  confidenceBand,
+  confidenceMeaning,
+  findingOutcomes,
+} from "@/lib/confidence";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoute, Link } from "@tanstack/react-router";
 import {
@@ -210,8 +215,9 @@ export function SuggestionsPage() {
         <ShieldCheck aria-hidden="true" />
         <AlertDescription>
           Le proposte sono ipotesi. Una correzione ricordata è un esempio
-          confermato da te, non autorizza una sostituzione. Solo “Approva e
-          pubblica” attiva la regola dalla prossima sessione.
+          confermato da te. Puoi approvare manualmente; il criterio facoltativo
+          nelle Impostazioni approva i nuovi rilievi oltre 90 solo dopo i
+          controlli. Le regole pubblicate valgono dalla prossima sessione.
         </AlertDescription>
       </Alert>
       {error && !dialog ? (
@@ -307,6 +313,22 @@ export function SuggestionsPage() {
                     </h2>
                   </CardTitle>
                   <CardDescription>{proposal.candidate.reason}</CardDescription>
+                  <p className="text-sm">
+                    {proposal.confidence === null
+                      ? "Confidenza sconosciuta"
+                      : `Confidenza ${proposal.confidence}/100`}{" "}
+                    · {confidenceBand(proposal.confidence)}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {confidenceMeaning}
+                  </p>
+                  {proposal.analysisOutcome && (
+                    <Badge variant="outline">
+                      Ultimo esito analisi:{" "}
+                      {findingOutcomes[proposal.analysisOutcome] ??
+                        proposal.analysisOutcome}
+                    </Badge>
+                  )}
                 </CardHeader>
                 <CardContent className="flex flex-col gap-5">
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

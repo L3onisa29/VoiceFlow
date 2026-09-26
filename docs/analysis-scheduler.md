@@ -1,6 +1,6 @@
 # Pianificazione locale dell'analisi
 
-In Impostazioni, salva prima il consenso in **Analisi con OpenAI**. In **Pianificazione locale**, seleziona l'attivazione del LaunchAgent e salva. I due consensi sono separati e inizialmente disattivati. L'approvazione delle proposte linguistiche resta nella pagina Suggerimenti. Aprire l'app o leggere lo stato non abilita il job.
+In Impostazioni, salva prima il consenso in **Analisi con OpenAI**. In **Pianificazione locale**, seleziona l'attivazione del LaunchAgent e salva. I due consensi sono separati e inizialmente disattivati. L'approvazione delle proposte linguistiche resta manuale nella pagina Suggerimenti, salvo attivazione esplicita del criterio facoltativo per i nuovi rilievi con confidenza superiore a 90 e controlli locali superati. Aprire l'app o leggere lo stato non abilita il job.
 
 La fascia iniziale è 02:30–06:00 nell'ora locale del Mac; 03:00–05:00 è una configurazione valida. La durata ammessa è da 1 minuto a 12 ore. Una fine precedente all'inizio indica il giorno seguente, per esempio 23:00–01:00. Inizio e fine uguali sono rifiutati. Il worker controlla nuovamente fascia e consenso prima della preparazione, prima della richiesta e durante il lavoro.
 
@@ -59,7 +59,7 @@ La prova nativa richiede l'attivazione esplicita nell'app e resta da eseguire:
 
 1. Aprire la build finale firmata, verificare entrambi i consensi OFF e helper presente. Non salvare consensi per controllare soltanto l'interfaccia.
 2. Per autorizzare il job reale, selezionare prima il consenso OpenAI e poi l'attivazione della pianificazione. Configurare una fascia breve che includa l'ora corrente e limiti D1 ridotti.
-3. Chiudere la finestra e l'app, attendere il prossimo evento calendario. Riaprire e verificare tentativo, checkpoint, stato ed eventuali errori senza pubblicazione di regole.
+3. Chiudere la finestra e l'app, attendere il prossimo evento calendario. Riaprire e verificare tentativo, checkpoint, stato ed eventuali errori. Con il criterio automatico disattivato non devono essere pubblicate regole; se esplicitamente attivato, verificare che soltanto i nuovi rilievi sopra 90 con controlli locali superati possano pubblicare.
 4. Solo durante una prova audio esplicitamente richiesta, avviare dettatura mentre il provider lavora. Controllare preemption, pausa/ripresa/finalizzazione e avviso eventuale; verificare che la dettatura resti utilizzabile.
 5. Verificare fine fascia e revoca del consenso durante il lavoro. Nessuna nuova richiesta dopo il confine; i dati già inviati restano soggetti alla policy del fornitore.
 6. Salvare 03:00–05:00 due volte, riparare due volte e disattivare due volte. Confrontare preferenza, plist e rilevamento. Non modificare fuso/ora del Mac per questa prova; le transizioni sono coperte da clock controllato.

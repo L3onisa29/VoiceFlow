@@ -48,6 +48,8 @@ const proposalSchema = z.object({
   state: z.enum(["proposed", "approved", "rejected", "deferred", "disabled"]),
   rejectionReason: z.string().nullable(),
   approvedAt: z.number().nullable(),
+  confidence: z.number().int().min(0).max(100).nullable().default(null),
+  analysisOutcome: z.string().nullable().default(null),
   conflicts: z.array(z.string()),
   evidence: z.array(
     z.object({
