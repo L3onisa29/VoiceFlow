@@ -684,8 +684,9 @@ impl SuggestionStore {
         &self,
         request: IngestRequest,
         batch_id: i64,
+        attempt_id: i64,
     ) -> std::result::Result<(), IngestFailure> {
-        self.ingest_scoped(request, Some(batch_id))
+        self.ingest_scoped(request, Some((batch_id, attempt_id)))
             .map_err(|error| {
                 if error.is::<CandidateRejection>() {
                     IngestFailure::InvalidCandidate
@@ -694,7 +695,7 @@ impl SuggestionStore {
                 }
             })
     }
-    fn ingest_scoped(&self, request: IngestRequest, batch_id: Option<i64>) -> Result<()> {
+    fn ingest_scoped(&self, request: IngestRequest, scope: Option<(i64, i64)>) -> Result<()> {
         ensure!(
             !request.evidence.is_empty() && request.evidence.len() <= 64,
             CandidateRejection(anyhow::anyhow!("Servono da 1 a 64 riferimenti reali."))
@@ -703,11 +704,12 @@ impl SuggestionStore {
         self.access(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let dictionary = crate::dictionary::read_schema_snapshot(&tx,"vocabulary")?;
-            if let Some(id)=batch_id { crate::analysis::validate_scope(&tx,id,&request.evidence)?; }
+            if let Some((id,attempt))=scope { crate::analysis::validate_scope(&tx,id,&request.evidence)?; ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM analysis_attempts WHERE id=?1 AND batch_id=?2 AND state='running')",params![attempt,id],|r|r.get::<_,bool>(0))?,"Tentativo non attivo."); }
             validate(&candidate,&dictionary).map_err(CandidateRejection)?;
             for reference in &request.evidence { validate_evidence(&candidate,&evidence(&tx,reference.clone())?).map_err(CandidateRejection)?; }
             let identity = canonical(&candidate)?;
             let existing: Option<(i64,String)> = tx.query_row("SELECT id,candidate_json FROM suggestions WHERE identity=?1",[&identity],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let created = existing.is_none();
             let id = if let Some((id,json)) = existing {
                 let old:Candidate=serde_json::from_str(&json)?;
                 // A duplicate cannot silently alter a reviewed definition or its examples.
@@ -726,6 +728,12 @@ impl SuggestionStore {
                 inserted += tx.execute("INSERT OR IGNORE INTO suggestion_evidence VALUES(?1,?2,?3,?4,?5)",params![id,r.session_id,r.revision_id,r.original_index,serde_json::to_string(r)?])?;
             }
             if inserted > 0 { tx.execute("UPDATE suggestions SET revision=revision+1,state=CASE WHEN state='rejected' AND ?2 THEN 'proposed' ELSE state END WHERE id=?1",params![id,new_source])?; }
+            if let Some((_,attempt))=scope {
+                let revision:i64=tx.query_row("SELECT revision FROM suggestions WHERE id=?1",[id],|r|r.get(0))?;
+                let relation=if created {"created"} else if inserted>0 {"updated"} else {"existing"};
+                tx.execute("INSERT INTO analysis_attempt_proposals(attempt_id,proposal_id,relation,revision) VALUES(?1,?2,?3,?4) ON CONFLICT(attempt_id,proposal_id) DO UPDATE SET revision=excluded.revision,relation=CASE WHEN analysis_attempt_proposals.relation='created' THEN 'created' WHEN analysis_attempt_proposals.relation='updated' OR excluded.relation='updated' THEN 'updated' ELSE 'existing' END",params![attempt,id,relation,revision])?;
+                tx.execute("UPDATE analysis_attempts SET accepted=accepted+1 WHERE id=?1",[attempt])?;
+            }
             tx.commit()?; Ok(())
         })
     }

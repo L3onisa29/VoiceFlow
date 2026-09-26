@@ -131,10 +131,13 @@ pub fn run() {
             suggestions::suggestions_snapshot,
             suggestions::suggestions_review,
             analysis::analysis_status,
+            analysis::runs::analysis_runs,
+            analysis::runs::analysis_run_detail,
             analysis::analysis_configure,
             analysis::analysis_exclude,
             analysis::analysis_excluded,
             scheduler::scheduler_status,
+            scheduler::invocations::scheduler_invocations,
             scheduler::scheduler_configure,
             history::history_remember
         ])

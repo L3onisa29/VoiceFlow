@@ -8,7 +8,7 @@ Il LaunchAgent `com.voiceflow.desktop.analysis` lavora nella sessione GUI dell'u
 
 ## Stato e riparazione
 
-L'app distingue preferenza richiesta, presenza del plist, rilevamento del job tramite `launchctl print`, configurazione del plist e proprietà del worker tramite lock del kernel. “Job caricato” significa registrato in launchd, non prova che un'analisi sia riuscita. I risultati, gli errori del provider e i contatori sono nel pannello Analisi. Aggiorna lo stato per rileggere i dati; non è un indicatore aggiornato in streaming.
+L'app distingue preferenza richiesta, presenza del plist, rilevamento del job tramite `launchctl print`, configurazione del plist e proprietà del worker tramite lock del kernel. “Job caricato” significa registrato in launchd, non prova che un'analisi sia riuscita. I risultati, gli errori del provider e i contatori sono nella pagina Analisi, insieme agli ultimi avvii del job. La pagina rilegge automaticamente i dati durante il lavoro e quando torna in primo piano; il pannello delle Impostazioni mantiene il pulsante Aggiorna stato.
 
 **Salva pianificazione** installa o aggiorna. **Ripara pianificazione** riconcilia una configurazione salvata dopo un errore di installazione o dopo lo spostamento del bundle. Entrambe le azioni sono idempotenti. **Disattiva pianificazione** salva OFF prima di chiamare `launchctl disable` e `bootout`. Se launchctl fallisce, OFF resta salvato e i processi rispettano la revoca. Ripetere la disattivazione completa la rimozione. Disattivare il consenso OpenAI interrompe comunque il worker, anche se il LaunchAgent resta registrato.
 
@@ -66,3 +66,16 @@ La prova nativa richiede l'attivazione esplicita nell'app e resta da eseguire:
 7. Dopo uno spostamento autorizzato del bundle, usare Ripara e verificare il nuovo percorso. Ripetere la verifica della firma di helper e app.
 
 L'interfaccia è desktop. La dimensione minima dichiarata è 780×620; la navigazione per smartphone non rientra in questo lotto.
+
+
+## Avvii visibili anche senza richieste
+
+La pagina Analisi distingue consenso OpenAI, preferenza di pianificazione, plist installato, job caricato e worker attivo. Mostra il motivo per cui l'analisi automatica non è attiva e collega le Impostazioni per intervenire. L'assenza di analisi completate non viene interpretata come un guasto di launchd: le due cronologie restano separate.
+
+`analysis-scheduler.sqlite3` conserva gli ultimi 100 avvii del launcher che hanno acquisito il lock del worker. La conservazione limitata evita di accumulare indefinitamente i controlli senza lavoro. Gli avvii concorrenti che non acquisiscono il lock non aggiungono una riga. I tentativi effettivi del provider rimangono integralmente nello storico di Analisi, senza questa scadenza.
+
+Ogni avvio registrato conserva l'inizio, la fine se osservata, un codice statico e l'eventuale ID del lotto. Gli esiti distinguono pianificazione disattivata, fuori fascia, dettatura, consenso assente/non leggibile, attesa del retry, nessuna fonte preparabile, limite giornaliero, CLI indisponibile, errore del worker e risultato del tentativo. «Nessuna fonte preparabile» può dipendere anche da esclusioni o fonti troppo grandi; non equivale a una chiamata completata senza candidati. Un errore prima dell'apertura dell'archivio può impedire anche la registrazione diagnostica.
+
+Il nuovo IPC `scheduler_invocations()` usa `spawn_blocking`. Se acquisisce il lock del worker, può riconciliare vecchi avvii rimasti aperti e i relativi tentativi come interrotti. Anche il launcher riconcilia prima di registrare il prossimo avvio. Non inventa l'ora della fine o il tempo misurato. Il launcher recupera inoltre i tentativi dopo aver terminato e raccolto il proprio gruppo di processi. La prova resta il lock del kernel, non la scadenza informativa né il PID persistito.
+
+Le nuove righe diagnostiche non contengono testo del provider, stdout/stderr, prompt o trascrizioni. Le scritture usano lo stesso timeout SQLite breve dello scheduler e non entrano nel percorso della cattura. I limiti D1, i lock, la fascia, il backoff e le regole di cancellazione restano quelli descritti sopra. La CLI reale e la consegna del bundle firmato richiedono la verifica nativa separata; gli esiti dei test con provider finti non vengono importati nello storico personale.

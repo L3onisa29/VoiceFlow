@@ -1,5 +1,6 @@
 //! Local launchd scheduling. Reading status never enables or executes a job.
 mod coordination;
+pub mod invocations;
 mod runtime;
 #[cfg(test)]
 mod tests;
@@ -94,6 +95,7 @@ impl Store {
         let c = Connection::open(self.data.join("analysis-scheduler.sqlite3"))?;
         c.busy_timeout(Duration::from_millis(100))?;
         c.execute_batch("CREATE TABLE IF NOT EXISTS scheduler(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL, last_error TEXT, phase TEXT NOT NULL DEFAULT 'idle', lease_until INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, retry_day INTEGER NOT NULL DEFAULT 0);")?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS scheduler_invocations(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at INTEGER NOT NULL,ended_at INTEGER,reason TEXT NOT NULL,batch_id INTEGER);")?;
         c.execute(
             "INSERT OR IGNORE INTO scheduler(id,config) VALUES(1,?1)",
             [serde_json::to_string(&Schedule::default())?],

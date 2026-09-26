@@ -54,10 +54,27 @@ Per ogni evento `item.started`, `item.updated` e `item.completed`, il parser amm
 
 D2 deve possedere una sola prenotazione del worker, chiamare queste funzioni fuori dal thread UI, verificare fascia/dettatura prima della preparazione e di ogni richiesta e fornire cancellazione durante le richieste. Non deve invocare ingestione generica o `review` sulle risposte. L'entrypoint interno `SuggestionStore::ingest_prepared` usa la stessa transazione di C2 con una guardia aggiuntiva per il lotto; il pubblico `ingest` mantiene il contratto precedente.
 
-D1 registra solo IPC per preferenze, stato ed esclusioni. Non espone un IPC di esecuzione dell'analisi e non avvia job. Finestra 02:30–06:00, LaunchAgent, coordinamento con la dettatura e politica di retry appartengono a D2.
+D1 registra IPC per preferenze, stato, esclusioni e consultazione dei tentativi. Non espone un IPC di esecuzione dell'analisi e non avvia job. Finestra 02:30–06:00, LaunchAgent, coordinamento con la dettatura e politica di retry appartengono a D2.
 
 Lo schema completo della risposta è [analysis-output-v1.json](schemas/analysis-output-v1.json). Ogni elemento `candidates` usa il contratto C2. Il validatore locale applica anche i campi nullable obbligatori e i limiti dello schema prima della validazione semantica C2. Questo impedisce che il comportamento permissivo dei campi Rust `Option` accetti campi mancanti.
 
 ## Pianificazione disponibile in D2
 
 Il helper, il LaunchAgent, la fascia locale e il coordinamento con la dettatura sono descritti in [Pianificazione locale dell'analisi](analysis-scheduler.md). L'attivazione richiede una seconda scelta esplicita nell'app, oltre al consenso D1. Il provider in quel processo usa il gruppo supervisionato del worker: una terminazione forzata conserva il budget riservato e rende necessario il recupero dei checkpoint dopo la prova del lock. Le directory CLI del worker vengono raccolte dal launcher o al successivo controllo sicuro dello stato. Il percorso D1 separato conserva la propria gestione del gruppo e dello scratch temporaneo.
+
+## Storico dei tentativi nell'app
+
+La pagina **Analisi** elenca i tentativi persistenti, inclusi quelli automatici del helper. Ogni riga mostra lotto, tentativo, stato e conteggi; i lotti preparati senza tentativi restano visibili con la dicitura «Preparata, nessun invio». La paginazione usa la coppia lotto/tentativo in ordine decrescente e restituisce 20 righe per pagina. I tentativi non hanno una scadenza di conservazione. Un esito `completed` con zero candidati è un'analisi completata senza suggerimenti.
+
+Il dettaglio conserva il risultato del singolo tentativo, indipendentemente dai retry dello stesso lotto: inizio, fine se osservata, tempo misurato della richiesta al provider, byte preparati, numero originale delle fonti, candidati accettati/rifiutati e codice d'errore. La durata riguarda la chiamata al provider, non tutta l'ingestione. Dopo un'interruzione senza fine osservata, fine e durata restano sconosciute; la prenotazione del budget rimane invariata. I record precedenti alla migrazione v2 conservano il proprio stato e inizio, ma non ereditano conteggi o errori dal lotto mutabile. I metadati mancanti sono dichiarati sconosciuti.
+
+Ogni ingestione valida registra nella stessa transazione C2 il collegamento tentativo/proposta, la revisione risultante e l'effetto `created`, `updated` oppure `existing`. La stessa proposta compare una sola volta per tentativo, anche quando più candidati accettati la ripresentano. Un errore di storage annulla anche quel collegamento. I candidati già committati prima di un errore o crash restano collegati al tentativo che li ha importati. Un retry crea nuovi collegamenti propri, senza cambiare quelli precedenti.
+
+Il link alla proposta apre la sua versione corrente in Suggerimenti, filtrata per ID. La revisione conservata nel tentativo indica quale revisione aveva prodotto l'ingestione; non viene archiviata un'altra copia del testo della proposta o dei suoi esempi. Il dettaglio delle sessioni riusa lo storico corrente. L'esclusione impedisce l'apertura della sessione da Analisi; la cancellazione della sessione o revisione rimuove i riferimenti attraverso le chiavi esterne e conserva soltanto i conteggi operativi. Le proposte eliminate sono indicate come tali. Nessun prompt, output CLI o testo delle fonti viene duplicato nelle nuove tabelle.
+
+IPC asincroni con `spawn_blocking`:
+
+- `analysis_runs({ before, limit })`: pagina di righe, con `before` nullo oppure `{ batchId, attemptId }`; limite 1–100, ID positivi.
+- `analysis_run_detail({ key: { batchId, attemptId } })`: metadati del tentativo, riferimenti alle sessioni e alle proposte. `attemptId: null` identifica soltanto un lotto ancora senza tentativi; se nel frattempo è partito, la lettura richiede di aggiornare l'elenco.
+
+La pagina rilegge i dati quando riceve focus e ogni 3 secondi durante un'esecuzione, altrimenti ogni 30 secondi. Ogni ciclo attende quello precedente; cambio pagina/selezione e smontaggio ignorano risposte obsolete e cancellano i timer. Un errore lascia visibili gli ultimi dati con un avviso e permette di riprovare. La lettura non abilita consenso, pianificazione o pubblicazione.

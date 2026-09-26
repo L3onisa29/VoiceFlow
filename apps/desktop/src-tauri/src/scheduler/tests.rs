@@ -526,3 +526,61 @@ fn completed_checkpoint_does_not_repeat_in_fall_hour_or_after_restart() {
         );
     }
 }
+
+#[test]
+fn invocation_history_is_bounded_and_preserves_unknown_crash_end() {
+    let f = Fixture::new();
+    let store = f.store();
+    store.begin_invocation().unwrap();
+    let id = store.begin_invocation().unwrap();
+    store.finish_invocation(id, "no-work", None).unwrap();
+    let records = store.invocations().unwrap();
+    assert_eq!(records[0].reason, "no-work");
+    assert!(records[0].ended_at.is_some());
+    assert_eq!(records[1].reason, "interrupted");
+    assert!(records[1].ended_at.is_none());
+    for _ in 0..105 {
+        let id = store.begin_invocation().unwrap();
+        store.finish_invocation(id, "outside-window", None).unwrap();
+    }
+    let records = Store::new(f.data.clone()).invocations().unwrap();
+    assert_eq!(records.len(), 100);
+    assert!(records.windows(2).all(|p| p[0].id > p[1].id));
+}
+#[test]
+fn launcher_skips_are_persistent_without_provider_calls() {
+    let f = Fixture::new();
+    runtime::run(vec!["--data".into(), f.data.to_string_lossy().into_owned()]).unwrap();
+    assert_eq!(f.store().invocations().unwrap()[0].reason, "disabled");
+    let minute = local_minute(Local::now());
+    f.store()
+        .save(&Schedule {
+            enabled: true,
+            start_minute: (minute + 60) % 1440,
+            end_minute: (minute + 120) % 1440,
+        })
+        .unwrap();
+    runtime::run(vec!["--data".into(), f.data.to_string_lossy().into_owned()]).unwrap();
+    assert_eq!(f.store().invocations().unwrap()[0].reason, "outside-window");
+    assert!(f.analysis().runs(None, 20).unwrap().entries.is_empty());
+}
+#[test]
+fn background_no_work_and_failure_have_durable_diagnostics() {
+    let f = Fixture::new();
+    f.ready("exit 7");
+    let mut child = f.launch();
+    child.wait().unwrap();
+    let runs = f.analysis().runs(None, 20).unwrap();
+    assert_eq!(runs.entries[0].state, "failed");
+    assert_eq!(runs.entries[0].error.as_deref(), Some("provider-exit"));
+    assert_eq!(f.store().invocations().unwrap()[0].reason, "failed");
+    let f = Fixture::new();
+    f.ready("exit 7");
+    HistoryStore::new(f.data.join("history.sqlite3"))
+        .delete(1)
+        .unwrap();
+    let mut child = f.launch();
+    child.wait().unwrap();
+    assert_eq!(f.store().invocations().unwrap()[0].reason, "no-work");
+    assert!(!f.data.join("provider.pid").exists());
+}

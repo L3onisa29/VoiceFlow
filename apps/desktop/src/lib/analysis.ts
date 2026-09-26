@@ -40,6 +40,8 @@ export const analysisApi = {
     invoke<void>("analysis_exclude", { id, excluded }),
 };
 export const analysisErrors: Record<string, string> = {
+  "ingest-storage":
+    "Errore di archiviazione. Le proposte già salvate restano disponibili; il lotto può essere riprovato.",
   "provider-unavailable":
     "Codex CLI o Node non disponibile. Verifica l'installazione.",
   "provider-exit":

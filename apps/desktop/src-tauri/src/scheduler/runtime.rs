@@ -45,10 +45,15 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             unsafe { libc::getpgrp() } == unsafe { libc::getpid() },
             "Worker senza gruppo isolato."
         );
-        let result = execute(&data);
-        if let Err(error) = result {
+        let invocation = value("--invocation")
+            .filter(|v| !v.is_empty())
+            .map(|v| v.parse::<i64>())
+            .transpose()?;
+        let result = execute(&data, invocation);
+        if result.is_err() {
             let store = Store::new(data);
-            let _ = store.error(Some(&format!("Analisi non completata: {error}")));
+            let _ = store.error(Some("Analisi non completata. Consulta Analisi per gli esiti; verifica disponibilità CLI e archivio."));
+            store.note(invocation, "worker-error", None);
             let _ = store.outcome(true, now_ms());
         }
         kill_execution_group();
@@ -58,11 +63,28 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     let Some(permit) = coordination.worker()? else {
         return Ok(());
     };
+    let invocation = store.begin_invocation().ok();
+    let _observation = super::invocations::Observation {
+        store: &store,
+        id: invocation,
+    };
     clear_scratch(&data)?;
-    if !store.schedule()?.current() || !store.due(now_ms())? {
-        return Ok(());
-    }
-    if coordination.recording() || !consented(&data) {
+    let schedule = store.schedule()?;
+    let skip = if !schedule.enabled {
+        Some("disabled")
+    } else if !schedule.current() {
+        Some("outside-window")
+    } else if !store.due(now_ms())? {
+        Some("backoff")
+    } else if coordination.recording() {
+        Some("recording")
+    } else if !consented(&data) {
+        Some("consent-unavailable")
+    } else {
+        None
+    };
+    if let Some(reason) = skip {
+        store.note(invocation, reason, None);
         return Ok(());
     }
     let previous: String =
@@ -70,6 +92,12 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             .connect()?
             .query_row("SELECT phase FROM scheduler WHERE id=1", [], |r| r.get(0))?;
     if previous == "running" {
+        let _ = AnalysisStore::open(
+            data.join("history.sqlite3"),
+            data.join("dictionary.sqlite3"),
+        )
+        .recover_interrupted();
+        store.note(invocation, "interrupted", None);
         store.outcome(true, now_ms())?;
         store.error(Some("Worker interrotto. Checkpoint e budget conservati; nuovo tentativo dopo almeno 5 minuti."))?;
         return Ok(());
@@ -78,12 +106,20 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     fs::DirBuilder::new()
         .mode(0o700)
         .create(data.join("analysis-runtime"))?;
-    let mut child = role_command("--execute", &data, fd)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()?;
+    let mut child = role_command_args(
+        "--execute",
+        &data,
+        fd,
+        &[
+            "--invocation",
+            &invocation.map(|id| id.to_string()).unwrap_or_default(),
+        ],
+    )?
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .process_group(0)
+    .spawn()?;
     let _parent_pipe = child.stdin.take();
     let start = Instant::now();
     let mut interrupted = None;
@@ -113,19 +149,29 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             .connect()?
             .query_row("SELECT phase FROM scheduler WHERE id=1", [], |r| r.get(0))?;
     if phase == "running" {
+        let _ = AnalysisStore::open(
+            data.join("history.sqlite3"),
+            data.join("dictionary.sqlite3"),
+        )
+        .recover_interrupted();
+        store.note(invocation, "interrupted", None);
         store.outcome(true, now_ms())?;
         store.error(Some("Worker interrotto. Checkpoint e budget conservati; nuovo tentativo dopo almeno 5 minuti."))?;
     }
     Ok(())
 }
 pub(super) fn role_command(role: &str, data: &Path, fd: RawFd) -> Result<Command> {
-    let args = vec![
+    role_command_args(role, data, fd, &[])
+}
+fn role_command_args(role: &str, data: &Path, fd: RawFd, extra: &[&str]) -> Result<Command> {
+    let mut args = vec![
         role.to_string(),
         "--data".into(),
         data.to_string_lossy().into_owned(),
         "--permit-fd".into(),
         fd.to_string(),
     ];
+    args.extend(extra.iter().map(|s| s.to_string()));
     let mut command = Command::new(std::env::current_exe()?);
     #[cfg(not(test))]
     command.args(args);
@@ -225,12 +271,15 @@ fn watchdog(data: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
 }
-fn execute(data: &Path) -> Result<()> {
+fn execute(data: &Path, invocation: Option<i64>) -> Result<()> {
+    let store = Store::new(data.to_path_buf());
     let coordination = Coordination::new(data);
     let Some(work) = coordination.work()? else {
+        store.note(invocation, "recording", None);
         return Ok(());
     };
     if coordination.recording() {
+        store.note(invocation, "recording", None);
         return Ok(());
     }
     let work_fd = work.inherit()?;
@@ -252,8 +301,8 @@ fn execute(data: &Path) -> Result<()> {
             }
         }
     });
-    let store = Store::new(data.to_path_buf());
     if !store.schedule()?.current() || !consented(data) || !store.due(now_ms())? {
+        store.note(invocation, "conditions-changed", None);
         return Ok(());
     }
     store.phase("running", now_ms() + 630_000)?;
@@ -271,18 +320,33 @@ fn execute(data: &Path) -> Result<()> {
             || started.elapsed() >= Duration::from_secs(600)
     };
     if cancelled() {
+        store.note(invocation, "cancelled", None);
         return Ok(());
     }
     let Some(batch) = analysis.prepare()? else {
         store.phase("idle", 0)?;
+        store.note(invocation, "no-work", None);
         return Ok(());
     };
     if cancelled() {
+        store.note(invocation, "cancelled", None);
         return Ok(());
     }
-    let provider =
-        CodexProvider::in_worker_group(Executables::discover()?, data.join("analysis-runtime"))?;
-    let outcome = analysis.run(batch, &provider, &cancelled, now_ms())?;
+    if let Some(id) = invocation {
+        let _ = store.invocation_batch(id, batch.id());
+    }
+    let executables = Executables::discover().inspect_err(|_| {
+        store.note(invocation, "provider-unavailable", Some(batch.id()));
+    })?;
+    let provider = CodexProvider::in_worker_group(executables, data.join("analysis-runtime"))?;
+    let outcome = analysis
+        .run(batch, &provider, &cancelled, now_ms())
+        .inspect_err(|error| {
+            if error.is::<crate::analysis::DailyLimit>() {
+                store.note(invocation, "daily-limit", None);
+            }
+        })?;
+    store.note(invocation, &outcome.state, Some(outcome.batch_id));
     store.error(None)?;
     store.outcome(outcome.state == "failed", now_ms())?;
     Ok(())

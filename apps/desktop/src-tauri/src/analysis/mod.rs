@@ -1,5 +1,7 @@
 //! Local, incremental analysis. The provider receives RAM-only payloads and cannot publish rules.
 mod provider;
+pub mod runs;
+pub use runs::{RunDetail, RunKey, RunPage};
 mod schema;
 use crate::{
     dictionary::{DictionarySnapshot, DictionaryStore},
@@ -17,6 +19,15 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+#[derive(Debug)]
+pub(crate) struct DailyLimit;
+impl std::fmt::Display for DailyLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Limite giornaliero raggiunto.")
+    }
+}
+impl std::error::Error for DailyLimit {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -147,9 +158,10 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         INSERT INTO analysis_schema SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM analysis_schema);",
     )?;
     ensure!(
-        c.query_row("SELECT version FROM analysis_schema", [], |r| r
-            .get::<_, i64>(0))?
-            == 1,
+        (1..=2).contains(
+            &c.query_row("SELECT version FROM analysis_schema", [], |r| r
+                .get::<_, i64>(0))?
+        ),
         "Analisi creata da una versione più recente."
     );
     c.execute_batch("CREATE TABLE IF NOT EXISTS analysis_settings(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NOT NULL,privacy_version INTEGER NOT NULL DEFAULT 0);
@@ -167,6 +179,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS analysis_recategorize AFTER UPDATE OF category ON confirmed_corrections WHEN OLD.category<>NEW.category BEGIN UPDATE analysis_events SET done=0 WHERE revision_id=NEW.revision_id; END;
         CREATE TRIGGER IF NOT EXISTS analysis_forget AFTER DELETE ON confirmed_corrections BEGIN DELETE FROM analysis_events WHERE revision_id=OLD.revision_id; END;
         CREATE TRIGGER IF NOT EXISTS analysis_undo AFTER UPDATE OF reverted ON history_revisions WHEN NEW.reverted=1 BEGIN DELETE FROM analysis_events WHERE revision_id=NEW.id; END;")?;
+    runs::migrate(c)?;
     let inserted = c.execute(
         "INSERT OR IGNORE INTO analysis_settings(id,json) VALUES(1,?1)",
         [serde_json::to_string(&AnalysisSettings::default())?],
@@ -325,7 +338,7 @@ impl AnalysisStore {
             }
             tx.execute("UPDATE analysis_scan SET cursor=?1 WHERE id=1",[scanned])?;
             if batch.sources.is_empty(){tx.commit()?;return Ok(None);}
-            tx.execute("INSERT INTO analysis_batches(privacy_version,state) VALUES(?1,'prepared')",[version])?;batch.id=tx.last_insert_rowid();
+            tx.execute("INSERT INTO analysis_batches(privacy_version,state,created_at,source_count) VALUES(?1,'prepared',?2,?3)",params![version,now()?,batch.sources.len() as i64])?;batch.id=tx.last_insert_rowid();
             for source in &batch.sources {tx.execute("INSERT INTO analysis_batch_sources VALUES(?1,?2,?3)",params![batch.id,source.event_id,source.fingerprint()?])?;}
             add_context(&tx,&mut batch,config.max_input_bytes as usize,&dictionary)?;
             tx.commit()?;Ok(Some(batch))
@@ -368,7 +381,7 @@ impl AnalysisStore {
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE analysis_batches SET state='failed',error='interrupted' WHERE state='running'",[])?;
         // Unknown elapsed time after a crash consumes the reserved timeout, never free retries.
-        tx.execute("UPDATE analysis_attempts SET state='interrupted' WHERE state='running'",[])?;
+        tx.execute("UPDATE analysis_attempts SET state='interrupted',error='interrupted' WHERE state='running'",[])?;
         tx.commit()?;Ok(())
     })
     }
@@ -389,10 +402,12 @@ impl AnalysisStore {
             ensure!(!current.sources.is_empty(),"Nessuna sorgente ancora valida nel lotto.");
             let prompt=current.prompt()?;ensure!(prompt.len()<=config.max_input_bytes as usize,"Lotto oltre il limite.");
             let (requests,ms):(u32,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN state IN ('running','interrupted') THEN reserved_ms ELSE elapsed_ms END),0) FROM analysis_attempts WHERE started_at>=?1",[now_ms-now_ms.rem_euclid(86_400_000)],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            ensure!(requests<config.max_requests_per_day&&ms<(config.max_seconds_per_day as i64)*1000,"Limite giornaliero raggiunto.");
+            ensure!(requests<config.max_requests_per_day&&ms<(config.max_seconds_per_day as i64)*1000,DailyLimit);
             let timeout=Duration::from_millis(((config.request_timeout_seconds as u64)*1000).min((config.max_seconds_per_day as i64*1000-ms) as u64));
             ensure!(tx.execute("UPDATE analysis_batches SET state='running',error=NULL WHERE id=?1 AND state IN ('prepared','failed')",[batch.id])?==1,"Lotto già avviato o concluso.");
-            tx.execute("INSERT INTO analysis_attempts(batch_id,started_at,input_bytes,reserved_ms,state) VALUES(?1,?2,?3,?4,'running')",params![batch.id,now_ms,prompt.len() as i64,timeout.as_millis() as i64])?;let attempt=tx.last_insert_rowid();tx.commit()?;Ok((prompt,timeout,attempt))
+            tx.execute("INSERT INTO analysis_attempts(batch_id,started_at,input_bytes,reserved_ms,state,source_count,accepted) VALUES(?1,?2,?3,?4,'running',?5,0)",params![batch.id,now_ms,prompt.len() as i64,timeout.as_millis() as i64,current.sources.len() as i64])?;let attempt=tx.last_insert_rowid();
+            for source in &current.sources {tx.execute("INSERT INTO analysis_attempt_sources(attempt_id,session_id,revision_id) VALUES(?1,?2,?3)",params![attempt,source.session_id,source.revision_id])?;}
+            tx.commit()?;Ok((prompt,timeout,attempt))
         })?;
         let stop = || {
             cancel.cancelled()
@@ -434,7 +449,7 @@ impl AnalysisStore {
                                 continue;
                             }
                         };
-                        match suggestions.ingest_prepared(request, batch.id) {
+                        match suggestions.ingest_prepared(request, batch.id, attempt) {
                             Ok(()) => accepted += 1,
                             Err(IngestFailure::InvalidCandidate) => rejected += 1,
                             Err(IngestFailure::Infrastructure) => {
@@ -458,8 +473,8 @@ impl AnalysisStore {
         self.history.access(|c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
-                "UPDATE analysis_attempts SET elapsed_ms=?1,state=?2 WHERE id=?3",
-                params![elapsed, state, attempt],
+                "UPDATE analysis_attempts SET elapsed_ms=?1,state=?2,ended_at=?4,error=?5,accepted=?6,rejected=?7 WHERE id=?3",
+                params![elapsed, state, attempt, now()?, error, accepted as i64, rejected as i64],
             )?;
             tx.execute(
                 "UPDATE analysis_batches SET state=?1,error=?2,accepted=?3,rejected=?4 WHERE id=?5",

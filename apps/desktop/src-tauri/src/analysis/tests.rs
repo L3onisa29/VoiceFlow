@@ -474,6 +474,22 @@ fn storage_failure_keeps_sources_pending_and_retry_deduplicates_committed_candid
                 "rejected"
             );
         }
+        let attempts = f.store.runs(None, 20).unwrap().entries;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].state, "completed");
+        assert_eq!(attempts[1].state, "failed");
+        assert_eq!(attempts[1].error.as_deref(), Some("ingest-storage"));
+        assert_eq!(attempts[1].accepted, Some(i64::from(fail_after_first)));
+        if fail_after_first {
+            let retry = f.store.run_detail(attempts[0].key.clone()).unwrap();
+            assert_eq!(retry.proposals[0].relation, "existing");
+            let prior = f.store.run_detail(attempts[1].key.clone()).unwrap();
+            assert_eq!(prior.proposals[0].relation, "created");
+            assert_eq!(
+                prior.proposals[0].proposal_id,
+                retry.proposals[0].proposal_id
+            );
+        }
         assert_eq!(snap.version, 0);
         assert!(snap.publications.is_empty());
     }
@@ -491,11 +507,16 @@ fn checkpoint_resume_after_partial_ingestion_is_idempotent() {
                 "UPDATE analysis_batches SET state='running' WHERE id=?1",
                 [b.id],
             )?;
+            c.execute("INSERT INTO analysis_attempts(id,batch_id,started_at,input_bytes,reserved_ms,state,accepted) VALUES(1,?1,1000,1,1000,'running',0)",[b.id])?;
             Ok(())
         })
         .unwrap();
     f.suggestions()
-        .ingest_prepared(serde_json::from_value(terminology(id, None)).unwrap(), b.id)
+        .ingest_prepared(
+            serde_json::from_value(terminology(id, None)).unwrap(),
+            b.id,
+            1,
+        )
         .unwrap();
     f.store.recover_interrupted().unwrap();
     assert_eq!(f.run(vec![terminology(id, None)]).accepted, 1);
@@ -852,4 +873,174 @@ fn new_disfluency_shapes_pass_provider_schema_and_remain_unpublished() {
     assert_eq!(s.version, 0);
     assert!(s.publications.is_empty());
     assert!(s.proposals.iter().all(|p| p.state == "proposed"));
+}
+
+#[test]
+fn attempt_history_persists_its_own_outcome() {
+    let f = Fixture::new();
+    f.enabled();
+    f.record("nessun suggerimento");
+    f.run(vec![]);
+    f.store
+        .history
+        .access(|c| {
+            let columns = c
+                .prepare("PRAGMA table_info(analysis_attempts)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                columns.contains(&"accepted".to_string()),
+                "attempt outcomes are missing; mutable batch counts cannot describe retries"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn run_history_retry_no_output_and_keyset_survive_reopen() {
+    let f = Fixture::new();
+    f.enabled();
+    f.record("voice flow");
+    let prepared = f.store.prepare().unwrap().unwrap();
+    let before = f.store.runs(None, 1).unwrap();
+    assert_eq!(before.entries[0].state, "prepared");
+    assert_eq!(before.entries[0].source_count, Some(1));
+    assert!(before.entries[0].started_at.is_none());
+    f.store
+        .run(
+            prepared,
+            &Fake(|_: &str, _: &dyn Cancellation| Err(ProviderError::Timeout)),
+            &|| false,
+            1000,
+        )
+        .unwrap();
+    f.run(vec![]);
+    let reopened = AnalysisStore::open(
+        f.dir.join("history.sqlite3"),
+        f.dir.join("dictionary.sqlite3"),
+    );
+    let first = reopened.runs(None, 1).unwrap();
+    assert_eq!(first.entries[0].state, "completed");
+    assert_eq!(first.entries[0].accepted, Some(0));
+    assert!(first.entries[0].ended_at.is_some());
+    let second = reopened.runs(first.next_cursor, 1).unwrap();
+    assert_eq!(second.entries[0].state, "failed");
+    assert_eq!(second.entries[0].error.as_deref(), Some("timeout"));
+    assert_eq!(second.entries[0].accepted, Some(0));
+    assert!(second.next_cursor.is_none());
+    assert!(reopened.runs(None, 0).is_err());
+    assert!(
+        reopened
+            .runs(
+                Some(RunKey {
+                    batch_id: 0,
+                    attempt_id: None
+                }),
+                20
+            )
+            .is_err()
+    );
+    assert!(
+        reopened
+            .run_detail(RunKey {
+                batch_id: 1,
+                attempt_id: Some(-1)
+            })
+            .is_err()
+    );
+    assert!(
+        reopened
+            .run_detail(RunKey {
+                batch_id: 999,
+                attempt_id: Some(1)
+            })
+            .is_err()
+    );
+}
+#[test]
+fn attempt_proposals_are_atomic_deduplicated_and_respect_source_deletion() {
+    let f = Fixture::new();
+    f.enabled();
+    let id = f.record("voice flow");
+    f.run(vec![
+        terminology(id, None),
+        terminology(id, None),
+        json!({}),
+    ]);
+    let key = f.store.runs(None, 20).unwrap().entries.remove(0).key;
+    let detail = f.store.run_detail(key.clone()).unwrap();
+    assert_eq!(detail.run.state, "partial");
+    assert_eq!(detail.run.accepted, Some(2));
+    assert_eq!(detail.run.rejected, Some(1));
+    assert_eq!(detail.proposals.len(), 1);
+    assert_eq!(detail.proposals[0].relation, "created");
+    assert_eq!(
+        detail.proposals[0].proposal_id,
+        Some(f.suggestions().snapshot().unwrap().proposals[0].id)
+    );
+    assert_eq!(detail.sources[0].session_id, id);
+    f.store.exclude(id, true).unwrap();
+    assert!(f.store.run_detail(key.clone()).unwrap().sources[0].excluded);
+    f.store.history.delete(id).unwrap();
+    let detail = f.store.run_detail(key).unwrap();
+    assert!(detail.sources.is_empty());
+    assert_eq!(detail.run.source_count, Some(1));
+    assert!(detail.proposals[0].proposal_id.is_none());
+    assert_eq!(detail.run.accepted, Some(2));
+}
+#[test]
+fn cancellation_and_crash_keep_honest_attempt_metadata() {
+    let f = Fixture::new();
+    f.enabled();
+    f.record("voice flow");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    f.store
+        .run(
+            f.store.prepare().unwrap().unwrap(),
+            &Fake(|_: &str, _: &dyn Cancellation| {
+                stop.store(true, Ordering::Relaxed);
+                Ok(ProviderReply { candidates: vec![] })
+            }),
+            &stop,
+            1000,
+        )
+        .unwrap();
+    let cancelled = f.store.runs(None, 20).unwrap().entries.remove(0);
+    assert_eq!(cancelled.state, "cancelled");
+    assert!(cancelled.ended_at.is_some());
+    f.store.history.access(|c|{c.execute("INSERT INTO analysis_attempts(batch_id,started_at,input_bytes,reserved_ms,state,accepted,source_count) VALUES(?1,2000,1,1000,'running',0,1)",[cancelled.key.batch_id])?;Ok(())}).unwrap();
+    f.store.recover_interrupted().unwrap();
+    let crash = f.store.runs(None, 1).unwrap().entries.remove(0);
+    assert_eq!(crash.state, "interrupted");
+    assert_eq!(crash.error.as_deref(), Some("interrupted"));
+    assert!(crash.ended_at.is_none());
+    assert!(crash.elapsed_ms.is_none());
+    assert!(crash.rejected.is_none());
+}
+#[test]
+fn version_one_attempt_migration_does_not_invent_missing_outcomes() {
+    let f = Fixture::new();
+    f.enabled();
+    f.record("voice flow");
+    f.run(vec![]);
+    let c = Connection::open(f.dir.join("history.sqlite3")).unwrap();
+    c.execute_batch("DROP TABLE analysis_attempt_proposals; DROP TABLE analysis_attempt_sources;
+        ALTER TABLE analysis_batches DROP COLUMN created_at; ALTER TABLE analysis_batches DROP COLUMN source_count;
+        ALTER TABLE analysis_attempts DROP COLUMN ended_at;ALTER TABLE analysis_attempts DROP COLUMN source_count;
+        ALTER TABLE analysis_attempts DROP COLUMN error;ALTER TABLE analysis_attempts DROP COLUMN accepted;ALTER TABLE analysis_attempts DROP COLUMN rejected;
+        DROP INDEX analysis_attempts_batch;UPDATE analysis_schema SET version=1;") .unwrap();
+    drop(c);
+    let reopened = AnalysisStore::open(
+        f.dir.join("history.sqlite3"),
+        f.dir.join("dictionary.sqlite3"),
+    );
+    let old = reopened.runs(None, 20).unwrap().entries.remove(0);
+    assert_eq!(old.state, "completed");
+    assert_eq!(old.started_at, Some(1000));
+    assert!(old.accepted.is_none());
+    assert!(old.source_count.is_none());
+    assert!(old.ended_at.is_none());
+    assert!(old.elapsed_ms.is_none());
+    assert_eq!(reopened.runs(None, 20).unwrap().entries.len(), 1);
 }

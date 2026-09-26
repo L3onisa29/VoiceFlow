@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createRoute } from "@tanstack/react-router";
+import { createRoute, Link } from "@tanstack/react-router";
 import {
   Check,
   Clock3,
@@ -61,6 +61,13 @@ export const Route = createRoute({
   getParentRoute: () => rootRoute,
   path: "/suggestions",
   component: SuggestionsPage,
+  validateSearch: (search: Record<string, unknown>): { proposal?: number } => ({
+    proposal:
+      Number.isSafeInteger(Number(search.proposal)) &&
+      Number(search.proposal) > 0
+        ? Number(search.proposal)
+        : undefined,
+  }),
 });
 type DialogState =
   | { kind: "edit" | "reject" | "approve"; proposal: Proposal }
@@ -68,6 +75,7 @@ type DialogState =
 const languageNames = { "*": "Tutte le lingue", it: "Italiano", en: "Inglese" };
 
 export function SuggestionsPage() {
+  const { proposal: linkedProposal } = Route.useSearch();
   const [data, setData] = useState<ReviewSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,12 +168,13 @@ export function SuggestionsPage() {
     setDialog(next);
   }
   const proposals =
-    data?.proposals.filter(
-      (p) =>
-        filter === "all" ||
-        (filter === "review"
-          ? p.state === "proposed" || p.state === "deferred"
-          : p.state === filter),
+    data?.proposals.filter((p) =>
+      linkedProposal
+        ? p.id === linkedProposal
+        : filter === "all" ||
+          (filter === "review"
+            ? p.state === "proposed" || p.state === "deferred"
+            : p.state === filter),
     ) ?? [];
   const groupNames = new Map(data?.groups.map((g) => [g.id, g.name]));
   return (
@@ -186,6 +195,17 @@ export function SuggestionsPage() {
           Aggiorna
         </Button>
       </header>
+      {linkedProposal && (
+        <Alert>
+          <AlertDescription>
+            Proposta #{linkedProposal} collegata a un tentativo.{" "}
+            <Link to="/suggestions" search={{}}>
+              Mostra tutti i suggerimenti
+            </Link>
+            {data && !proposals.length && " · Proposta non più disponibile."}
+          </AlertDescription>
+        </Alert>
+      )}
       <Alert>
         <ShieldCheck aria-hidden="true" />
         <AlertDescription>
