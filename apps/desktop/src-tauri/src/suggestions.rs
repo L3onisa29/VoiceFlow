@@ -1954,4 +1954,95 @@ mod tests {
             "voice flow"
         );
     }
+    #[test]
+    fn phrase_disfluency_ingest_edit_publish_disable_restore_and_session_snapshot() {
+        let f = Fixture::new();
+        let text = "le ultime le ultime chat";
+        let id = f.record("phrase", text);
+        let mut candidate = cleanup();
+        candidate.definition = Definition::Cleanup {
+            operation: Operation::RepeatPhrase {
+                phrase: vec!["le".into(), "ultime".into()],
+            },
+            context: voiceflow_core::cleanup::Context {
+                after: Some("chat".into()),
+                ..Default::default()
+            },
+        };
+        candidate.positive_examples = vec![Example {
+            input: text.into(),
+            output: "le ultime chat".into(),
+        }];
+        candidate.negative_examples = vec![Example {
+            input: "le ultime le ultime pagine".into(),
+            output: "le ultime le ultime pagine".into(),
+        }];
+        let s = f.ingest(id, candidate.clone());
+        let proposal = s.proposals[0].id;
+        assert_eq!(s.version, 0);
+        assert_eq!(s.proposals[0].state, "proposed");
+        assert_eq!(
+            rendered(f.store.session_snapshot("it").unwrap(), text),
+            text
+        );
+        candidate.reason = "Ripetizione di frase rivista".into();
+        let s = f
+            .act(
+                &s,
+                Some(proposal),
+                ReviewAction::Edit {
+                    candidate: Box::new(candidate.clone()),
+                },
+                "edit-phrase",
+            )
+            .unwrap();
+        assert_eq!(s.proposals[0].candidate, candidate);
+        assert_eq!(s.version, 0);
+        let before = f.store.session_snapshot("it").unwrap();
+        let s = f
+            .act(&s, Some(proposal), ReviewAction::Approve, "approve-phrase")
+            .unwrap();
+        assert_eq!(s.version, 1);
+        assert_eq!(rendered(before, text), text);
+        let active = f.store.session_snapshot("it").unwrap();
+        let s = f
+            .act(&s, Some(proposal), ReviewAction::Disable, "disable-phrase")
+            .unwrap();
+        assert_eq!(s.version, 2);
+        assert_eq!(rendered(active, text), "le ultime chat");
+        assert_eq!(
+            rendered(f.store.session_snapshot("it").unwrap(), text),
+            text
+        );
+        let s = f
+            .act(
+                &s,
+                None,
+                ReviewAction::Restore { version: 1 },
+                "restore-phrase",
+            )
+            .unwrap();
+        assert_eq!(s.version, 3);
+        let reopened =
+            SuggestionStore::open(f.path.join("history.db"), f.path.join("dictionary.db"));
+        assert_eq!(
+            reopened.snapshot().unwrap().proposals[0].candidate,
+            candidate
+        );
+        assert_eq!(
+            rendered(reopened.session_snapshot("it").unwrap(), text),
+            "le ultime chat"
+        );
+        assert_eq!(
+            reopened
+                .history
+                .access(|c| Ok(c.query_row(
+                    "SELECT text FROM transcriptions WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, String>(0)
+                )?))
+                .unwrap(),
+            text
+        );
+    }
 }

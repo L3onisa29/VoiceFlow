@@ -815,3 +815,41 @@ fn bounded_scan_cursor_prevents_oversized_sources_starving_new_work() {
     let batch = reopened.prepare().unwrap().unwrap();
     assert_eq!(batch.sources[0].session_id, id);
 }
+
+#[test]
+fn new_disfluency_shapes_pass_provider_schema_and_remain_unpublished() {
+    let f = Fixture::new();
+    f.enabled();
+    let id = f.record("le ultime le ultime chat quindi mi mi mantieni");
+    let mut phrase = cleanup(id);
+    phrase["candidate"]["definition"]["operation"] =
+        json!({"kind":"repeat-phrase","phrase":["le","ultime"]});
+    phrase["candidate"]["definition"]["context"]["after"] = json!("chat");
+    phrase["candidate"]["positiveExamples"] =
+        json!([{"input":"le ultime le ultime chat","output":"le ultime chat"}]);
+    let mut word = phrase.clone();
+    word["candidate"]["definition"]["operation"] = json!({"kind":"repeat","word":"mi"});
+    word["candidate"]["definition"]["context"]["after"] = json!("mantieni");
+    word["candidate"]["positiveExamples"] =
+        json!([{"input":"mi mi mantieni","output":"mi mantieni"}]);
+    assert!(schema::candidate(&phrase));
+    assert!(schema::candidate(&word));
+    for words in [
+        json!([]),
+        json!(["le"]),
+        json!(["le", "ultime", "chat", "oggi"]),
+    ] {
+        let mut bad = phrase.clone();
+        bad["candidate"]["definition"]["operation"]["phrase"] = words;
+        assert!(!schema::candidate(&bad));
+    }
+    let mut unsafe_phrase = phrase.clone();
+    unsafe_phrase["candidate"]["definition"]["operation"]["phrase"] = json!(["non", "ora"]);
+    let outcome = f.run(vec![phrase, word, unsafe_phrase]);
+    assert_eq!(outcome.accepted, 2);
+    assert_eq!(outcome.rejected, 1);
+    let s = f.suggestions().snapshot().unwrap();
+    assert_eq!(s.version, 0);
+    assert!(s.publications.is_empty());
+    assert!(s.proposals.iter().all(|p| p.state == "proposed"));
+}

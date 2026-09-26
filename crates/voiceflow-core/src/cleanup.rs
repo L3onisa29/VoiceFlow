@@ -38,8 +38,10 @@ pub enum Operation {
     /// Delete only the first source word, retaining every following original word.
     /// Two to seven explicit words; no captures, replacement text or wildcards.
     RemoveFalseStart { source: Vec<String> },
-    /// Only the established Italian function-word whitelist is supported.
+    /// Exact repeated word. New words require positive adjacent context.
     Repeat { word: String },
+    /// Delete the first of two identical explicit phrases of two or three words.
+    RepeatPhrase { phrase: Vec<String> },
     /// Only the established della / dell' and della / dell’ family is supported.
     Elision { first: String, prefix: String },
 }
@@ -98,6 +100,7 @@ impl Operation {
     fn first(&self) -> &str {
         match self {
             Self::RemoveFalseStart { source } => &source[0],
+            Self::RepeatPhrase { phrase } => &phrase[0],
             Self::Repeat { word } => word,
             Self::Elision { first, .. } => first,
         }
@@ -105,7 +108,14 @@ impl Operation {
     fn words(&self) -> usize {
         match self {
             Self::RemoveFalseStart { source } => source.len(),
+            Self::RepeatPhrase { phrase } => phrase.len() * 2,
             _ => 2,
+        }
+    }
+    pub(crate) fn deleted_words(&self) -> usize {
+        match self {
+            Self::RepeatPhrase { phrase } => phrase.len(),
+            _ => 1,
         }
     }
     fn matches(&self, words: &[(&str, &str)]) -> bool {
@@ -130,6 +140,14 @@ impl Operation {
                 }) == expected
             }),
             Self::Repeat { word } => terminal(words[1].1) == word,
+            Self::RepeatPhrase { phrase } => (0..self.words()).all(|i| {
+                let actual = words[i].1;
+                (if i + 1 == self.words() {
+                    terminal(actual)
+                } else {
+                    actual
+                }) == phrase[i % phrase.len()]
+            }),
             Self::Elision { prefix, .. } => terminal(words[1].1)
                 .strip_prefix(prefix)
                 .is_some_and(|tail| !tail.is_empty() && tail.chars().all(char::is_lowercase)),
@@ -212,7 +230,27 @@ impl CompiledCatalog {
                     );
                 }
                 Operation::Repeat { word } => {
-                    ensure!(REPEATS.contains(&word.as_str()), "Unsupported repetition")
+                    ensure!(safe_deleted_word(word), "Unsafe repeated word");
+                    ensure!(
+                        REPEATS.contains(&word.as_str())
+                            || rule.context.before.is_some()
+                            || rule.context.after.is_some(),
+                        "New repeated words require a positive adjacent context"
+                    );
+                }
+                Operation::RepeatPhrase { phrase } => {
+                    ensure!(
+                        (2..=3).contains(&phrase.len()),
+                        "Repeated phrases require 2 or 3 words"
+                    );
+                    ensure!(
+                        phrase.iter().all(|w| safe_deleted_word(w)),
+                        "Unsafe repeated phrase"
+                    );
+                    ensure!(
+                        rule.context.before.is_some() || rule.context.after.is_some(),
+                        "Repeated phrases require a positive adjacent context"
+                    );
                 }
                 Operation::Elision { first, prefix } => ensure!(
                     first == "della" && ["dell'", "dell’"].contains(&prefix.as_str()),
@@ -262,8 +300,7 @@ impl CompiledCatalog {
                         .all(|id| bounded_text(id, 128)),
                 "Invalid cleanup provenance"
             );
-            // All supported operations delete exactly the first source token, so
-            // overlapping matches cannot disagree about output. Reject duplicates.
+            // Reject identical declarations; matching precedence is deterministic.
             let shape = serde_json::to_string(&(&rule.language, &rule.operation, &rule.context))?;
             ensure!(
                 shapes.insert(shape),
@@ -351,7 +388,7 @@ impl CompiledCatalog {
     pub fn required_frozen_words(&self) -> usize {
         (self.lookahead + 1).max(2)
     }
-    /// Returns the chosen rule's identity. Every match deletes one source word.
+    /// Returns the chosen rule. Phrase repetitions delete their first phrase.
     /// Commands protect the entire dependency, including retained source words.
     pub fn matching_rule<'a>(
         &'a self,
@@ -406,13 +443,16 @@ fn example_output(rule: &Rule, input: &str) -> String {
     }
     let mut output = String::new();
     let mut separator = None;
-    for i in 0..words.len() {
+    let mut i = 0;
+    while i < words.len() {
         let sep = separator.take().unwrap_or(words[i].0);
         if rule.matches(&words[i..], i.checked_sub(1).map(|j| words[j].1)) {
             separator = Some(sep);
+            i += rule.operation.deleted_words();
         } else {
             output.push_str(sep);
             output.push_str(words[i].1);
+            i += 1;
         }
     }
     output.push_str(&input[offset..]);
@@ -900,5 +940,314 @@ mod tests {
             );
             assert!(compiled.matching_rule(&words, None, &[]).is_none());
         }
+    }
+    fn repetition(phrase: &[&str], after: &str) -> Rule {
+        let mut r = rule(&["unused", "placeholder"]);
+        r.id = format!("repeat-{}", phrase.join("-"));
+        r.operation = if phrase.len() == 1 {
+            Operation::Repeat {
+                word: phrase[0].into(),
+            }
+        } else {
+            Operation::RepeatPhrase {
+                phrase: phrase.iter().map(|w| (*w).into()).collect(),
+            }
+        };
+        r.context.after = Some(after.into());
+        r.positive_examples = vec![Example {
+            input: format!("{} {} {after}", phrase.join(" "), phrase.join(" ")),
+            output: format!("{} {after}", phrase.join(" ")),
+        }];
+        r
+    }
+    fn disfluency_rules() -> Vec<Rule> {
+        let mut del = rule(&["del", "della"]);
+        del.id = "restart-del-della".into();
+        let mut input = rule(&["del", "dell'input"]);
+        input.id = "restart-del-input".into();
+        vec![
+            repetition(&["mi"], "mantieni"),
+            repetition(&["in"], "caso"),
+            repetition(&["le", "ultime"], "chat"),
+            del,
+            input,
+        ]
+    }
+    #[test]
+    fn disfluencies_are_explicit_contextual_and_opt_in() {
+        let rules = disfluency_rules();
+        for (input, expected) in [
+            ("quindi mi mi mantieni", "quindi mi mantieni"),
+            ("ma in in caso", "ma in caso"),
+            ("le ultime le ultime chat", "le ultime chat"),
+            ("del della prova", "della prova"),
+            ("del dell'input", "dell'input"),
+            (
+                "mi mi piace in in realtà le ultime le ultime pagine",
+                "mi mi piace in in realtà le ultime le ultime pagine",
+            ),
+            (
+                "non non no no 42 42 Anna Anna molto molto importante",
+                "non non no no 42 42 Anna Anna molto molto importante",
+            ),
+            (
+                "Mi mi mantieni in In caso Le ultime le ultime chat",
+                "Mi mi mantieni in In caso Le ultime le ultime chat",
+            ),
+            (
+                "`mi` `mi` mantieni \"mi mi\" mantieni",
+                "`mi` `mi` mantieni \"mi mi\" mantieni",
+            ),
+        ] {
+            assert_eq!(process(rules.clone(), vec![], true, input), expected);
+            assert_eq!(process(rules.clone(), vec![], false, input), input);
+            assert_eq!(process(vec![], vec![], true, input), input);
+            let mut builtin = TextProcessor::new(FormatMode::Faithful, true);
+            builtin.update(input, true).unwrap();
+            assert_eq!(builtin.parts().0, input);
+        }
+    }
+    #[test]
+    fn disfluencies_stream_at_every_boundary_and_drain_once() {
+        let rules = disfluency_rules();
+        for prefix in 0..18 {
+            let lead = "pad ".repeat(prefix);
+            let input = format!(
+                "{lead}mi mi mantieni in in caso le ultime le ultime chat del della prova del dell'input {}",
+                "tail ".repeat(18)
+            );
+            let expected = process(rules.clone(), vec![], true, &input);
+            for character in [false, true] {
+                let mut p = processor(rules.clone(), vec![], true);
+                let mut committed = String::new();
+                for (i, c) in input.char_indices() {
+                    if !character && !c.is_whitespace() {
+                        continue;
+                    }
+                    let end = i + c.len_utf8();
+                    p.update(&input[..end], false).unwrap();
+                    p.update(&input[..end], false).unwrap();
+                    assert!(p.parts().0.starts_with(&committed));
+                    committed = p.parts().0.into();
+                    assert!(p.buffered_words() <= 7);
+                    assert!(p.retained_words() <= DICTIONARY_RETAINED_WORDS);
+                    if c.is_whitespace() {
+                        assert_eq!(
+                            format!("{}{}", p.parts().0, p.parts().1),
+                            process(rules.clone(), vec![], true, &input[..end])
+                        );
+                    }
+                }
+                p.update(&input, true).unwrap();
+                assert_eq!(p.parts().0, expected);
+                assert_eq!(p.retained_words(), 0);
+                p.update("le ultime", true).unwrap();
+                p.update("le ultime chat", true).unwrap();
+                assert_eq!(p.parts().0, format!("{expected} le ultime le ultime chat"));
+            }
+        }
+    }
+    #[test]
+    fn phrase_revisions_restore_frozen_first_phrase_and_original_separators() {
+        for phrase in [vec!["le", "ultime"], vec!["tutte", "le", "ultime"]] {
+            let r = repetition(&phrase, "chat");
+            for prefix in 0..18 {
+                let lead = "pad ".repeat(prefix);
+                let source = phrase.join(" ");
+                let input = format!("{lead}{source} {source} chat tail tail tail tail tail tail ");
+                let mut p = processor(vec![r.clone()], vec![], true);
+                p.update(&input, false).unwrap();
+                let frozen = p.parts().0.to_owned();
+                assert!(!frozen.contains("ultime"));
+                for replacement in ["pagine", "chat", "domande"] {
+                    let changed = input.replacen("chat", replacement, 1);
+                    p.update(&changed, false).unwrap();
+                    assert!(p.parts().0.starts_with(&frozen));
+                    assert_eq!(
+                        format!("{}{}", p.parts().0, p.parts().1),
+                        process(vec![r.clone()], vec![], true, &changed)
+                    );
+                    assert!(p.retained_words() <= DICTIONARY_RETAINED_WORDS);
+                }
+                let changed = input.replacen("chat", "domande", 1);
+                p.update(&changed, true).unwrap();
+                assert_eq!(p.parts().0, changed.trim_end());
+            }
+        }
+        let r = repetition(&["le", "ultime"], "chat");
+        for sep in ["\n", "\r\n", "\t", "  "] {
+            let input = format!("oggi{sep}le ultime le ultime chat");
+            assert_eq!(
+                process(vec![r.clone()], vec![], true, &input),
+                format!("oggi{sep}le ultime chat")
+            );
+        }
+    }
+    #[test]
+    fn phrase_boundaries_commands_dictionary_and_overlaps_use_original_source() {
+        let r = repetition(&["le", "ultime"], "chat");
+        for input in [
+            "le ultime, le ultime chat",
+            "le ultime le ultime, chat",
+            "le ultime\nle ultime chat",
+            "le ultime le\nultime chat",
+            "le ultime le ultime\nchat",
+        ] {
+            assert_eq!(process(vec![r.clone()], vec![], true, input), input);
+        }
+        assert_eq!(
+            process(
+                vec![r.clone()],
+                vec![],
+                true,
+                "le ultime le ultime chat, le ultime le ultime chat"
+            ),
+            "le ultime le ultime chat, le ultime chat"
+        );
+        // Only the final pair has the approved right context. No recursive collapse.
+        assert_eq!(
+            process(
+                vec![r.clone()],
+                vec![],
+                true,
+                "le ultime le ultime le ultime chat"
+            ),
+            "le ultime le ultime chat"
+        );
+        assert_eq!(
+            process(
+                vec![r.clone()],
+                vec![term("le ultime", "Recenti")],
+                true,
+                "le ultime le ultime chat"
+            ),
+            "Recenti Recenti chat"
+        );
+        assert_eq!(
+            process(
+                vec![r.clone()],
+                vec![term("chat", "Conversazioni")],
+                true,
+                "le ultime le ultime chat"
+            ),
+            "le ultime Conversazioni"
+        );
+        assert_eq!(
+            process(
+                vec![r.clone()],
+                vec![term("test", "le ultime le ultime chat")],
+                true,
+                "test"
+            ),
+            "le ultime le ultime chat"
+        );
+        assert_eq!(
+            process(
+                vec![r],
+                vec![],
+                true,
+                "le ultime <unk> le ultime chat new line fine"
+            ),
+            "le ultime chat\nfine"
+        );
+        for (terms, expected) in [
+            (
+                vec![term("ultime", "recenti")],
+                "le recenti le recenti chat",
+            ),
+            (vec![term("ultime le", "X")], "le X ultime chat"),
+            (
+                vec![term("ultime le", "X"), term("ultime le", "Y")],
+                "le ultime le ultime chat",
+            ),
+            (
+                vec![term("ultime le ultime chat uno due tre", "X")],
+                "le ultime le ultime chat",
+            ),
+        ] {
+            assert_eq!(
+                process(
+                    vec![repetition(&["le", "ultime"], "chat")],
+                    terms,
+                    true,
+                    "le ultime le ultime chat"
+                ),
+                expected
+            );
+        }
+        let mut normalized = term("ULTIME", "recenti");
+        normalized.mode = MatchMode::UnicodeLowercase;
+        assert_eq!(
+            process(
+                vec![repetition(&["le", "ultime"], "chat")],
+                vec![normalized],
+                true,
+                "le ultime le ultime chat"
+            ),
+            "le recenti le recenti chat"
+        );
+        let internal_command = repetition(&["oggi", "new", "line"], "fine");
+        assert_eq!(
+            process(
+                vec![internal_command],
+                vec![],
+                true,
+                "oggi new line oggi new line fine"
+            ),
+            "oggi\noggi\nfine"
+        );
+        let command = repetition(&["new", "line"], "fine");
+        assert_eq!(
+            process(vec![command], vec![], true, "oggi new line new line fine"),
+            "oggi\nfine"
+        );
+        let mut long = repetition(&["le", "le"], "fine");
+        long.id = "long".into();
+        let short = repetition(&["le"], "fine");
+        for rules in [vec![long.clone(), short.clone()], vec![short, long]] {
+            assert_eq!(process(rules, vec![], true, "le le le le fine"), "le fine");
+        }
+    }
+    #[test]
+    fn repeat_schema_rejects_unbounded_protected_or_unscoped_deletion() {
+        for phrase in [
+            vec![],
+            vec!["le"],
+            vec!["le", "ultime", "chat", "oggi"],
+            vec!["non", "ora"],
+            vec!["io", "non"],
+            vec!["Anna", "anna"],
+            vec!["42", "volte"],
+            vec!["`le`", "ultime"],
+        ] {
+            let mut r = repetition(&["le", "ultime"], "chat");
+            r.operation = Operation::RepeatPhrase {
+                phrase: phrase.iter().map(|w| (*w).into()).collect(),
+            };
+            assert!(CompiledCatalog::compile(catalog(vec![r]), "it").is_err());
+        }
+        for word in ["non", "no", "42", "Anna", "mi()"] {
+            let mut r = repetition(&["mi"], "mantieni");
+            r.operation = Operation::Repeat { word: word.into() };
+            assert!(CompiledCatalog::compile(catalog(vec![r]), "it").is_err());
+        }
+        for mut r in [
+            repetition(&["mi"], "mantieni"),
+            repetition(&["le", "ultime"], "chat"),
+        ] {
+            r.context.after = None;
+            assert!(CompiledCatalog::compile(catalog(vec![r]), "it").is_err());
+        }
+        let r = repetition(&["tutte", "le", "ultime"], "chat");
+        let data = catalog(vec![r]);
+        let serialized = serde_json::to_string(&data).unwrap();
+        assert_eq!(serde_json::from_str::<Catalog>(&serialized).unwrap(), data);
+        assert!(CompiledCatalog::compile(data, "it").is_ok());
+        assert!(
+            serde_json::from_str::<Operation>(
+                r#"{"kind":"repeat-phrase","phrase":["le","ultime"],"replacement":"all"}"#
+            )
+            .is_err()
+        );
     }
 }

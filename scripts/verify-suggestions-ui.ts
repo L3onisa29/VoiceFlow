@@ -10,7 +10,7 @@ if (!modulePath)
   throw new Error("Set PLAYWRIGHT_MODULE to an installed Playwright index.mjs");
 const { chromium } = await import(pathToFileURL(modulePath).href);
 const root = resolve(import.meta.dirname, "..");
-const output = resolve(root, "artifacts/suggestions-c2");
+const output = resolve(root, "artifacts/suggestions-disfluencies");
 await mkdir(output, { recursive: true });
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({
@@ -178,6 +178,25 @@ try {
   await dialog
     .getByLabel("Espressione completa, da 2 a 7 parole", { exact: true })
     .fill("volevo vorrei");
+  await dialog.getByLabel("Operazione di pulizia", { exact: true }).click();
+  await page
+    .getByRole("option", {
+      name: "Ripetizione di una frase breve",
+      exact: true,
+    })
+    .click();
+  await dialog
+    .getByLabel("Frase ripetuta, da 2 a 3 parole (richiede contesto)", {
+      exact: true,
+    })
+    .fill("le ultime");
+  await dialog
+    .getByLabel("Solo prima della parola", { exact: true })
+    .fill("chat");
+  await dialog
+    .locator("#positiveExamples-0-input")
+    .fill("le ultime le ultime chat");
+  await dialog.locator("#positiveExamples-0-output").fill("le ultime chat");
   await dialog
     .getByLabel("Motivazione", { exact: true })
     .fill("Esempio rivisto dalla persona");
@@ -208,6 +227,24 @@ try {
   await cleanup
     .getByText("Esempio rivisto dalla persona", { exact: true })
     .waitFor();
+  assert.deepEqual(
+    await page.evaluate(
+      "window.review.proposals.find(p => p.id === 2).candidate.definition.operation",
+    ),
+    { kind: "repeat-phrase", phrase: ["le", "ultime"] },
+  );
+  await cleanup
+    .getByRole("heading", { name: "Ripetizione di frase", exact: true })
+    .waitFor();
+  await cleanup
+    .getByText(
+      "Elimina la prima occorrenza di “le ultime” quando ripetuta due volte.",
+      { exact: true },
+    )
+    .waitFor();
+  pass(
+    "Phrase repetition edits preserve the new shape and context without activation",
+  );
   await cleanup.getByRole("button", { name: "Rimanda", exact: true }).click();
   await cleanup.getByText("Rimandata", { exact: true }).waitFor();
   await cleanup.getByRole("button", { name: "Rifiuta", exact: true }).click();

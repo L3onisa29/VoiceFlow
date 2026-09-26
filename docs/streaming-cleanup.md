@@ -24,7 +24,7 @@ window and unfinished word immediately. Silence, pause and stop complete the
 last word and drain the window once. A pause is an
 utterance boundary: commands and cleanup do not join across it.
 
-Cleanup recognizes only these lowercase Italian patterns:
+The builtin catalog recognizes only these lowercase Italian patterns:
 
 - `il la scheda` becomes `la scheda`.
 - `della dell'acquisizione` and the curly-apostrophe equivalent lose `della`.
@@ -74,9 +74,9 @@ No new learned rule activates automatically.
 
 The core accepts a separate immutable cleanup catalog through
 `TextProcessor::with_rules` and `StreamingSession::with_rules`. It supports exact
-false-start phrases of 2–7 words that delete only the first source word, the
-existing function-word repeat whitelist, and the existing apostrophe-prefix
-family. Every rule includes version, language, adjacent conditions/exceptions,
+false-start phrases of 2–7 words that delete only the first source word, exact
+word repetitions, exact repetitions of a two- or three-word phrase, and the
+existing apostrophe-prefix family. Every rule includes version, language, adjacent conditions/exceptions,
 provenance and checked positive/negative examples. Unknown operations, executable
 code, regex, generic repeated-word deletion and dependencies exceeding seven
 words are rejected. The limit is 256 rules including builtins. Each rule's examples
@@ -85,7 +85,16 @@ validate that rule in isolation; publication must also check combined behavior.
 Commands take precedence, followed by dictionary matches or conflicts, then
 cleanup at the current original source position. No rewritten text reenters the
 matcher. New adjacency created by a deletion never becomes another match. Existing
-adjacent source matches can each remove one word. The survivor keeps its original
+adjacent source matches can each delete their original source span. A phrase
+repetition deletes the first entire phrase. At each source position, the longest
+matching dependency wins, followed by positive context specificity, explicit
+language, and stable rule ID. Consumed positions are skipped; output never becomes
+fresh matching input. To protect dictionary priority within a multiword deletion,
+a phrase is preserved if a dictionary variant could begin at any interior word
+of its first occurrence. This conservative check uses the dictionary’s exact or
+Unicode-lowercase index even when that variant’s later context would not match.
+It avoids extending the seven-word dependency to wait for an interior dictionary
+match. Commands protect the entire matched cleanup source. The survivor keeps its original
 spelling and punctuation. Conditions inspect source words, including words already
 rendered differently by the dictionary. A pause resets their context.
 
@@ -100,10 +109,53 @@ C2 owns approval, versioned publication, disabling and rollback. Compilation is
 validation, not approval. Only an explicitly published snapshot may be injected
 into a new dictation; running and paused sessions retain their catalog. History
 records the instantiated session's cleanup version, with processor version
-`voiceflow-text-v3`. See [C1 verification and integration contract](verification/voiceflow-v1-c1.md)
+`voiceflow-text-v4` for new sessions. Existing historical metadata is unchanged. See [C1 verification and integration contract](verification/voiceflow-v1-c1.md)
 for the schema limits, API, priority and tests. The core does not infer whether an
 explicit lowercase phrase is a name or intentional wording; review remains
 necessary even when a candidate passes structural validation.
+
+## Speech disfluency proposals
+
+The supported shapes are additive within schema version 1; older operations and
+publication archives retain their meaning. The builtin version and its 17 rules
+are unchanged. Compilation alone does not approve or activate a proposal.
+
+A `repeat` operation accepts one explicit lowercase literal word. Outside the
+legacy function-word list, a positive adjacent `before` or `after` condition is
+required. A `repeat-phrase` operation has a `phrase` array of two or three explicit
+lowercase literal words, for example `{"kind":"repeat-phrase","phrase":["le","ultime"]}`.
+It also requires a positive adjacent condition. The condition surrounds the entire
+repeated source, not the gap between its two occurrences. Two copies plus right
+context consume at most seven source words. Every deleted word must pass the
+same literal and negation restrictions; numbers, uppercase literals and code
+syntax are rejected. Examples and exceptions still undergo backend validation.
+
+These are available proposals, not new active defaults:
+
+| Proposed operation and condition | Before | After |
+| --- | --- | --- |
+| `repeat: mi`, `after: mantieni` | mi mi mantieni | mi mantieni |
+| `repeat: in`, `after: caso` | in in caso | in caso |
+| `repeat-phrase: [le, ultime]`, `after: chat` | le ultime le ultime chat | le ultime chat |
+| Existing `remove-false-start: [del, della]`, `after: prova` | del della prova | della prova |
+| Existing `remove-false-start: [del, dell'input]` | del dell'input | dell'input |
+
+These operations remove speech disfluencies, not recognition spelling errors.
+The analyzer can propose them, and the suggestion editor exposes the phrase and
+its context before explicit approval and publication. Without a matching approved
+rule, `mi mi`, `in in` and `le ultime le ultime` stay literal. Cleanup off bypasses
+all these operations. `molto molto importante` and repeated negations remain
+unchanged under the illustrated rules.
+
+Matching preserves case and surviving punctuation. Internal punctuation and
+newlines break a repeated phrase. Right context is exact: `chat,` does not satisfy
+`after: chat`. Punctuation on the last source word also prevents a right-context
+match. Pause/finalization boundaries never join to form a new repetition.
+An intentional repetition in precisely the approved literal context is
+indistinguishable from a hesitation in text alone. A lowercase name or quoted
+passage containing that exact context is not semantically recognized. Narrow
+conditions and the app review remain necessary. No fuzzy or semantic correction
+is added. See [disfluency verification](verification/voiceflow-v1-disfluencies.md).
 
 ## Reproduce verification
 

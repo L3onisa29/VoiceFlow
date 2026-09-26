@@ -545,7 +545,7 @@ pub(crate) fn processing_metadata(settings: &Settings) -> Result<ProcessingMetad
             .into(),
         model_provenance: "download-manifest; runtime files not rehashed".into(),
         decoder_version: "parakeet-rs/0.3.8; preroll-v1".into(),
-        processor_version: "voiceflow-text-v3".into(),
+        processor_version: "voiceflow-text-v4".into(),
         format: match settings.format {
             voiceflow_core::formatting::FormatMode::Faithful => "faithful",
             voiceflow_core::formatting::FormatMode::SpokenCommands => "spoken-commands",

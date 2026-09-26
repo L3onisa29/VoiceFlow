@@ -292,12 +292,19 @@ impl TextProcessor {
             }
         }
         if self.cleanup
-            && self
+            && let Some(rule) = self
                 .cleanup_catalog
                 .matching_rule(&source, before, &protected)
-                .is_some()
         {
-            return (1, String::new(), false, true);
+            let deleted = rule.operation.deleted_words();
+            if !source
+                .iter()
+                .take(deleted)
+                .skip(1)
+                .any(|(_, word)| self.dictionary.can_start_at(word))
+            {
+                return (deleted, String::new(), false, true);
+            }
         }
         (1, first.text.clone(), false, false)
     }

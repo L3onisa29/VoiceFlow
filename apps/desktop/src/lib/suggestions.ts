@@ -15,6 +15,10 @@ const operation = z.discriminatedUnion("kind", [
   }),
   z.object({ kind: z.literal("repeat"), word: z.string() }),
   z.object({
+    kind: z.literal("repeat-phrase"),
+    phrase: z.array(z.string()).min(2).max(3),
+  }),
+  z.object({
     kind: z.literal("elision"),
     first: z.string(),
     prefix: z.string(),

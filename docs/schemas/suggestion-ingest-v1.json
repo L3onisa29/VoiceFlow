@@ -110,22 +110,9 @@
               "const": "repeat"
             },
             "word": {
-              "enum": [
-                "il",
-                "lo",
-                "la",
-                "gli",
-                "le",
-                "un",
-                "una",
-                "di",
-                "del",
-                "della",
-                "dello",
-                "dei",
-                "degli",
-                "delle"
-              ]
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
             }
           },
           "required": [
@@ -155,6 +142,29 @@
             "first",
             "prefix"
           ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "phrase"
+          ],
+          "properties": {
+            "kind": {
+              "const": "repeat-phrase"
+            },
+            "phrase": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 3,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              }
+            }
+          }
         }
       ]
     },

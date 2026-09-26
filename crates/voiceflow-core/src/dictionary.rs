@@ -184,6 +184,12 @@ impl Dictionary {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+    /// Conservatively protect starts inside a multiword cleanup deletion without
+    /// extending the dependency window for a dictionary rule beginning there.
+    pub(crate) fn can_start_at(&self, word: &str) -> bool {
+        let first = terminal(word).0;
+        self.exact.contains_key(first) || self.normalized.contains_key(&first.to_lowercase())
+    }
     /// One extra frozen source word protects commands overlapping a rule's end.
     pub fn required_frozen_words(&self) -> usize {
         (self.lookahead + 1).max(2)

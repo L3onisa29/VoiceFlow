@@ -153,7 +153,8 @@ export function CandidateEditor({
                         "remove-false-start",
                         "Elimina la prima parola della falsa partenza",
                       ],
-                      ["repeat", "Ripetizione di una parola funzionale"],
+                      ["repeat", "Ripetizione di una parola esatta"],
+                      ["repeat-phrase", "Ripetizione di una frase breve"],
                       ["elision", "Elisione della / dell’"],
                     ]}
                     onChange={(value) =>
@@ -162,13 +163,15 @@ export function CandidateEditor({
                         operation:
                           value === "repeat"
                             ? { kind: "repeat", word: "il" }
-                            : value === "elision"
-                              ? {
-                                  kind: "elision",
-                                  first: "della",
-                                  prefix: "dell'",
-                                }
-                              : { kind: "remove-false-start", source: [] },
+                            : value === "repeat-phrase"
+                              ? { kind: "repeat-phrase", phrase: [] }
+                              : value === "elision"
+                                ? {
+                                    kind: "elision",
+                                    first: "della",
+                                    prefix: "dell'",
+                                  }
+                                : { kind: "remove-false-start", source: [] },
                       })
                     }
                   />
@@ -178,8 +181,10 @@ export function CandidateEditor({
                     {definition.operation.kind === "remove-false-start"
                       ? "Espressione completa, da 2 a 7 parole"
                       : definition.operation.kind === "repeat"
-                        ? "Parola ripetuta"
-                        : "Prefisso da conservare"}
+                        ? "Parola ripetuta (nuove parole richiedono contesto)"
+                        : definition.operation.kind === "repeat-phrase"
+                          ? "Frase ripetuta, da 2 a 3 parole (richiede contesto)"
+                          : "Prefisso da conservare"}
                   </FieldLabel>
                   <Input
                     id="source"
@@ -189,7 +194,9 @@ export function CandidateEditor({
                         ? definition.operation.source.join(" ")
                         : definition.operation.kind === "repeat"
                           ? definition.operation.word
-                          : definition.operation.prefix
+                          : definition.operation.kind === "repeat-phrase"
+                            ? definition.operation.phrase.join(" ")
+                            : definition.operation.prefix
                     }
                     onChange={(e) =>
                       setDefinition({
@@ -205,10 +212,15 @@ export function CandidateEditor({
                                   ...definition.operation,
                                   word: e.target.value,
                                 }
-                              : {
-                                  ...definition.operation,
-                                  prefix: e.target.value,
-                                },
+                              : definition.operation.kind === "repeat-phrase"
+                                ? {
+                                    ...definition.operation,
+                                    phrase: e.target.value.split(" "),
+                                  }
+                                : {
+                                    ...definition.operation,
+                                    prefix: e.target.value,
+                                  },
                       })
                     }
                   />

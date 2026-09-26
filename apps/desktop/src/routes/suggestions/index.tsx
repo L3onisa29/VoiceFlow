@@ -279,8 +279,11 @@ export function SuggestionsPage() {
                           ? "Falsa partenza"
                           : proposal.candidate.definition.operation.kind ===
                               "repeat"
-                            ? "Ripetizione funzionale"
-                            : "Elisione"}
+                            ? "Ripetizione di parola"
+                            : proposal.candidate.definition.operation.kind ===
+                                "repeat-phrase"
+                              ? "Ripetizione di frase"
+                              : "Elisione"}
                     </h2>
                   </CardTitle>
                   <CardDescription>{proposal.candidate.reason}</CardDescription>
@@ -309,7 +312,10 @@ export function SuggestionsPage() {
                         : proposal.candidate.definition.operation.kind ===
                             "repeat"
                           ? `Elimina una ripetizione di “${proposal.candidate.definition.operation.word}”.`
-                          : `Elimina “${proposal.candidate.definition.operation.first}” prima di “${proposal.candidate.definition.operation.prefix}…”.`}
+                          : proposal.candidate.definition.operation.kind ===
+                              "repeat-phrase"
+                            ? `Elimina la prima occorrenza di “${proposal.candidate.definition.operation.phrase.join(" ")}” quando ripetuta due volte.`
+                            : `Elimina “${proposal.candidate.definition.operation.first}” prima di “${proposal.candidate.definition.operation.prefix}…”.`}
                   </p>
                   <p className="text-sm text-muted-foreground">
                     {languageNames[proposal.candidate.language]} ·{" "}
