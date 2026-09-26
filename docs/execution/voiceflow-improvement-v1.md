@@ -160,3 +160,15 @@ Node 24.18.0, pnpm 11.5.0, Rust/Cargo 1.97.1. MSRV dichiarata 1.88 non eseguita.
 Riferimenti congelati invariati. Lavoro concorrente alle impostazioni SQLite conservato fuori dai nostri commit; build e test comprendono quelle modifiche. Nessun push, PR o worktree.
 
 Commit sperimentale finale: `ac02231b8bfa351369c92b02f97086f34a906748`. Sorgenti verificati senza cambi funzionali successivi alla build; questo registro è aggiornato in un commit documentale conclusivo. Nel working tree restano soltanto i quattro file del lavoro concorrente, esclusi dai commit di esecuzione.
+
+## Prova personale sullo storico del 25 settembre 2026
+
+Eseguita su richiesta esplicita dell'utente il 26 settembre. Selezionate tutte le 29 trascrizioni del 25 settembre, fuso Europe/Rome, per 1.752 parole archiviate. Lettura SQLite in sola lettura; nessuna migrazione o modifica ai database dell'app. Corpus, programmi riproducibili, proposte e confronti completi sono salvati localmente nella cartella privata esclusa da Git `artifacts/personal-evaluation/2026-09-25/`; nessun testo personale incluso in questo registro.
+
+Processore reale ricompilato con `cargo build --offline -p voiceflow-core --lib`. Con le regole attuali elimina i tre marcatori presenti nelle sessioni 11, 18 e 24; nessun altro cambiamento. Il dizionario locale contiene zero termini. Prova separata con dieci varianti terminologiche e due nuove varianti di pulizia, ricavate dai testi e NON approvate né attivate: dieci sostituzioni terminologiche in nove trascrizioni, due pulizie in due trascrizioni, dodici interventi complessivi su dieci trascrizioni. Includendo i marcatori cambiano undici trascrizioni, diciotto restano identiche.
+
+Verifica distinta dei risultati: per tutte le 29 righe, sia con regole attuali sia con proposte, testo completo, prefissi parola per parola e prefissi carattere per carattere producono lo stesso risultato; seconda elaborazione idempotente. Confronto con l'elenco esplicito degli interventi attesi: nessuna modifica aggiuntiva. Hash del corpus verificato e hash del database originale invariato dopo la prova. Riproduzione: `bash artifacts/personal-evaluation/2026-09-25/run.sh`.
+
+Limite concreto emerso: il catalogo rifiuta nuove operazioni di ripetizione per i pronomi e le preposizioni fuori dalla whitelist fissa. Due ripetizioni osservate nelle sessioni 5 e 29 restano irrisolte; rifiuto del compilatore riprodotto. Anche la ripetizione di una frase nella sessione 20 resta fuori dalle operazioni supportate. Nessuna riparazione del prodotto effettuata durante questa valutazione.
+
+Questa prova copre il ritrattamento del testo personale archiviato. Lo schema storico precedente non contiene originale ASR, audio o correzioni confermate: le proposte sono ipotesi valutate sugli stessi dati da cui sono state ricavate, senza campione indipendente. Non si dichiara un tasso di accuratezza o di falsi positivi. Gli snapshot streaming sono simulati dal testo, non quelli del decoder originale. Restano pendenti qualità della dettatura reale e verifica dei marcatori nell'app in esecuzione. Nessun provider esterno invocato e nessuna proposta attivata.
