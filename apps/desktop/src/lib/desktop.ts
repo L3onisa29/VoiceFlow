@@ -14,6 +14,7 @@ export const stateSchema = z.object({
     "loading",
     "recording",
     "paused",
+    "stopping",
     "finalizing",
     "complete",
     "error",
@@ -37,6 +38,18 @@ export const stateSchema = z.object({
   }),
 });
 export type DictationState = z.infer<typeof stateSchema>;
+/** Fields the HUD panel needs on top of the shared state. */
+export const liveStateSchema = stateSchema.extend({
+  session: z.number().int().nonnegative(),
+  recoverable: z.boolean(),
+});
+export type LiveState = z.infer<typeof liveStateSchema>;
+/** Passo del misuratore tra un cambio di testo e il successivo. */
+export const levelSchema = z.object({
+  revision: z.number(),
+  level: z.number(),
+});
+export type LevelUpdate = z.infer<typeof levelSchema>;
 export const permissionsSchema = z.object({
   microphone: z.boolean(),
   microphoneStatus: z.string(),
@@ -52,6 +65,7 @@ export async function getPermissions() {
 export type Action =
   | "toggle_recording"
   | "stop_recording"
+  | "stop_and_copy"
   | "pause_recording"
   | "cancel_recording"
   | "load_model"

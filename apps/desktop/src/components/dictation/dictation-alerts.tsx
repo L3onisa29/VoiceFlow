@@ -1,98 +1,104 @@
 import { ArrowUpRight, Mic, Keyboard, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
-import type { DictationState, Permissions, Action } from "@/lib/desktop";
+import { useDictation, useDictationState } from "@/hooks/use-dictation";
+import { toUserMessage } from "@/lib/errors";
 
-type DictationAlertsProps = {
-  state: DictationState | null;
-  permissions: Permissions | null;
-  error: string | null;
-  onAction: (action: Action) => void;
-  onOpenPrivacy: (section: "microphone" | "accessibility") => void;
-};
-
-export function DictationAlerts({
-  state,
-  permissions,
-  error,
-  onAction,
-  onOpenPrivacy,
-}: DictationAlertsProps) {
+/** Only actionable problems: errors and missing macOS permissions. */
+export function DictationAlerts() {
+  const state = useDictationState("phase", "message", "modelReady");
+  const { permissions, error, onAction, onOpenPrivacy } = useDictation((s) => ({
+    permissions: s.permissions,
+    error: s.error,
+    onAction: s.execute,
+    onOpenPrivacy: s.privacy,
+  }));
   const needsMicrophone = permissions && !permissions.microphone;
   const needsAccessibility = permissions && !permissions.accessibility;
+  if (
+    !error &&
+    state?.phase !== "error" &&
+    !needsMicrophone &&
+    !needsAccessibility
+  )
+    return null;
   return (
-    <>
+    <div className="flex flex-col gap-2">
       {(error || state?.phase === "error") && (
         <Alert variant="destructive">
           <TriangleAlert aria-hidden="true" />
           <AlertTitle>Operazione non completata</AlertTitle>
-          <AlertDescription>{error || state?.message}</AlertDescription>
-          {state?.phase === "error" && state.modelReady && (
-            <Button
-              className="col-start-2 mt-2 justify-self-start"
-              variant="outline"
-              size="sm"
-              onClick={() => void onAction("cancel_recording")}
-            >
-              Annulla dettatura
-            </Button>
-          )}
-          {needsAccessibility && (
-            <Button
-              className="col-start-2 mt-2 justify-self-start"
-              variant="outline"
-              size="sm"
-              onClick={() => void onOpenPrivacy("accessibility")}
-            >
-              Apri Accessibilità
-              <ArrowUpRight data-icon="inline-end" />
-            </Button>
-          )}
+          <AlertDescription className="flex flex-col items-start gap-2">
+            <span>
+              {error || (state?.message ? toUserMessage(state.message) : null)}
+            </span>
+            {((state?.phase === "error" && state.modelReady) ||
+              needsAccessibility) && (
+              <span className="flex flex-wrap gap-2">
+                {state?.phase === "error" && state.modelReady && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void onAction("cancel_recording")}
+                  >
+                    Annulla dettatura
+                  </Button>
+                )}
+                {needsAccessibility && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void onOpenPrivacy("accessibility")}
+                  >
+                    Apri Accessibilità
+                    <ArrowUpRight data-icon="inline-end" />
+                  </Button>
+                )}
+              </span>
+            )}
+          </AlertDescription>
         </Alert>
       )}
       {needsMicrophone && (
         <Alert>
-          <Mic />
-          <AlertTitle>Consenti l’accesso al microfono.</AlertTitle>
-          <AlertDescription>
-            Consenti l’accesso al microfono per iniziare a dettare.
+          <Mic aria-hidden="true" />
+          <AlertTitle>Accesso al microfono necessario</AlertTitle>
+          <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+            <span>Serve per registrare la dettatura.</span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                permissions.microphoneStatus === "not-determined"
+                  ? void onAction("request_microphone")
+                  : void onOpenPrivacy("microphone")
+              }
+            >
+              Consenti microfono
+              <ArrowUpRight data-icon="inline-end" />
+            </Button>
           </AlertDescription>
-          <Button
-            className="col-start-2 mt-2 justify-self-start"
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              permissions.microphoneStatus === "not-determined"
-                ? void onAction("request_microphone")
-                : void onOpenPrivacy("microphone")
-            }
-          >
-            Consenti microfono
-            <ArrowUpRight data-icon="inline-end" />
-          </Button>
         </Alert>
       )}
       {needsAccessibility && (
         <Alert>
-          <Keyboard />
-          <AlertTitle>
-            Consenti a VoiceFlow di incollare dove scrivi.
-          </AlertTitle>
-          <AlertDescription>
-            Apri Accessibilità e abilita VoiceFlow. Il permesso serve per
-            inserire la dettatura al cursore in T3 Code e nelle altre app.
+          <Keyboard aria-hidden="true" />
+          <AlertTitle>Accesso ad Accessibilità necessario</AlertTitle>
+          <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+            <span>
+              Serve per incollare la dettatura al cursore nelle altre app.
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void onOpenPrivacy("accessibility")}
+            >
+              Consenti Accessibilità
+              <ArrowUpRight data-icon="inline-end" />
+            </Button>
           </AlertDescription>
-          <Button
-            className="col-start-2 mt-2 justify-self-start"
-            variant="outline"
-            size="sm"
-            onClick={() => void onOpenPrivacy("accessibility")}
-          >
-            Consenti Accessibilità
-            <ArrowUpRight data-icon="inline-end" />
-          </Button>
         </Alert>
       )}
-    </>
+    </div>
   );
 }

@@ -4,11 +4,13 @@ mod dictionary;
 mod history;
 mod hud;
 mod output_audio;
+mod overlay;
 mod platform;
 pub mod scheduler;
 mod service;
 mod settings;
 pub mod suggestions;
+pub mod voice_profile;
 use service::{Command, Service, Snapshot};
 use tauri::{
     Manager, State,
@@ -45,8 +47,10 @@ fn open_privacy(app: tauri::AppHandle, section: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 #[tauri::command]
-fn load_model(service: State<'_, Service>) -> Result<(), String> {
-    service.send(Command::Load).map_err(|e| e.to_string())
+fn load_model(app: tauri::AppHandle, service: State<'_, Service>) -> Result<(), String> {
+    service.send(Command::Load).map_err(|e| e.to_string())?;
+    service.publish(&app);
+    Ok(())
 }
 #[tauri::command]
 fn toggle_recording(app: tauri::AppHandle) -> Result<(), String> {
@@ -57,16 +61,25 @@ fn stop_recording(app: tauri::AppHandle) -> Result<(), String> {
     send_from_controls(&app, Command::Stop)
 }
 #[tauri::command]
+fn stop_and_copy(app: tauri::AppHandle) -> Result<(), String> {
+    send_from_controls(&app, Command::StopCopy)
+}
+#[tauri::command]
+fn live_edit(service: State<'_, Service>, edit: service::LiveEdit) -> Result<(), String> {
+    service.live_edit(edit).map_err(|e| e.to_string())
+}
+#[tauri::command]
 fn pause_recording(service: State<'_, Service>) -> Result<(), String> {
     service.send(Command::Pause).map_err(|e| e.to_string())
 }
-fn send_from_controls(app: &tauri::AppHandle, command: Command) -> Result<(), String> {
+pub(crate) fn send_from_controls(app: &tauri::AppHandle, command: Command) -> Result<(), String> {
     let handle = app.clone();
     app.run_on_main_thread(move || {
         platform::hide_if_frontmost(objc2_foundation::MainThreadMarker::new().unwrap());
         if let Err(error) = handle.state::<Service>().send(command) {
             eprintln!("{error}");
         }
+        handle.state::<Service>().publish(&handle);
     })
     .map_err(|e| e.to_string())
 }
@@ -112,6 +125,8 @@ pub fn run() {
             load_model,
             toggle_recording,
             stop_recording,
+            stop_and_copy,
+            live_edit,
             pause_recording,
             cancel_recording,
             save_settings,
@@ -130,6 +145,9 @@ pub fn run() {
             history::history_undo,
             suggestions::suggestions_snapshot,
             suggestions::suggestions_review,
+            suggestions::replay::suggestions_replay,
+            suggestions::spellings::dictionary_auto_variants,
+            suggestions::spellings::dictionary_remove_auto_variant,
             analysis::analysis_status,
             analysis::runs::analysis_runs,
             analysis::runs::analysis_run_detail,
@@ -137,9 +155,23 @@ pub fn run() {
             analysis::analysis_exclude,
             analysis::analysis_excluded,
             scheduler::scheduler_status,
+            scheduler::invocations::scheduler_run_now,
             scheduler::invocations::scheduler_invocations,
             scheduler::scheduler_configure,
-            history::history_remember
+            history::history_remember,
+            history::history_recent,
+            history::history_save_changes,
+            history::history_forget,
+            overlay::overlay_fit,
+            overlay::overlay_hide,
+            overlay::overlay_release,
+            overlay::recents_insert,
+            voice_profile::voice_profile_status,
+            voice_profile::voice_profile_start,
+            voice_profile::voice_profile_stop,
+            voice_profile::voice_profile_cancel,
+            voice_profile::voice_profile_skip,
+            voice_profile::voice_profile_delete
         ])
         .setup(|app| {
             let data = app
@@ -163,11 +195,14 @@ pub fn run() {
                 history.clone(),
                 app.state::<dictionary::DictionaryStore>().inner().clone(),
             ));
+            let profile = voice_profile::ProfileStore::new(data.join("voice-profile"));
+            app.manage(profile.clone());
             let service = Service::new(
                 app.handle().clone(),
                 data.join("models/nemotron-3.5-streaming-int8"),
-                data.join("desktop-settings.json"),
+                data.join("desktop-settings.sqlite3"),
                 history,
+                profile,
             )?;
             app.manage(service.clone());
             let toggle: Shortcut = "Alt+Space".parse()?;
@@ -176,6 +211,18 @@ pub fn run() {
                     let _ = send_from_controls(app, Command::Toggle);
                 }
             })?;
+            // The picker and its panels are extras: VoiceFlow still dictates without them.
+            let recents: Shortcut = "Control+Alt+KeyV".parse()?;
+            if let Err(error) = app.global_shortcut().on_shortcut(recents, |app, _, event| {
+                if event.state == ShortcutState::Pressed {
+                    overlay::toggle_recents(app);
+                }
+            }) {
+                eprintln!("Scorciatoia ⌃⌥V non disponibile: {error}");
+            }
+            if let Err(error) = overlay::create(app.handle()) {
+                eprintln!("Pannelli della dettatura non disponibili: {error:#}");
+            }
             let open = MenuItem::with_id(app, "open", "Apri VoiceFlow", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Esci", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
@@ -193,14 +240,19 @@ pub fn run() {
                 .build(app)?;
             if service.snapshot().model_present {
                 service.send(Command::Load)?;
+                service.publish(app.handle());
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            tauri::WindowEvent::Focused(false) => {
+                overlay::on_blur(window.app_handle(), window.label());
+            }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("VoiceFlow could not start")

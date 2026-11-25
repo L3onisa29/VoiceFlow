@@ -1,10 +1,7 @@
-import { Globe2 } from "lucide-react";
-import {
-  Field,
-  FieldGroup,
-  FieldLabel,
-  FieldDescription,
-} from "@/components/ui/field";
+import { useEffect, useState } from "react";
+import { toast } from "sonner";
+import { SettingsRow } from "@/components/settings/settings-row";
+import { FieldGroup } from "@/components/ui/field";
 import {
   Select,
   SelectContent,
@@ -13,35 +10,67 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { settingsSchema, type Settings } from "@/lib/desktop";
+import { saveSettings, settingsSchema, type Settings } from "@/lib/desktop";
+import { toUserMessage } from "@/lib/errors";
 
 type DictationSettingsProps = {
   settings: Settings | undefined;
   locked: boolean;
-  onChange: (settings: Settings) => void;
 };
 
+/**
+ * Language and text preferences. Each select applies on change; the chosen
+ * value is shown until the engine publishes the new settings, and a failed
+ * write reverts it.
+ */
 export function DictationSettings({
   settings,
   locked,
-  onChange,
 }: DictationSettingsProps) {
+  const [pending, setPending] = useState<Settings | null>(null);
+  const [saving, setSaving] = useState<keyof Settings | null>(null);
+
+  // The engine echoes saved settings in its state: drop the optimistic copy.
+  useEffect(() => setPending(null), [settings]);
+
+  const current = pending ?? settings;
+  const disabled = locked || !settings || saving !== null;
+
+  async function apply(key: keyof Settings, value: unknown) {
+    if (!current) return;
+    const result = settingsSchema.safeParse({ ...current, [key]: value });
+    if (!result.success) return;
+    setPending(result.data);
+    setSaving(key);
+    try {
+      await saveSettings(result.data);
+    } catch (error) {
+      setPending(null);
+      toast.error(toUserMessage(error));
+    } finally {
+      setSaving(null);
+    }
+  }
+
   return (
-    <FieldGroup className="grid grid-cols-1 gap-5 xl:grid-cols-3">
-      <Field data-disabled={locked || !settings}>
-        <FieldLabel htmlFor="language">
-          <Globe2 aria-hidden="true" />
-          Lingua
-        </FieldLabel>
+    <FieldGroup className="gap-0">
+      <SettingsRow
+        htmlFor="language"
+        label="Lingua"
+        description="Lingua del parlato da trascrivere."
+        disabled={disabled}
+        saving={saving === "language"}
+      >
         <Select
-          disabled={locked || !settings}
-          value={settings?.language ?? "auto"}
-          onValueChange={(language) => {
-            if (settings)
-              void onChange(settingsSchema.parse({ ...settings, language }));
-          }}
+          disabled={disabled}
+          value={current?.language ?? "auto"}
+          onValueChange={(language) => void apply("language", language)}
         >
-          <SelectTrigger id="language" className="w-full">
+          <SelectTrigger
+            id="language"
+            className="w-full"
+            aria-describedby="language-description"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -52,21 +81,24 @@ export function DictationSettings({
             </SelectGroup>
           </SelectContent>
         </Select>
-        <FieldDescription>
-          Italiano e inglese, anche nella stessa giornata.
-        </FieldDescription>
-      </Field>
-      <Field data-disabled={locked || !settings}>
-        <FieldLabel htmlFor="cleanup">Pulizia locale</FieldLabel>
+      </SettingsRow>
+      <SettingsRow
+        htmlFor="cleanup"
+        label="Pulizia locale"
+        description="Riduce false partenze come “il la scheda”, senza correggere la grammatica."
+        disabled={disabled}
+        saving={saving === "cleanup"}
+      >
         <Select
-          disabled={locked || !settings}
-          value={settings?.cleanup ? "on" : "off"}
-          onValueChange={(value) => {
-            if (settings)
-              void onChange({ ...settings, cleanup: value === "on" });
-          }}
+          disabled={disabled}
+          value={current?.cleanup ? "on" : "off"}
+          onValueChange={(value) => void apply("cleanup", value === "on")}
         >
-          <SelectTrigger id="cleanup" className="w-full">
+          <SelectTrigger
+            id="cleanup"
+            className="w-full"
+            aria-describedby="cleanup-description"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -76,22 +108,28 @@ export function DictationSettings({
             </SelectGroup>
           </SelectContent>
         </Select>
-        <FieldDescription>
-          Riduce casi come "il la scheda" in italiano. Le ultime 7 parole
-          restano modificabili. Nessuna correzione grammaticale.
-        </FieldDescription>
-      </Field>
-      <Field data-disabled={locked || !settings}>
-        <FieldLabel htmlFor="format">Come vuoi il tuo testo</FieldLabel>
+      </SettingsRow>
+      <SettingsRow
+        htmlFor="format"
+        label="Formato del testo"
+        description={
+          current?.format === "spoken-commands"
+            ? "Pronuncia “a capo”, “nuovo paragrafo” o “punto elenco”."
+            : "Conserva le tue parole, con punteggiatura automatica."
+        }
+        disabled={disabled}
+        saving={saving === "format"}
+      >
         <Select
-          disabled={locked || !settings}
-          value={settings?.format ?? "faithful"}
-          onValueChange={(format) => {
-            if (settings)
-              void onChange(settingsSchema.parse({ ...settings, format }));
-          }}
+          disabled={disabled}
+          value={current?.format ?? "faithful"}
+          onValueChange={(format) => void apply("format", format)}
         >
-          <SelectTrigger id="format" className="w-full">
+          <SelectTrigger
+            id="format"
+            className="w-full"
+            aria-describedby="format-description"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -103,14 +141,7 @@ export function DictationSettings({
             </SelectGroup>
           </SelectContent>
         </Select>
-        <FieldDescription>
-          {settings?.format === "spoken-commands"
-            ? "Pronuncia “a capo”, “nuovo paragrafo” o “punto elenco”."
-            : settings?.cleanup
-              ? "Comandi vocali letterali. Pulizia locale attiva."
-              : "Conserva le tue parole, con punteggiatura automatica."}
-        </FieldDescription>
-      </Field>
+      </SettingsRow>
     </FieldGroup>
   );
 }

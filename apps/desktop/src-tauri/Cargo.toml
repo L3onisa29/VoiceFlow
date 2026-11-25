@@ -16,7 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 voiceflow-core = { path = "../../../crates/voiceflow-core" }
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
@@ -34,7 +34,7 @@ chrono = "0.4"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSObject", "NSArray", "NSTimer", "NSDate", "block2"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSRunningApplication", "NSPanel", "NSWindow", "NSView", "NSResponder", "NSControl", "NSCell", "NSButton", "NSButtonCell", "NSTextField", "NSTextFieldCell", "NSFont", "NSFontDescriptor", "libc", "objc2-core-foundation", "NSColor", "NSBezierPath", "NSGraphics", "NSScreen", "NSEvent", "NSAppearance", "NSAccessibilityProtocols"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSRunningApplication", "NSPanel", "NSWindow", "NSView", "NSResponder", "NSControl", "NSCell", "NSButton", "NSButtonCell", "NSTextField", "NSTextFieldCell", "NSFont", "NSFontDescriptor", "libc", "objc2-core-foundation", "NSColor", "NSImage", "NSBezierPath", "NSGraphics", "NSScreen", "NSEvent", "NSAppearance", "NSAccessibilityProtocols"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }
 block2 = "0.6"
 core-foundation = "0.10"

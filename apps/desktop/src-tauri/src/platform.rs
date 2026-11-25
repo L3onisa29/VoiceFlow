@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, ensure};
 use core_foundation::{
     base::{CFEqual, CFGetTypeID, CFRelease, CFTypeRef, TCFType},
+    boolean::CFBoolean,
     string::{CFString, CFStringGetTypeID, CFStringRef},
 };
 use core_graphics::{
@@ -21,6 +22,10 @@ unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn CGEventSourceFlagsState(state: i32) -> u64;
     fn AXUIElementCreateSystemWide() -> CFTypeRef;
+    fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
+    fn AXUIElementSetMessagingTimeout(element: CFTypeRef, timeout: f32) -> i32;
+    fn AXUIElementSetAttributeValue(element: CFTypeRef, name: CFStringRef, value: CFTypeRef)
+    -> i32;
     fn AXUIElementCopyAttributeValue(
         element: CFTypeRef,
         name: CFStringRef,
@@ -78,14 +83,61 @@ impl Drop for FocusTarget {
     }
 }
 
+impl FocusTarget {
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+}
+
 pub fn focused_target() -> Option<FocusTarget> {
     if !unsafe { AXIsProcessTrusted() } {
         return None;
     }
+    let pid = frontmost_pid()?;
+    if pid == std::process::id() as i32 {
+        return None;
+    }
+    resolve_focus(|source| read_focused_target(source, pid))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FocusSource {
+    Application,
+    SystemWide,
+}
+
+fn resolve_focus<T>(mut read: impl FnMut(FocusSource) -> Option<T>) -> Option<T> {
+    read(FocusSource::Application).or_else(|| read(FocusSource::SystemWide))
+}
+
+fn read_focused_target(source: FocusSource, expected_pid: i32) -> Option<FocusTarget> {
     unsafe {
-        let root = AXUIElementCreateSystemWide();
+        let root = match source {
+            FocusSource::Application => AXUIElementCreateApplication(expected_pid),
+            FocusSource::SystemWide => AXUIElementCreateSystemWide(),
+        };
         if root.is_null() {
             return None;
+        }
+        // Bound a stalled application's AX response instead of blocking dictation.
+        let _ = AXUIElementSetMessagingTimeout(root, 0.15);
+        if source == FocusSource::Application {
+            // Electron builds its native editor tree lazily. This is its documented
+            // assistive-client API; it does not activate the app or move the caret.
+            let name = CFString::new("AXManualAccessibility");
+            let mut enabled: CFTypeRef = std::ptr::null();
+            let _ = AXUIElementCopyAttributeValue(root, name.as_concrete_TypeRef(), &mut enabled);
+            let yes = CFBoolean::true_value();
+            if enabled.is_null() || CFEqual(enabled, yes.as_CFTypeRef()) == 0 {
+                let _ = AXUIElementSetAttributeValue(
+                    root,
+                    name.as_concrete_TypeRef(),
+                    yes.as_CFTypeRef(),
+                );
+            }
+            if !enabled.is_null() {
+                CFRelease(enabled);
+            }
         }
         let mut value: *const c_void = std::ptr::null();
         let status = AXUIElementCopyAttributeValue(
@@ -95,13 +147,20 @@ pub fn focused_target() -> Option<FocusTarget> {
         );
         CFRelease(root);
         if status != 0 || value.is_null() {
+            if !value.is_null() {
+                CFRelease(value);
+            }
             return None;
         }
         let mut pid = 0;
-        if AXUIElementGetPid(value, &mut pid) != 0 || pid == std::process::id() as i32 {
+        if AXUIElementGetPid(value, &mut pid) != 0
+            || pid != expected_pid
+            || frontmost_pid() != Some(expected_pid)
+        {
             CFRelease(value);
             return None;
         }
+        let _ = AXUIElementSetMessagingTimeout(value, 0.15);
         let attribute = |name: &str| -> Option<String> {
             let mut attribute: CFTypeRef = std::ptr::null();
             if AXUIElementCopyAttributeValue(
@@ -148,7 +207,9 @@ pub fn paste_text(target: &FocusTarget, text: &str, cancelled: impl Fn() -> bool
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let current = focused_target().ok_or_else(|| anyhow!("Nessun campo di testo attivo"))?;
+    let current = wait_for_focus(Some(target.pid), &cancelled).ok_or_else(|| {
+        anyhow!("Il campo di destinazione non risponde. Il testo resta disponibile in VoiceFlow.")
+    })?;
     ensure!(
         current.pid == target.pid && unsafe { CFEqual(current.element, target.element) } != 0,
         "Il campo attivo è cambiato. Il testo resta disponibile in VoiceFlow."
@@ -180,20 +241,100 @@ pub fn hide_if_frontmost(mtm: MainThreadMarker) {
     }
 }
 fn is_frontmost() -> bool {
+    frontmost_pid() == Some(std::process::id() as i32)
+}
+/// The frontmost application when it is not VoiceFlow.
+pub fn frontmost_foreign_pid() -> Option<i32> {
+    frontmost_pid().filter(|pid| *pid != std::process::id() as i32)
+}
+/// Name shown to the user for a running application.
+pub fn app_name(pid: i32) -> Option<String> {
+    objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.localizedName())
+        .map(|name| name.to_string())
+        .filter(|name| !name.trim().is_empty())
+}
+fn frontmost_pid() -> Option<i32> {
     NSWorkspace::sharedWorkspace()
         .frontmostApplication()
-        .is_some_and(|app| app.processIdentifier() == std::process::id() as i32)
+        .map(|app| app.processIdentifier())
 }
-pub fn destination_at_stop() -> Option<FocusTarget> {
+pub fn destination_at_stop(cancelled: impl Fn() -> bool) -> Option<FocusTarget> {
     let deadline = Instant::now() + Duration::from_millis(600);
-    while is_frontmost() && Instant::now() < deadline {
+    while is_frontmost() && Instant::now() < deadline && !cancelled() {
         std::thread::sleep(Duration::from_millis(10));
     }
-    focused_target()
+    wait_for_focus(frontmost_pid(), cancelled)
+}
+
+fn retry_focus<T>(
+    mut read: impl FnMut() -> Option<T>,
+    mut retry: impl FnMut() -> bool,
+) -> Option<T> {
+    loop {
+        if let Some(target) = read() {
+            return Some(target);
+        }
+        if !retry() {
+            return None;
+        }
+    }
+}
+
+fn wait_for_focus(expected_pid: Option<i32>, cancelled: impl Fn() -> bool) -> Option<FocusTarget> {
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let available =
+        || !cancelled() && frontmost_pid() == expected_pid && unsafe { AXIsProcessTrusted() };
+    retry_focus(
+        || available().then(focused_target).flatten(),
+        || {
+            if !available() || Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            true
+        },
+    )
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn focused_editor_is_found_when_the_system_wide_ax_query_returns_no_element() {
+        let target = resolve_focus(|source| match source {
+            FocusSource::Application => Some("same editor"),
+            FocusSource::SystemWide => None,
+        });
+        assert_eq!(target, Some("same editor"));
+    }
+    #[test]
+    fn system_wide_focus_remains_a_fallback_for_native_editors() {
+        assert_eq!(
+            resolve_focus(|source| (source == FocusSource::SystemWide).then_some("editor")),
+            Some("editor")
+        );
+    }
+    #[test]
+    fn transient_missing_focus_is_retried_without_replacing_a_valid_target() {
+        let mut reads = [None, None, Some("same editor"), Some("different editor")].into_iter();
+        assert_eq!(
+            retry_focus(|| reads.next().flatten(), || true),
+            Some("same editor")
+        );
+        assert_eq!(reads.next(), Some(Some("different editor")));
+        let mut attempts = 0;
+        assert_eq!(
+            retry_focus::<()>(
+                || {
+                    attempts += 1;
+                    None
+                },
+                || false
+            ),
+            None
+        );
+        assert_eq!(attempts, 1);
+    }
     #[test]
     fn editors_with_generic_accessibility_roles_can_receive_paste() {
         for role in [Some("AXWebArea"), Some("AXGroup"), None] {
