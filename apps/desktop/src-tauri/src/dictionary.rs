@@ -381,16 +381,132 @@ impl DictionaryStore {
 }
 
 fn archive_snapshot(connection: &Connection) -> Result<()> {
-    let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM dictionary_versions WHERE revision=(SELECT revision FROM dictionary_state WHERE id=1))",[],|r|r.get(0))?;
+    archive_schema_snapshot(connection, "main")
+}
+fn archive_schema_snapshot(connection: &Connection, schema: &str) -> Result<()> {
+    let exists:bool=connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {schema}.dictionary_versions WHERE revision=(SELECT revision FROM {schema}.dictionary_state WHERE id=1))"),[],|r|r.get(0))?;
     if exists {
         return Ok(());
     }
-    let snapshot = read_snapshot(connection)?;
+    let snapshot = read_schema_snapshot(connection, schema)?;
     connection.execute(
-        "INSERT OR IGNORE INTO dictionary_versions VALUES(?1, ?2)",
+        &format!("INSERT OR IGNORE INTO {schema}.dictionary_versions VALUES(?1, ?2)"),
         params![snapshot.version, serde_json::to_string(&snapshot)?],
     )?;
     Ok(())
+}
+/// The shape every automatic variant uses: any language, no group, no context.
+fn automatic_rule(variants: Vec<String>) -> TermRule {
+    TermRule {
+        variants,
+        language: all_languages(),
+        matching: MatchMode::UnicodeLowercase,
+        context: RuleContext::default(),
+    }
+}
+impl Term {
+    #[cfg(test)]
+    pub(crate) fn rule_variants(&self) -> usize {
+        self.rule.variants.len()
+    }
+}
+impl DictionarySnapshot {
+    /// The term holding this variant under case-insensitive matching, if any.
+    pub(crate) fn term_of_variant(&self, variant: &str) -> Option<&Term> {
+        self.terms.iter().find(|term| {
+            term.rule
+                .variants
+                .iter()
+                .any(|v| v.to_lowercase() == variant)
+        })
+    }
+    /// Whether an automatic variant may join this term: only a term that already is
+    /// case-insensitive, without context, language or group restriction.
+    pub(crate) fn accepts_automatic_variant(&self, term: &str) -> Option<bool> {
+        let key = term.trim().to_lowercase();
+        self.terms
+            .iter()
+            .find(|candidate| candidate.text.to_lowercase() == key)
+            .map(|found| {
+                found.group_ids.is_empty()
+                    && found.rule.variants.len() < 128
+                    && found.rule.language == "*"
+                    && found.rule.matching == MatchMode::UnicodeLowercase
+                    && found.rule.context == RuleContext::default()
+            })
+    }
+}
+/// Adds one case-insensitive variant to `term` in an attached dictionary, creating the
+/// term when it is missing. The caller has validated the combination and owns the
+/// transaction; this bumps and archives the revision like any manual save.
+pub(crate) fn add_automatic_variant(
+    connection: &Connection,
+    schema: &str,
+    term: &str,
+    variant: &str,
+) -> Result<i64> {
+    let (text, key) = label(term, 200)?;
+    let existing: Option<(i64, String)> = connection
+        .query_row(
+            &format!("SELECT id,rule_json FROM {schema}.terms WHERE text_key=?1"),
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let id = if let Some((id, json)) = existing {
+        let mut rule: TermRule = serde_json::from_str(&json)?;
+        rule.variants.push(variant.to_owned());
+        connection.execute(
+            &format!("UPDATE {schema}.terms SET rule_json=?1 WHERE id=?2"),
+            params![serde_json::to_string(&rule)?, id],
+        )?;
+        id
+    } else {
+        connection.execute(
+            &format!("INSERT INTO {schema}.terms(text,text_key,rule_json) VALUES(?1,?2,?3)"),
+            params![
+                text,
+                key,
+                serde_json::to_string(&automatic_rule(vec![variant.to_owned()]))?
+            ],
+        )?;
+        connection.last_insert_rowid()
+    };
+    bump(connection, schema)?;
+    Ok(id)
+}
+/// Removes a variant, whichever term holds it. False when it is no longer present.
+pub(crate) fn remove_variant(connection: &Connection, schema: &str, variant: &str) -> Result<bool> {
+    let terms = connection
+        .prepare(&format!("SELECT id,rule_json FROM {schema}.terms"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut removed = false;
+    for (id, json) in terms {
+        let mut rule: TermRule = serde_json::from_str(&json)?;
+        let before = rule.variants.len();
+        rule.variants.retain(|v| v.to_lowercase() != variant);
+        if rule.variants.len() != before {
+            connection.execute(
+                &format!("UPDATE {schema}.terms SET rule_json=?1 WHERE id=?2"),
+                params![serde_json::to_string(&rule)?, id],
+            )?;
+            removed = true;
+        }
+    }
+    if removed {
+        bump(connection, schema)?;
+    }
+    Ok(removed)
+}
+fn bump(connection: &Connection, schema: &str) -> Result<()> {
+    connection.execute(
+        &format!("UPDATE {schema}.dictionary_state SET revision = revision + 1 WHERE id = 1"),
+        [],
+    )?;
+    archive_schema_snapshot(connection, schema)
 }
 
 pub(crate) fn read_snapshot(connection: &Connection) -> Result<DictionarySnapshot> {
@@ -485,7 +601,9 @@ impl DictionarySnapshot {
             .iter()
             .filter(|term| {
                 language.is_none_or(|language| {
-                    (term.rule.language == "*" || term.rule.language == language)
+                    (language == "auto"
+                        || term.rule.language == "*"
+                        || term.rule.language == language)
                         && (term.group_ids.is_empty()
                             || term
                                 .group_ids
@@ -973,7 +1091,7 @@ mod tests {
                 fixture.store.session_snapshot("auto").unwrap().0,
                 "voice flow"
             ),
-            "voice flow"
+            "VoiceFlow"
         );
         let reopened = DictionaryStore::new(fixture.root.join("dictionary.sqlite3"));
         assert_eq!(reopened.session_snapshot("it-IT").unwrap().2, version);
@@ -1021,7 +1139,7 @@ mod tests {
         assert!(serde_json::from_value::<SaveTerm>(serde_json::json!({"id":null,"text":"Bad","groupIds":[],"variants":[],"invented":true})).is_err());
     }
     #[test]
-    fn management_surfaces_intersecting_conflicts_but_not_disjoint_languages() {
+    fn management_surfaces_cross_language_conflicts_in_automatic_mode() {
         let fixture = Fixture::new();
         let mut a = configured("First", &["variant"], vec![], "it");
         a.rule.context.before = Some("x".into());
@@ -1041,14 +1159,21 @@ mod tests {
             .store
             .save_term(configured("First", &["variant"], vec![], "it"))
             .unwrap();
-        assert!(
+        assert_eq!(
             other
                 .store
                 .save_term(configured("Second", &["variant"], vec![], "en"))
                 .unwrap()
                 .conflicts
-                .is_empty()
+                .len(),
+            2
         );
+        for (language, expected) in [("it", "First"), ("en", "Second"), ("auto", "variant")] {
+            assert_eq!(
+                output(other.store.session_snapshot(language).unwrap().0, "variant"),
+                expected
+            );
+        }
     }
     #[test]
     fn v1_migration_preserves_terms_without_inventing_variants_and_is_idempotent() {

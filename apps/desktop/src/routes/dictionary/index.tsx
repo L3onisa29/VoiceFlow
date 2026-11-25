@@ -1,239 +1,304 @@
-import { useRef, useState } from "react";
-import { createRoute } from "@tanstack/react-router";
-import { BookOpen, Plus, Pencil, Trash2, RefreshCw } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { z } from "zod";
+import { toast } from "sonner";
+import { BookOpen, Plus, TriangleAlert } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Badge } from "@/components/ui/badge";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import {
-  Card,
-  CardHeader,
-  CardTitle,
-  CardDescription,
-  CardContent,
-  CardFooter,
-} from "@/components/ui/card";
-import { Spinner } from "@/components/ui/spinner";
-import { Input } from "@/components/ui/input";
-import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Empty,
+  EmptyContent,
+  EmptyDescription,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
-  EmptyDescription,
-  EmptyContent,
 } from "@/components/ui/empty";
+import { Page, PageContent, PageHeader } from "@/components/layout/page";
+import { ActiveGroupsMenu } from "@/components/dictionary/active-groups-menu";
 import {
-  Table,
-  TableHeader,
-  TableBody,
-  TableRow,
-  TableHead,
-  TableCell,
-} from "@/components/ui/table";
-import { TermDialog } from "@/components/dictionary/term-dialog";
-import { GroupDialog } from "@/components/dictionary/group-dialog";
+  AutoVariants,
+  useAutoVariants,
+} from "@/components/dictionary/auto-variants";
+import {
+  BulkActions,
+  BulkDeleteDialog,
+} from "@/components/dictionary/bulk-actions";
 import {
   DeleteDialog,
   type DeleteTarget,
 } from "@/components/dictionary/delete-dialog";
 import { DictionaryError } from "@/components/dictionary/dictionary-error";
-import { useDictionary } from "@/hooks/use-dictionary";
+import { DictionaryToolbar } from "@/components/dictionary/dictionary-toolbar";
+import { GroupDialog } from "@/components/dictionary/group-dialog";
+import { GroupManager } from "@/components/dictionary/group-manager";
+import { TermDialog } from "@/components/dictionary/term-dialog";
+import { TermPagination } from "@/components/dictionary/term-pagination";
 import {
+  TermTable,
+  TermTableSkeleton,
+} from "@/components/dictionary/term-table";
+import { useDictionary } from "@/hooks/use-dictionary";
+import { useShortcut } from "@/hooks/use-shortcut";
+import {
+  applyToTerms,
   dictionaryApi,
   emptyTermRule,
-  type TermInput,
+  filterTerms,
+  groupTermCounts,
+  type BulkOutcome,
+  type Dictionary,
+  type Group,
   type GroupInput,
+  type Term,
+  type TermFilter,
+  type TermInput,
+  type TermSort,
 } from "@/lib/dictionary";
-import { Route as rootRoute } from "../__root";
+import { toUserMessage } from "@/lib/errors";
+import { dictionaryQuery, warm } from "@/lib/route-loaders";
 
-export const Route = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/dictionary",
+export const Route = createFileRoute("/dictionary/")({
+  // `?new=1` opens the add dialog (command palette "Aggiungi parola").
+  validateSearch: z.object({ new: z.literal(1).optional().catch(undefined) }),
+  loader: ({ context }) =>
+    warm(context.queryClient.ensureQueryData(dictionaryQuery)),
   component: DictionaryPage,
 });
 
-export function DictionaryPage() {
-  const { data, loading, busy, error, refresh, mutate, clearError } =
+const PAGE_SIZE = 10;
+const words = (count: number) => (count === 1 ? "1 parola" : `${count} parole`);
+const plural = (count: number, one: string, many: string) =>
+  count === 1 ? one : many;
+
+type Editor = { initial: TermInput; title?: string };
+
+function DictionaryPage() {
+  const { data, loading, busy, error, refresh, mutate, write, clearError } =
     useDictionary();
+  const autoVariants = useAutoVariants(data?.version ?? null).data ?? [];
+  const automatic = new Set(autoVariants.map((variant) => variant.spelling));
+
   const opener = useRef<HTMLElement | null>(null);
-  const addButton = useRef<HTMLButtonElement | null>(null);
-  const rememberFocus = () => {
+  const addButton = useRef<HTMLButtonElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const groupsButton = useRef<HTMLButtonElement>(null);
+  const rememberFocus = (element?: HTMLElement | null) => {
     opener.current =
-      document.activeElement instanceof HTMLElement
+      element ??
+      (document.activeElement instanceof HTMLElement
         ? document.activeElement
-        : null;
+        : null);
   };
   const returnFocus = () => {
-    (opener.current?.isConnected ? opener.current : addButton.current)?.focus();
+    (opener.current?.isConnected
+      ? opener.current
+      : (document.querySelector<HTMLElement>('[role="dialog"] button') ??
+        addButton.current)
+    )?.focus();
   };
+
+  const [page, setPage] = useState(1);
+  const [sort, setSort] = useState<TermSort>("az");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("all");
-  const [term, setTerm] = useState<TermInput | null>(null);
+  const [filter, setFilter] = useState<TermFilter>("all");
+  const [selection, setSelection] = useState<Set<number>>(() => new Set());
+  const [editor, setEditor] = useState<Editor | null>(null);
   const [group, setGroup] = useState<GroupInput | null>(null);
   const [deletion, setDeletion] = useState<DeleteTarget | null>(null);
+  const [manageGroups, setManageGroups] = useState(false);
+  const [bulkDeletion, setBulkDeletion] = useState<number[] | null>(null);
+
   const selectedGroup = data?.groups.find((item) => String(item.id) === filter);
-  const effectiveFilter =
+  const effectiveFilter: TermFilter =
     filter === "ungrouped" || selectedGroup ? filter : "all";
-  const query = search.trim().toLowerCase();
-  const terms =
-    data?.terms.filter(
-      (item) =>
-        item.text.toLowerCase().includes(query) &&
-        (effectiveFilter === "all" ||
-          (effectiveFilter === "ungrouped"
-            ? !item.groupIds.length
-            : item.groupIds.includes(Number(effectiveFilter)))),
-    ) ?? [];
-  const counts = new Map<number, number>();
-  for (const item of data?.terms ?? [])
-    for (const id of item.groupIds) counts.set(id, (counts.get(id) ?? 0) + 1);
+  const terms = data
+    ? filterTerms(data.terms, search, effectiveFilter, sort)
+    : [];
+  const pageCount = Math.max(1, Math.ceil(terms.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount);
+  useEffect(() => {
+    if (page > pageCount) setPage(pageCount);
+  }, [page, pageCount]);
+  const visibleTerms = terms.slice(
+    (currentPage - 1) * PAGE_SIZE,
+    currentPage * PAGE_SIZE,
+  );
+  const counts = groupTermCounts(data?.terms ?? []);
   const groupNames = new Map(data?.groups.map((item) => [item.id, item.name]));
+  // Deleted terms leave the selection as soon as the snapshot drops them.
+  const selectedTerms = (data?.terms ?? []).filter((item) =>
+    selection.has(item.id),
+  );
+  const selected = new Set(selectedTerms.map((item) => item.id));
   const locked = loading || busy || !data;
-  const openTerm = (initial: TermInput) => {
-    rememberFocus();
+  const dialogOpen =
+    !!editor || !!group || !!deletion || manageGroups || !!bulkDeletion;
+
+  const resetList = () => {
+    setPage(1);
+    setSelection(new Set());
+  };
+  const openEditor = (next: Editor, element?: HTMLElement | null) => {
+    rememberFocus(element);
     clearError();
-    setTerm(initial);
+    setEditor(next);
   };
   const addTerm = () =>
-    openTerm({
-      ...emptyTermRule,
-      id: null,
-      text: "",
-      groupIds: selectedGroup ? [selectedGroup.id] : [],
+    openEditor({
+      initial: {
+        ...emptyTermRule,
+        id: null,
+        text: "",
+        groupIds: selectedGroup ? [selectedGroup.id] : [],
+      },
     });
   const openGroup = (initial: GroupInput) => {
     rememberFocus();
     clearError();
     setGroup(initial);
   };
-  const openDelete = (target: DeleteTarget) => {
-    rememberFocus();
+  const openDelete = (target: DeleteTarget, element?: HTMLElement | null) => {
+    rememberFocus(element);
     clearError();
     setDeletion(target);
   };
   const closeDialog = () => {
-    setTerm(null);
+    setEditor(null);
     setGroup(null);
     setDeletion(null);
     clearError();
   };
+
+  useShortcut(
+    "mod+f",
+    () => {
+      searchInput.current?.focus();
+      searchInput.current?.select();
+    },
+    { enabled: !!data && !dialogOpen, allowInInputs: true },
+  );
+  useShortcut("mod+n", addTerm, { enabled: !locked && !dialogOpen });
+
+  const { new: requestedNew } = Route.useSearch();
+  const navigate = Route.useNavigate();
+  // Open the add dialog once the dictionary is ready, then drop the request.
+  useEffect(() => {
+    if (!requestedNew || locked) return;
+    void navigate({ search: {}, replace: true });
+    if (!dialogOpen) addTerm();
+  }, [requestedNew, locked]);
+
+  /**
+   * Runs one single-term command per selected id inside one snapshot write, then
+   * reports successes and failures with counts. Failed terms stay selected.
+   */
+  const runBulk = async (
+    ids: number[],
+    command: (term: Term) => Promise<Dictionary> | null,
+    messages: { done: (count: number) => string; none: string },
+  ) => {
+    const result: { outcome?: BulkOutcome } = {};
+    const saved = await write(async () => {
+      result.outcome = await applyToTerms(ids, command);
+      return result.outcome.snapshot;
+    });
+    const outcome = result.outcome;
+    if (!saved || !outcome) return;
+    const failed = outcome.failedIds.length;
+    setSelection(new Set(outcome.failedIds));
+    if (failed)
+      toast.error(
+        `${words(failed)} su ${ids.length} non ${plural(failed, "aggiornata", "aggiornate")}`,
+        {
+          description: `${outcome.done ? `${messages.done(outcome.done)}. ` : ""}${toUserMessage(outcome.error)}`,
+        },
+      );
+    else if (outcome.done) toast.success(messages.done(outcome.done));
+    else toast(messages.none);
+  };
+  const assignTo = (target: Group) =>
+    void runBulk(
+      [...selected],
+      (item) =>
+        item.groupIds.includes(target.id)
+          ? null
+          : dictionaryApi.saveTerm({
+              ...item,
+              groupIds: [...item.groupIds, target.id],
+            }),
+      {
+        done: (count) =>
+          `${words(count)} ${plural(count, "assegnata", "assegnate")} a “${target.name}”`,
+        none: `Le parole selezionate sono già in “${target.name}”`,
+      },
+    );
+  const removeFrom = (target: Group) =>
+    void runBulk(
+      [...selected],
+      (item) =>
+        item.groupIds.includes(target.id)
+          ? dictionaryApi.saveTerm({
+              ...item,
+              groupIds: item.groupIds.filter((id) => id !== target.id),
+            })
+          : null,
+      {
+        done: (count) =>
+          `${words(count)} ${plural(count, "rimossa", "rimosse")} da “${target.name}”`,
+        none: `Nessuna parola selezionata è in “${target.name}”`,
+      },
+    );
+
   return (
-    <>
-      <header className="page-header">
-        <div>
-          <p className="eyebrow">LE PAROLE CHE USI</p>
-          <h1>Dizionario</h1>
-          <p>Nomi, termini ed espressioni. Organizzati come lavori tu.</p>
-        </div>
-        <Button ref={addButton} onClick={addTerm} disabled={locked}>
-          <Plus data-icon="inline-start" />
-          Aggiungi parola
-        </Button>
-      </header>
-      <Alert>
-        <BookOpen aria-hidden="true" />
-        <AlertDescription>
-          Solo le varianti confermate modificano la dettatura. Gruppi e
-          modifiche si applicano dalla prossima sessione; pausa e ripresa
-          mantengono lo stesso dizionario.
-        </AlertDescription>
-      </Alert>
-      {error && !term && !group && !deletion && (
-        <DictionaryError error={error} />
-      )}
-      {!data ? (
-        <Empty>
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              {loading ? (
-                <Spinner aria-label="Caricamento dizionario" />
-              ) : (
-                <BookOpen />
-              )}
-            </EmptyMedia>
-            <EmptyTitle>
-              {loading
-                ? "Apertura del dizionario…"
-                : "Impossibile aprire il dizionario"}
-            </EmptyTitle>
-            <EmptyDescription>
-              {loading
-                ? "Caricamento delle parole salvate sul Mac."
-                : "I dati esistenti non vengono sostituiti. Puoi riprovare ad aprirli."}
-            </EmptyDescription>
-          </EmptyHeader>
-          {!loading && (
-            <EmptyContent>
-              <Button variant="outline" onClick={() => void refresh()}>
-                Riprova
-              </Button>
-            </EmptyContent>
-          )}
-        </Empty>
-      ) : (
-        <Card>
-          <CardHeader>
-            <CardTitle>
-              <h2>Parole salvate</h2>
-            </CardTitle>
-            <CardDescription>
-              Cerca nel dizionario o seleziona un gruppo.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex min-w-0 flex-col gap-4">
-            <FieldGroup>
-              <FieldLabel>Gruppi attivi nella prossima dettatura</FieldLabel>
-              <p className="text-sm text-muted-foreground">
-                I termini senza gruppo sono sempre disponibili. Seleziona
-                manualmente i contesti da usare.
-              </p>
-              <div className="flex flex-wrap gap-4">
-                {data.groups.map((item) => (
-                  <Field
-                    key={item.id}
-                    orientation="horizontal"
-                    className="w-auto"
-                  >
-                    <Checkbox
-                      id={`active-group-${item.id}`}
-                      checked={data.selectedGroupIds.includes(item.id)}
-                      disabled={locked}
-                      onCheckedChange={(checked) => {
-                        void mutate(() =>
-                          dictionaryApi.selectGroups(
-                            checked === true
-                              ? [...data.selectedGroupIds, item.id]
-                              : data.selectedGroupIds.filter(
-                                  (id) => id !== item.id,
-                                ),
-                          ),
-                        );
-                      }}
-                    />
-                    <FieldLabel htmlFor={`active-group-${item.id}`}>
-                      {item.name}
-                    </FieldLabel>
-                  </Field>
-                ))}
-                {!data.groups.length && (
-                  <p className="text-sm text-muted-foreground">
-                    Crea un gruppo per limitare le varianti a un contesto.
-                  </p>
-                )}
-              </div>
-            </FieldGroup>
+    <Page>
+      <PageHeader
+        title="Dizionario"
+        description="Grafie preferite e varianti da sostituire. Le modifiche valgono dalla prossima dettatura; la sessione attiva resta invariata."
+        actions={
+          <>
+            {data && (
+              <ActiveGroupsMenu
+                groups={data.groups}
+                selectedIds={data.selectedGroupIds}
+                disabled={locked}
+                onChange={(ids) =>
+                  void write(() => dictionaryApi.selectGroups(ids))
+                }
+                onManage={() => setManageGroups(true)}
+              />
+            )}
+            <Button
+              ref={addButton}
+              onClick={addTerm}
+              disabled={locked}
+              aria-keyshortcuts="Meta+N"
+            >
+              <Plus data-icon="inline-start" />
+              Aggiungi parola
+            </Button>
+          </>
+        }
+      />
+      <PageContent>
+        {error && !dialogOpen && (
+          <DictionaryError
+            title={
+              data
+                ? "Dizionario non aggiornato"
+                : "Impossibile aprire il dizionario"
+            }
+            error={error}
+            onRetry={() => void refresh()}
+          />
+        )}
+        {!data ? (
+          loading && <TermTableSkeleton />
+        ) : (
+          <>
             {data.conflicts.length > 0 && (
-              <Alert variant="destructive">
+              <Alert>
+                <TriangleAlert />
+                <AlertTitle>Varianti in conflitto</AlertTitle>
                 <AlertDescription>
                   Varianti in conflitto tra {data.conflicts.length} termini.
                   Quando le regole hanno la stessa specificità, il testo
@@ -242,249 +307,163 @@ export function DictionaryPage() {
                 </AlertDescription>
               </Alert>
             )}
-            <FieldGroup className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <Field>
-                <FieldLabel htmlFor="dictionary-search">
-                  Cerca parole
-                </FieldLabel>
-                <Input
-                  id="dictionary-search"
-                  type="search"
-                  placeholder="Cerca nel dizionario…"
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="dictionary-filter">Gruppo</FieldLabel>
-                <Select value={effectiveFilter} onValueChange={setFilter}>
-                  <SelectTrigger
-                    id="dictionary-filter"
-                    className="w-full min-w-0"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectItem value="all">
-                        Tutte le parole ({data.terms.length})
-                      </SelectItem>
-                      <SelectItem value="ungrouped">
-                        Senza gruppo (
-                        {
-                          data.terms.filter((item) => !item.groupIds.length)
-                            .length
-                        }
-                        )
-                      </SelectItem>
-                      {data.groups.map((item) => (
-                        <SelectItem key={item.id} value={String(item.id)}>
-                          {item.name} ({counts.get(item.id) ?? 0})
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
-            </FieldGroup>
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-sm text-muted-foreground" role="status">
-                {terms.length} {terms.length === 1 ? "parola" : "parole"}
-                {query ? " trovate" : ""}
-              </p>
-              <div className="flex flex-wrap gap-1">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={locked}
-                  onClick={() => openGroup({ id: null, name: "" })}
-                >
-                  <Plus data-icon="inline-start" />
-                  Crea gruppo
-                </Button>
-                {selectedGroup && (
-                  <>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={locked}
-                      onClick={() => openGroup(selectedGroup)}
-                      aria-label={`Rinomina gruppo ${selectedGroup.name}`}
-                    >
-                      <Pencil data-icon="inline-start" />
-                      Rinomina
-                    </Button>
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      disabled={locked}
-                      onClick={() =>
-                        openDelete({
-                          kind: "group",
-                          id: selectedGroup.id,
-                          label: selectedGroup.name,
-                        })
-                      }
-                      aria-label={`Elimina gruppo ${selectedGroup.name}`}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </>
+            <DictionaryToolbar
+              dictionary={data}
+              counts={counts}
+              search={search}
+              filter={effectiveFilter}
+              sort={sort}
+              found={terms.length}
+              locked={locked}
+              searchRef={searchInput}
+              groupsRef={groupsButton}
+              onSearch={(value) => {
+                setSearch(value);
+                resetList();
+              }}
+              onFilter={(value) => {
+                setFilter(value);
+                resetList();
+              }}
+              onSort={(value) => {
+                setSort(value);
+                setPage(1);
+              }}
+              onManageGroups={() => {
+                clearError();
+                setManageGroups(true);
+              }}
+            />
+            {selected.size > 0 && (
+              <BulkActions
+                count={selected.size}
+                groups={data.groups}
+                removable={data.groups.filter((item) =>
+                  selectedTerms.some((term) => term.groupIds.includes(item.id)),
                 )}
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  disabled={loading || busy}
-                  onClick={() => void refresh()}
-                  aria-label="Aggiorna dizionario"
-                >
-                  <RefreshCw />
-                </Button>
-              </div>
-            </div>
-            {loading && (
-              <p
-                className="flex items-center gap-2 text-sm text-muted-foreground"
-                role="status"
-              >
-                <Spinner aria-hidden="true" /> Aggiornamento…
-              </p>
+                busy={locked}
+                onAssign={assignTo}
+                onRemove={removeFrom}
+                onDelete={() => {
+                  rememberFocus();
+                  setBulkDeletion([...selected]);
+                }}
+                onClear={() => setSelection(new Set())}
+              />
             )}
-            {terms.length ? (
-              <div className="min-w-0 overflow-hidden rounded-lg border">
-                <Table className="table-fixed">
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Parola</TableHead>
-                      <TableHead>Gruppi</TableHead>
-                      <TableHead className="w-20">
-                        <span className="sr-only">Azioni</span>
-                      </TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {terms.map((item) => (
-                      <TableRow key={item.id}>
-                        <TableCell className="max-w-56 whitespace-normal break-words">
-                          <div className="flex flex-col gap-1">
-                            <span>{item.text}</span>
-                            <span className="text-xs text-muted-foreground">
-                              {item.variants.length
-                                ? item.variants.join(" · ")
-                                : "Nessuna variante, non applicata"}
-                            </span>
-                            {data.conflicts.includes(item.id) && (
-                              <Badge variant="destructive">Conflitto</Badge>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell className="max-w-64 whitespace-normal">
-                          <div className="flex flex-wrap gap-1">
-                            {item.groupIds.length ? (
-                              item.groupIds.map((id) => (
-                                <Badge
-                                  variant="secondary"
-                                  className="max-w-full whitespace-normal break-words"
-                                  key={id}
-                                >
-                                  {groupNames.get(id)}
-                                </Badge>
-                              ))
-                            ) : (
-                              <span className="text-muted-foreground">
-                                Senza gruppo
-                              </span>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex gap-1">
-                            <Button
-                              size="icon-sm"
-                              variant="ghost"
-                              disabled={locked}
-                              aria-label={`Modifica ${item.text}`}
-                              onClick={() => openTerm(item)}
-                            >
-                              <Pencil />
-                            </Button>
-                            <Button
-                              size="icon-sm"
-                              variant="ghost"
-                              disabled={locked}
-                              aria-label={`Elimina ${item.text}`}
-                              onClick={() =>
-                                openDelete({
-                                  kind: "term",
-                                  id: item.id,
-                                  label: item.text,
-                                })
-                              }
-                            >
-                              <Trash2 />
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
+            {visibleTerms.length ? (
+              <TermTable
+                terms={visibleTerms}
+                groupNames={groupNames}
+                conflicts={new Set(data.conflicts)}
+                automatic={automatic}
+                selection={selected}
+                locked={locked}
+                onSelect={(id, checked) =>
+                  setSelection((current) => {
+                    const next = new Set(current);
+                    if (checked) next.add(id);
+                    else next.delete(id);
+                    return next;
+                  })
+                }
+                onSelectPage={(checked) =>
+                  setSelection((current) => {
+                    const next = new Set(current);
+                    for (const item of visibleTerms)
+                      if (checked) next.add(item.id);
+                      else next.delete(item.id);
+                    return next;
+                  })
+                }
+                onOpen={(item, element) =>
+                  openEditor({ initial: item }, element)
+                }
+                onDuplicate={(item, element) =>
+                  openEditor(
+                    {
+                      initial: { ...item, id: null },
+                      title: "Duplica parola",
+                    },
+                    element,
+                  )
+                }
+                onDelete={(item, element) =>
+                  openDelete(
+                    { kind: "term", id: item.id, label: item.text },
+                    element,
+                  )
+                }
+              />
             ) : (
-              <Empty className="min-h-52 border">
+              <Empty className="border">
                 <EmptyHeader>
                   <EmptyMedia variant="icon">
                     <BookOpen />
                   </EmptyMedia>
                   <EmptyTitle>
-                    {query
-                      ? "Nessuna parola trovata"
-                      : effectiveFilter !== "all"
-                        ? "Qui non ci sono ancora parole"
-                        : "Il tuo dizionario inizia qui"}
+                    {!data.terms.length
+                      ? "Il tuo dizionario inizia qui"
+                      : search.trim()
+                        ? "Nessuna parola trovata"
+                        : "Nessuna parola in questo filtro"}
                   </EmptyTitle>
                   <EmptyDescription>
-                    {query
-                      ? "Prova un altro termine o cambia il gruppo selezionato."
-                      : "Aggiungi nomi e termini che vuoi conservare. Puoi raccoglierli in più gruppi."}
+                    {!data.terms.length
+                      ? "Aggiungi nomi e termini da scrivere sempre nello stesso modo. Puoi raccoglierli in gruppi."
+                      : "Prova un'altra ricerca o cambia il gruppo selezionato."}
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
-                  {query ? (
+                  {!data.terms.length ? (
+                    <Button onClick={addTerm} disabled={locked}>
+                      <Plus data-icon="inline-start" />
+                      Aggiungi parola
+                    </Button>
+                  ) : (
                     <Button
                       variant="outline"
                       onClick={() => {
                         setSearch("");
                         setFilter("all");
+                        resetList();
                       }}
                     >
                       Mostra tutte le parole
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="outline"
-                      onClick={addTerm}
-                      disabled={locked}
-                    >
-                      Aggiungi la prima parola
                     </Button>
                   )}
                 </EmptyContent>
               </Empty>
             )}
-          </CardContent>
-          <CardFooter>
-            <p className="text-xs text-muted-foreground">
-              Versione {data.version} · Salvato solo su questo Mac ·{" "}
-              {data.groups.length}{" "}
-              {data.groups.length === 1 ? "gruppo" : "gruppi"}
-            </p>
-          </CardFooter>
-        </Card>
+            {terms.length > 0 && (
+              <TermPagination
+                page={currentPage}
+                pageCount={pageCount}
+                pageSize={PAGE_SIZE}
+                total={terms.length}
+                onPage={setPage}
+              />
+            )}
+            <AutoVariants variants={autoVariants} disabled={busy} />
+          </>
+        )}
+      </PageContent>
+      {manageGroups && data && (
+        <GroupManager
+          dictionary={data}
+          counts={counts}
+          locked={locked}
+          childOpen={!!group || !!deletion}
+          returnFocus={groupsButton}
+          onClose={() => setManageGroups(false)}
+          onEdit={openGroup}
+          onDelete={(target) => openDelete(target)}
+        />
       )}
-      {term && data && (
+      {editor && data && (
         <TermDialog
-          initial={term}
+          initial={editor.initial}
+          title={editor.title}
           groups={data.groups}
           busy={busy}
           error={error}
@@ -492,7 +471,11 @@ export function DictionaryPage() {
           onReturnFocus={returnFocus}
           onSave={(input) => {
             void mutate(() => dictionaryApi.saveTerm(input)).then((saved) => {
-              if (saved) closeDialog();
+              if (!saved) return;
+              toast.success(
+                input.id === null ? "Parola aggiunta" : "Parola salvata",
+              );
+              closeDialog();
             });
           }}
         />
@@ -506,7 +489,11 @@ export function DictionaryPage() {
           onReturnFocus={returnFocus}
           onSave={(input) => {
             void mutate(() => dictionaryApi.saveGroup(input)).then((saved) => {
-              if (saved) closeDialog();
+              if (!saved) return;
+              toast.success(
+                input.id === null ? "Gruppo creato" : "Gruppo rinominato",
+              );
+              closeDialog();
             });
           }}
         />
@@ -524,11 +511,41 @@ export function DictionaryPage() {
                 ? dictionaryApi.deleteTerm(deletion.id)
                 : dictionaryApi.deleteGroup(deletion.id),
             ).then((saved) => {
-              if (saved) closeDialog();
+              if (!saved) return;
+              toast.success(
+                deletion.kind === "term"
+                  ? "Parola eliminata"
+                  : "Gruppo eliminato. Le parole sono conservate.",
+              );
+              closeDialog();
             });
           }}
         />
       )}
-    </>
+      {bulkDeletion && (
+        <BulkDeleteDialog
+          count={bulkDeletion.length}
+          busy={busy}
+          onClose={() => setBulkDeletion(null)}
+          onReturnFocus={() =>
+            (opener.current?.isConnected
+              ? opener.current
+              : searchInput.current
+            )?.focus()
+          }
+          onConfirm={() => {
+            void runBulk(
+              bulkDeletion,
+              (item) => dictionaryApi.deleteTerm(item.id),
+              {
+                done: (count) =>
+                  `${words(count)} ${plural(count, "eliminata", "eliminate")}`,
+                none: "Le parole selezionate erano già state eliminate",
+              },
+            ).then(() => setBulkDeletion(null));
+          }}
+        />
+      )}
+    </Page>
   );
 }

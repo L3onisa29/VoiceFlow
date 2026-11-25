@@ -1,60 +1,40 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 import { dictionaryApi, type Dictionary } from "@/lib/dictionary";
+import { queryKeys } from "@/lib/query-client";
+import { toUserMessage } from "@/lib/errors";
+import { useSnapshotQuery } from "./use-snapshot-query";
 
+const related = [queryKeys.suggestions, queryKeys.analysis];
 export function useDictionary() {
-  const [data, setData] = useState<Dictionary | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const pending = useRef(false);
-  const mounted = useRef(false);
-  const refresh = useCallback(async () => {
-    if (pending.current) return;
-    pending.current = true;
-    setLoading(true);
-    setError(null);
-    try {
-      const snapshot = await dictionaryApi.read();
-      if (mounted.current) setData(snapshot);
-    } catch (error) {
-      if (mounted.current) setError(String(error));
-    } finally {
-      pending.current = false;
-      if (mounted.current) setLoading(false);
-    }
-  }, []);
-  useEffect(() => {
-    mounted.current = true;
-    void refresh();
-    return () => {
-      mounted.current = false;
-    };
-  }, [refresh]);
-
-  const mutate = async (operation: () => Promise<Dictionary>) => {
-    if (pending.current) return false;
-    pending.current = true;
-    setBusy(true);
-    setError(null);
-    try {
-      const snapshot = await operation();
-      if (mounted.current) setData(snapshot);
-      return true;
-    } catch (error) {
-      if (mounted.current) setError(String(error));
-      return false;
-    } finally {
-      pending.current = false;
-      if (mounted.current) setBusy(false);
-    }
-  };
+  const query = useSnapshotQuery(
+    queryKeys.dictionary,
+    dictionaryApi.read,
+    related,
+  );
   return {
-    data,
-    loading,
-    busy,
-    error,
-    refresh,
-    mutate,
-    clearError: () => setError(null),
+    ...query,
+    /** Dialog writes: a failure stays in `error`, shown next to the draft. */
+    mutate: async (operation: () => Promise<Dictionary>) =>
+      (await query.mutate(operation)) !== null,
+    /** Page writes: a failure becomes a toast and never lingers in `error`. */
+    write: async (operation: () => Promise<Dictionary>) => {
+      let failure: unknown = null;
+      const saved = await query.mutate(async () => {
+        try {
+          return await operation();
+        } catch (error) {
+          failure = error;
+          throw error;
+        }
+      });
+      if (saved !== null) return true;
+      query.clearError();
+      toast.error(
+        failure === null
+          ? "Un’altra modifica è in corso. Riprova tra un istante."
+          : toUserMessage(failure),
+      );
+      return false;
+    },
   };
 }

@@ -37,7 +37,13 @@ I nomi dei gruppi accettano fino a 80 caratteri. Le chiavi dei termini e gruppi 
 
 ## Impostazioni
 
-La pagina raccoglie lingua, pulizia locale, formato del testo, stato e caricamento del modello, permessi macOS e scorciatoie. Le modifiche del testo mantengono il salvataggio automatico esistente in `desktop-settings.json`.
+La pagina raccoglie lingua, pulizia locale, formato del testo, stato e caricamento del modello, permessi macOS e scorciatoie. Lingua, pulizia locale e formato vengono salvati automaticamente nel database SQLite `~/Library/Application Support/VoiceFlow/desktop-settings.sqlite3`, con permessi `0600`.
+
+Alla prima apertura del database, l'app importa le preferenze da `desktop-settings.json`, se presente, e conserva il file originale. L'importazione e la versione dello schema vengono salvate nella stessa transazione; le aperture successive leggono solo SQLite. Un JSON non leggibile impedisce l'importazione e può essere corretto per ritentare. Un database non leggibile o con schema più recente non viene sostituito. Il servizio segnala l'errore e può continuare la dettatura con le preferenze predefinite in memoria.
+
+Le preferenze restano locali e funzionano offline. Esportazione/importazione del profilo e sincronizzazione automatica tra dispositivi non sono ancora implementate.
+
+Per l'uso futuro su più dispositivi, il requisito è una sincronizzazione automatica che non blocchi registrazione o trascrizione offline. Nell'attuale uso su un solo Mac, un profilo esportabile/importabile può essere un primo passo; il servizio di sincronizzazione e il relativo fornitore restano da definire.
 
 ## Persistenza e verifiche
 

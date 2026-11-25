@@ -13,6 +13,8 @@ export type DeleteTarget = {
   kind: "term" | "group";
   id: number;
   label: string;
+  termCount?: number;
+  globalCount?: number;
 };
 export function DeleteDialog({
   target,
@@ -50,7 +52,7 @@ export function DeleteDialog({
           </AlertDialogTitle>
           <AlertDialogDescription className="break-words">
             {target.kind === "group"
-              ? `Il gruppo “${target.label}” verrà eliminato. Le parole restano nel dizionario e negli altri gruppi. Le varianti rimaste senza gruppi saranno disponibili in tutte le prossime dettature.`
+              ? `Il gruppo “${target.label}” verrà eliminato. ${target.termCount} ${target.termCount === 1 ? "parola resta" : "parole restano"} nel dizionario. ${target.globalCount} ${target.globalCount === 1 ? "diventa" : "diventano"} senza gruppo: le loro varianti saranno disponibili in tutte le prossime dettature. Le altre mantengono i propri gruppi. La sessione attiva non cambia.`
               : `La parola “${target.label}” verrà eliminata dal dizionario e da tutti i suoi gruppi.`}
           </AlertDialogDescription>
         </AlertDialogHeader>
