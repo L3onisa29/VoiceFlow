@@ -9,7 +9,29 @@ const historyEntrySchema = z.object({
   wordCount: count,
   durationSeconds: z.number().nonnegative(),
   language: z.string(),
+  uncertainWords: count.default(0),
+  unknownRemoved: count.default(0),
 });
+const recognitionSchema = z.object({
+  meanConfidence: z.number().min(0).max(1).nullable(),
+  scoredTokens: count,
+  threshold: z.number(),
+  lowWords: z.array(z.object({ utterance: count, word: count })),
+  lowWordsTotal: count,
+  unknownRemoved: count,
+  languageTags: z.record(z.string(), count),
+});
+export type Recognition = z.infer<typeof recognitionSchema>;
+const timingSchema = z.object({
+  keyToMicrophoneMs: count.nullable(),
+  stopToPasteMs: count.nullable(),
+  pasted: z.boolean(),
+  inferenceMs: count,
+  chunks: count,
+  silenceClosures: count,
+  preparedDecoder: z.boolean(),
+});
+export type Timing = z.infer<typeof timingSchema>;
 const historyPageSchema = z.object({
   entries: z.array(historyEntrySchema),
   nextCursor: z.number().int().positive().nullable(),
@@ -44,6 +66,9 @@ const historyDetailSchema = z.object({
       groups: z.array(z.string()),
       dictionaryVersion: z.string().nullable(),
       cleanupVersion: z.string(),
+      recognition: recognitionSchema.nullish().default(null),
+      ruleHits: z.record(z.string(), count).nullish().default(null),
+      timing: timingSchema.nullish().default(null),
     })
     .nullable(),
   editVersion: count,
@@ -56,6 +81,8 @@ const historyDetailSchema = z.object({
       text: z.string(),
       reverted: z.boolean(),
       category: correctionCategorySchema.nullable(),
+      origin: z.enum(["live", "review"]).nullish().default(null),
+      segment: z.number().int().nonnegative().nullish().default(null),
     }),
   ),
 });
@@ -72,6 +99,30 @@ const editRequestSchema = z.object({
         new TextEncoder().encode(value).length <= 1_000_000,
       "Inserisci un testo tra 1 e 1.000.000 byte.",
     ),
+});
+const recentEntrySchema = z.object({
+  id: z.number().int().positive(),
+  createdAt: z.number().int(),
+  text: z.string(),
+  producedText: z.string(),
+  durationSeconds: z.number().nonnegative(),
+  pasted: z.boolean().nullable(),
+  interrupted: z.boolean(),
+  destinationApp: z.string().nullable(),
+});
+export type RecentEntry = z.infer<typeof recentEntrySchema>;
+const changeStepSchema = z.object({
+  segment: z.number().int().nonnegative(),
+  text: z.string().min(1),
+  category: correctionCategorySchema.nullable(),
+  restore: z.boolean(),
+});
+const changesRequestSchema = z.object({
+  id: z.number().int().positive(),
+  expectedVersion: count,
+  requestKey: z.string().min(1).max(80),
+  origin: z.enum(["live", "review"]),
+  steps: z.array(changeStepSchema).min(1).max(500),
 });
 export const historyApi = {
   page: async (search: string, beforeId: number | null = null) =>
@@ -92,6 +143,20 @@ export const historyApi = {
     historyDetailSchema.parse(
       await invoke("history_undo", { request: { id, expectedVersion } }),
     ),
+  recent: async (search: string) =>
+    z
+      .array(recentEntrySchema)
+      .parse(await invoke("history_recent", { query: { search } })),
+  saveChanges: async (request: z.infer<typeof changesRequestSchema>) =>
+    historyDetailSchema.parse(
+      await invoke("history_save_changes", {
+        request: changesRequestSchema.parse(request),
+      }),
+    ),
+  forget: async (id: number, revisionId: number) =>
+    historyDetailSchema.parse(
+      await invoke("history_forget", { request: { id, revisionId } }),
+    ),
   remember: async (
     id: number,
     revisionId: number,
@@ -107,6 +172,24 @@ export const historyApi = {
       }),
     ),
 };
+
+/** Avviso breve per elenco e dettaglio. Vuoto quando non c'è nulla da segnalare. */
+export function recognitionWarnings(entry: HistoryEntry) {
+  const warnings: string[] = [];
+  if (entry.unknownRemoved > 0)
+    warnings.push(
+      entry.unknownRemoved === 1
+        ? "1 parola non riconosciuta e omessa"
+        : `${entry.unknownRemoved} parole non riconosciute e omesse`,
+    );
+  if (entry.uncertainWords > 0)
+    warnings.push(
+      entry.uncertainWords === 1
+        ? "1 parola incerta"
+        : `${entry.uncertainWords} parole incerte`,
+    );
+  return warnings;
+}
 
 export function formatDuration(seconds: number) {
   const total = Math.round(seconds);

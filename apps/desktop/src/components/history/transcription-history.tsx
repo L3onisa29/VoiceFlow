@@ -1,5 +1,19 @@
-import { useRef, useState } from "react";
-import { Check, Copy, History, RefreshCw, Trash2 } from "lucide-react";
+import { queryClient, queryKeys, invalidatePrivacy } from "@/lib/query-client";
+import { useId, useRef, useState, type ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
+import {
+  ArrowUpRight,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  History,
+  MoreHorizontal,
+  RotateCcw,
+  Search,
+  Trash2,
+  X,
+} from "lucide-react";
+import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -14,41 +28,47 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  Card,
-  CardHeader,
-  CardTitle,
-  CardDescription,
-  CardContent,
-  CardFooter,
-  CardAction,
-} from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Empty,
+  EmptyContent,
   EmptyHeader,
   EmptyMedia,
   EmptyTitle,
   EmptyDescription,
 } from "@/components/ui/empty";
-import { Field, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
-import { HistoryEditor } from "@/components/history/history-editor";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group";
+import { Item, ItemContent } from "@/components/ui/item";
+import { Kbd } from "@/components/ui/kbd";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
 import { useHistory } from "@/hooks/use-history";
-import { formatDuration, historyApi, type HistoryEntry } from "@/lib/history";
-
-const number = new Intl.NumberFormat("it-IT", { maximumFractionDigits: 0 });
-const date = new Intl.DateTimeFormat("it-IT", {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
+import { useShortcut } from "@/hooks/use-shortcut";
+import {
+  formatDuration,
+  historyApi,
+  recognitionWarnings,
+  type HistoryEntry,
+} from "@/lib/history";
+import { toUserMessage } from "@/lib/errors";
+import { copyTranscription } from "./actions";
+import {
+  formatDateTime,
+  formatTime,
+  formatWords,
+  groupByDay,
+  isoDate,
+} from "./format";
 
 export function TranscriptionHistory({
   saveError,
@@ -56,320 +76,233 @@ export function TranscriptionHistory({
   saveError: string | null;
 }) {
   const [search, setSearch] = useState("");
-  const { data, loading, error, refresh, loadMore } = useHistory(search);
-  const [selected, setSelected] = useState<HistoryEntry | null>(null);
+  const searchRef = useRef(search);
+  searchRef.current = search;
+  const searchInput = useRef<HTMLInputElement>(null);
+  const { pages, hasNextPage, loading, error, refresh, loadMore } =
+    useHistory(search);
+  const [pageIndex, setPageIndex] = useState(0);
+  const currentPage = pages ? Math.min(pageIndex, pages.length - 1) : 0;
+  const data = pages?.[currentPage];
   const [deletion, setDeletion] = useState<HistoryEntry | null>(null);
   const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [copied, setCopied] = useState<number | null>(null);
-  const heading = useRef<HTMLHeadingElement>(null);
-  const opener = useRef<HTMLElement | null>(null);
-  const rememberFocus = () => {
-    opener.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-  };
+  const opener = useRef<number | null>(null);
+  const searching = search.trim().length > 0;
+  useShortcut(
+    "mod+f",
+    () => {
+      searchInput.current?.focus();
+      searchInput.current?.select();
+    },
+    { allowInInputs: true },
+  );
+  // Back to the row menu that opened the dialog, or to the search field.
   const returnFocus = () =>
-    (opener.current?.isConnected ? opener.current : heading.current)?.focus();
+    (
+      (opener.current === null
+        ? null
+        : document.querySelector<HTMLElement>(
+            `[data-history-actions="${opener.current}"]`,
+          )) ?? searchInput.current
+    )?.focus();
+  function updateSearch(value: string) {
+    setSearch(value);
+    setPageIndex(0);
+  }
   async function copy(id: number) {
     setBusy(true);
-    setActionError(null);
-    setCopied(null);
-    try {
-      await historyApi.copy(id);
-      setCopied(id);
-    } catch (error) {
-      setActionError(String(error));
-    } finally {
-      setBusy(false);
-    }
+    await copyTranscription(id);
+    setBusy(false);
   }
   async function remove() {
     if (!deletion || busy) return;
     setBusy(true);
-    setActionError(null);
     try {
       await historyApi.delete(deletion.id);
+      // Drop deleted text from inactive searches as well as the visible page.
+      await queryClient.resetQueries({ queryKey: queryKeys.history });
+      await invalidatePrivacy();
       opener.current = null;
       setDeletion(null);
-      heading.current?.focus();
+      if (data?.entries.length === 1 && currentPage > 0)
+        setPageIndex(currentPage - 1);
       refresh();
+      toast.success("Trascrizione eliminata.");
     } catch (error) {
-      setActionError(String(error));
+      toast.error(toUserMessage(error));
     } finally {
       setBusy(false);
     }
   }
-  const stats = data?.stats;
-  const metrics = [
-    {
-      label: "Parole totali",
-      value: stats ? number.format(stats.totalWords) : null,
-    },
-    {
-      label: "Dettature",
-      value: stats ? number.format(stats.totalSessions) : null,
-    },
-    {
-      label: "Tempo di dettatura",
-      value: stats ? formatDuration(stats.totalSeconds) : null,
-    },
-    {
-      label: "Parole al minuto",
-      value: stats
-        ? stats.wordsPerMinute === null
-          ? "Non disponibile"
-          : number.format(stats.wordsPerMinute)
-        : null,
-    },
-  ];
+  async function nextPage() {
+    if (!pages) return;
+    const requestedSearch = search;
+    if (currentPage + 1 < pages.length) {
+      setPageIndex(currentPage + 1);
+    } else if (
+      hasNextPage &&
+      (await loadMore()) &&
+      searchRef.current === requestedSearch
+    ) {
+      setPageIndex(currentPage + 1);
+    }
+  }
+  const paginated =
+    data && (currentPage > 0 || (pages?.length ?? 0) > 1 || hasNextPage);
   return (
-    <section className="flex flex-col gap-4" aria-labelledby="history-title">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-1">
-          <h2
-            id="history-title"
-            ref={heading}
-            tabIndex={-1}
-            className="text-lg font-semibold"
-          >
-            Le tue trascrizioni
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Il tuo storico, salvato solo su questo Mac.
-          </p>
-        </div>
-        <Badge variant="outline">Archivio locale</Badge>
-      </div>
+    <>
+      <InputGroup>
+        <InputGroupAddon>
+          <Search />
+        </InputGroupAddon>
+        <InputGroupInput
+          ref={searchInput}
+          type="search"
+          aria-label="Cerca nelle trascrizioni"
+          placeholder="Cerca una parola o una frase"
+          value={search}
+          maxLength={200}
+          onChange={(event) => updateSearch(event.target.value)}
+        />
+        <InputGroupAddon align="inline-end">
+          {searching ? (
+            <InputGroupButton
+              size="icon-xs"
+              aria-label="Cancella ricerca"
+              onClick={() => {
+                updateSearch("");
+                searchInput.current?.focus();
+              }}
+            >
+              <X />
+            </InputGroupButton>
+          ) : (
+            <Kbd>⌘F</Kbd>
+          )}
+        </InputGroupAddon>
+      </InputGroup>
       {saveError && (
         <Alert variant="destructive">
           <AlertTitle>Salvataggio non riuscito</AlertTitle>
           <AlertDescription>{saveError}</AlertDescription>
         </Alert>
       )}
-      <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-        {metrics.map(({ label, value }) => (
-          <Card key={label} size="sm">
-            <CardHeader>
-              <CardDescription>{label}</CardDescription>
-              <CardTitle>
-                {value === null ? (
-                  loading ? (
-                    <Skeleton className="h-6 w-16" />
-                  ) : (
-                    "Non disponibile"
-                  )
-                ) : (
-                  value
-                )}
-              </CardTitle>
-            </CardHeader>
-          </Card>
-        ))}
-      </div>
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        Statistiche su tutto lo storico conservato. La velocità usa il tempo di
-        registrazione, silenzi inclusi e pause escluse.
-      </p>
-      <Card>
-        <CardHeader>
-          <CardTitle>Storico</CardTitle>
-          <CardDescription>
-            Le dettature più recenti compaiono per prime.
-          </CardDescription>
-          <CardAction>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Aggiorna storico"
-              onClick={refresh}
-              disabled={loading}
-            >
-              <RefreshCw />
+      {error && (
+        <Alert variant="destructive">
+          <AlertTitle>Storico non disponibile</AlertTitle>
+          <AlertDescription className="flex flex-col items-start gap-2">
+            <span>{error}</span>
+            <Button variant="outline" size="sm" onClick={refresh}>
+              <RotateCcw data-icon="inline-start" />
+              Riprova
             </Button>
-          </CardAction>
-        </CardHeader>
-        <CardContent className="flex min-w-0 flex-col gap-4">
-          <Field>
-            <FieldLabel htmlFor="history-search">
-              Cerca nelle trascrizioni
-            </FieldLabel>
-            <Input
-              id="history-search"
-              type="search"
-              placeholder="Cerca una parola o una frase…"
-              value={search}
-              maxLength={200}
-              onChange={(event) => setSearch(event.target.value)}
-            />
-          </Field>
-          {(error || (actionError && !deletion && !selected)) && (
-            <Alert variant="destructive">
-              <AlertDescription>{error || actionError}</AlertDescription>
-              <Button
-                variant="outline"
-                size="sm"
-                className="mt-2 justify-self-start"
-                onClick={() => {
-                  setActionError(null);
-                  refresh();
-                }}
-              >
-                Riprova
-              </Button>
-            </Alert>
-          )}
-          {loading && (
-            <p
-              role="status"
-              className="flex items-center gap-2 text-sm text-muted-foreground"
-            >
-              <Spinner aria-hidden="true" />
-              Caricamento storico…
-            </p>
-          )}
-          {data && data.entries.length > 0 ? (
-            <ul className="flex flex-col divide-y" aria-busy={loading}>
-              {data.entries.map((entry) => (
-                <li
-                  key={entry.id}
-                  className="flex min-w-0 flex-col gap-3 py-4 first:pt-0 last:pb-0"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-                    <time dateTime={new Date(entry.createdAt).toISOString()}>
-                      {date.format(entry.createdAt)}
-                    </time>
-                    <span>
-                      {number.format(entry.wordCount)} parole ·{" "}
-                      {formatDuration(entry.durationSeconds)}
-                    </span>
-                  </div>
-                  <p className="line-clamp-3 whitespace-pre-wrap wrap-anywhere text-sm leading-relaxed">
-                    {entry.text}
-                  </p>
-                  <div className="flex flex-wrap items-center gap-1">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => {
-                        rememberFocus();
-                        setActionError(null);
-                        setSelected(entry);
-                      }}
-                    >
-                      Apri testo
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={busy}
-                      aria-label={`Copia trascrizione del ${date.format(entry.createdAt)}`}
-                      onClick={() => void copy(entry.id)}
-                    >
-                      {copied === entry.id ? (
-                        <Check data-icon="inline-start" />
-                      ) : (
-                        <Copy data-icon="inline-start" />
-                      )}
-                      {copied === entry.id ? "Copiato" : "Copia"}
-                    </Button>
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      disabled={busy}
-                      aria-label={`Elimina trascrizione del ${date.format(entry.createdAt)}`}
-                      onClick={() => {
-                        rememberFocus();
-                        setActionError(null);
-                        setDeletion(entry);
-                      }}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            !loading &&
-            !error && (
-              <Empty>
-                <EmptyHeader>
-                  <EmptyMedia variant="icon">
-                    <History />
-                  </EmptyMedia>
-                  <EmptyTitle>
-                    {search.trim()
-                      ? "Nessuna trascrizione trovata"
-                      : "Il tuo storico inizia qui"}
-                  </EmptyTitle>
-                  <EmptyDescription>
-                    {search.trim()
-                      ? "Prova un'altra parola o cancella la ricerca."
-                      : "Le prossime dettature concluse verranno salvate qui. Le dettature annullate e quelle senza testo non vengono conservate."}
-                  </EmptyDescription>
-                </EmptyHeader>
-              </Empty>
-            )
-          )}
-        </CardContent>
-        <CardFooter className="flex-wrap justify-between gap-3">
-          <p className="text-xs text-muted-foreground">
-            Solo testo e dati della sessione. Nessun audio salvato.
-          </p>
-          {data?.nextCursor && (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={loading}
-              onClick={() => void loadMore()}
-            >
-              Carica altre
-            </Button>
-          )}
-        </CardFooter>
-      </Card>
-      <Dialog
-        open={selected !== null}
-        onOpenChange={(open) => {
-          if (!open && !busy) {
-            setSelected(null);
-            setActionError(null);
-          }
-        }}
+          </AlertDescription>
+        </Alert>
+      )}
+      <section
+        aria-label="Trascrizioni"
+        aria-busy={loading}
+        className="flex flex-col gap-6"
       >
-        <DialogContent
-          className="sm:max-w-2xl"
-          onCloseAutoFocus={(event) => {
-            event.preventDefault();
-            returnFocus();
-          }}
-        >
-          <DialogHeader>
-            <DialogTitle>Trascrizione salvata</DialogTitle>
-            <DialogDescription>
-              {selected &&
-                `${date.format(selected.createdAt)} · ${selected.wordCount} parole · ${formatDuration(selected.durationSeconds)}`}
-            </DialogDescription>
-          </DialogHeader>
-          {selected && (
-            <HistoryEditor
-              key={selected.id}
-              id={selected.id}
-              onChanged={refresh}
-              onBusy={setBusy}
-            />
-          )}
-        </DialogContent>
-      </Dialog>
+        {data && data.entries.length > 0 ? (
+          groupByDay(data.entries).map((group) => (
+            <DayGroup key={group.key} label={group.label}>
+              {group.entries.map((entry) => (
+                <HistoryRow
+                  key={entry.id}
+                  entry={entry}
+                  disabled={busy}
+                  onCopy={() => void copy(entry.id)}
+                  onDelete={() => {
+                    opener.current = entry.id;
+                    setDeletion(entry);
+                  }}
+                />
+              ))}
+            </DayGroup>
+          ))
+        ) : !data && loading ? (
+          <HistorySkeleton />
+        ) : (
+          !error && (
+            <Empty className="border">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  {searching ? <Search /> : <History />}
+                </EmptyMedia>
+                <EmptyTitle>
+                  {searching
+                    ? "Nessun risultato"
+                    : "Nessuna trascrizione salvata"}
+                </EmptyTitle>
+                <EmptyDescription>
+                  {searching
+                    ? "Nessuna trascrizione contiene questo testo."
+                    : "Le dettature concluse vengono salvate qui. Quelle annullate o senza testo non vengono conservate."}
+                </EmptyDescription>
+              </EmptyHeader>
+              <EmptyContent>
+                {searching ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      updateSearch("");
+                      searchInput.current?.focus();
+                    }}
+                  >
+                    Cancella ricerca
+                  </Button>
+                ) : (
+                  <Button asChild variant="outline" size="sm">
+                    <Link to="/">Vai alla dettatura</Link>
+                  </Button>
+                )}
+              </EmptyContent>
+            </Empty>
+          )
+        )}
+        {paginated && (
+          <nav
+            className="flex items-center justify-end gap-2"
+            aria-label="Pagine dello storico"
+          >
+            <Button
+              size="icon-sm"
+              variant="outline"
+              disabled={loading || currentPage === 0}
+              aria-label="Pagina precedente"
+              title="Pagina precedente"
+              onClick={() => setPageIndex(currentPage - 1)}
+            >
+              <ChevronLeft />
+            </Button>
+            <span
+              className="min-w-16 text-center text-xs tabular-nums"
+              aria-live="polite"
+            >
+              Pagina {currentPage + 1}
+            </span>
+            <Button
+              size="icon-sm"
+              variant="outline"
+              disabled={
+                loading ||
+                (!hasNextPage && currentPage + 1 >= (pages?.length ?? 0))
+              }
+              aria-label="Pagina successiva"
+              title="Pagina successiva"
+              onClick={() => void nextPage()}
+            >
+              <ChevronRight />
+            </Button>
+          </nav>
+        )}
+      </section>
       <AlertDialog
         open={deletion !== null}
         onOpenChange={(open) => {
-          if (!open && !busy) {
-            setDeletion(null);
-            setActionError(null);
-          }
+          if (!open && !busy) setDeletion(null);
         }}
       >
         <AlertDialogContent
@@ -385,16 +318,11 @@ export function TranscriptionHistory({
               rimossi da questo archivio locale insieme ai conteggi. Anche le
               proposte non approvate e i riferimenti sorgente saranno rimossi.
               Le definizioni già approvate, con i loro esempi e versioni,
-              restano regole indipendenti. Eventuali
-              testi già inviati a servizi esterni non vengono cancellati da quei
-              servizi. L'operazione non può essere annullata.
+              restano regole indipendenti. Eventuali testi già inviati a servizi
+              esterni non vengono cancellati da quei servizi. L'operazione non
+              può essere annullata.
             </AlertDialogDescription>
           </AlertDialogHeader>
-          {actionError && (
-            <Alert variant="destructive">
-              <AlertDescription>{actionError}</AlertDescription>
-            </Alert>
-          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={busy}>Annulla</AlertDialogCancel>
             <AlertDialogAction
@@ -410,6 +338,117 @@ export function TranscriptionHistory({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </section>
+    </>
+  );
+}
+
+function DayGroup({ label, children }: { label: string; children: ReactNode }) {
+  const id = useId();
+  return (
+    <div role="group" aria-labelledby={id} className="flex flex-col gap-1">
+      <h2 id={id} className="px-3 text-xs font-medium text-muted-foreground">
+        {label}
+      </h2>
+      <ul className="flex flex-col">{children}</ul>
+    </div>
+  );
+}
+
+function HistoryRow({
+  entry,
+  disabled,
+  onCopy,
+  onDelete,
+}: {
+  entry: HistoryEntry;
+  disabled: boolean;
+  onCopy: () => void;
+  onDelete: () => void;
+}) {
+  const when = formatDateTime(entry.createdAt);
+  return (
+    <li className="flex min-w-0 items-center gap-1">
+      <Item asChild className="min-w-0 flex-1">
+        <Link
+          to="/history/$transcriptionId"
+          params={{ transcriptionId: entry.id }}
+        >
+          <ItemContent className="min-w-0">
+            <p className="line-clamp-2 whitespace-pre-wrap wrap-anywhere text-sm leading-relaxed">
+              {entry.text}
+            </p>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+              <time
+                dateTime={isoDate(entry.createdAt)}
+                className="tabular-nums"
+              >
+                {formatTime(entry.createdAt)}
+              </time>
+              <span aria-hidden="true">·</span>
+              <span>{formatDuration(entry.durationSeconds)}</span>
+              <span aria-hidden="true">·</span>
+              <span>{formatWords(entry.wordCount)}</span>
+              {recognitionWarnings(entry).map((warning) => (
+                <Badge key={warning} variant="warning">
+                  {warning}
+                </Badge>
+              ))}
+            </div>
+          </ItemContent>
+        </Link>
+      </Item>
+      <DropdownMenu modal={false}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            data-history-actions={entry.id}
+            variant="ghost"
+            size="icon-sm"
+            disabled={disabled}
+            aria-label={`Azioni per la trascrizione del ${when}`}
+          >
+            <MoreHorizontal />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuGroup>
+            <DropdownMenuItem onSelect={onCopy}>
+              <Copy />
+              Copia
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link
+                to="/history/$transcriptionId"
+                params={{ transcriptionId: entry.id }}
+              >
+                <ArrowUpRight />
+                Apri
+              </Link>
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuGroup>
+            <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+              <Trash2 />
+              Elimina
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>
+  );
+}
+
+function HistorySkeleton() {
+  return (
+    <div className="flex flex-col gap-1" aria-hidden="true">
+      <Skeleton className="mx-3 h-3 w-16" />
+      {Array.from({ length: 4 }, (_, index) => (
+        <div key={index} className="flex flex-col gap-2 px-3 py-2.5">
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-2/3" />
+          <Skeleton className="h-3 w-40" />
+        </div>
+      ))}
+    </div>
   );
 }

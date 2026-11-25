@@ -4,8 +4,9 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 const modulePath = process.env.PLAYWRIGHT_MODULE;
-if (!modulePath) throw new Error("Set PLAYWRIGHT_MODULE");
-const { chromium } = await import(pathToFileURL(modulePath).href);
+const { chromium } = await import(
+  modulePath ? pathToFileURL(modulePath).href : "playwright"
+);
 const root = resolve(import.meta.dirname, "..");
 const output = resolve(root, "artifacts/confidence");
 await mkdir(output, { recursive: true });
@@ -73,7 +74,7 @@ mockIPC(async(cmd,args)=>{
   if(window.failDetail)throw new Error('Dettaglio temporaneamente non disponibile');
   const run=structuredClone(window.rows.find(r=>r.key.attemptId===args.key.attemptId)||window.makeRun(1,1,'failed',0,0));
   if(window.delayDetail&&args.key.attemptId===2)await new Promise(resolve=>setTimeout(resolve,700));
-  return {run,findings:structuredClone(window.findings),sources:[{sessionId:1,revisionId:null,excluded:false},{sessionId:2,revisionId:null,excluded:true}],proposals:run.accepted?[{proposalId:7,relation:'created',revision:2}]:[]};
+  return {run,attempts:structuredClone(window.rows.filter(r=>r.key.batchId===run.key.batchId)),findings:structuredClone(window.findings),sources:[{sessionId:1,revisionId:null,excluded:false},{sessionId:2,revisionId:null,excluded:true}],proposals:run.accepted?[{proposalId:7,relation:'created',revision:2,currentState:'proposed',currentRevision:2}]:[]};
  }
  return null;
 },{shouldMockEvents:true});`,
@@ -88,16 +89,18 @@ const pass = (name: string) => {
   console.log("PASS", name);
 };
 try {
-  await page.goto("https://voiceflow.test/#/settings");
+  await page.goto("https://voiceflow.test/#/settings?section=analysis");
   const policy = page.getByRole("checkbox", {
     name: "Approva automaticamente con confidenza superiore a 90",
     exact: true,
   });
   await policy.waitFor();
   assert.equal(await policy.isChecked(), false);
-  await policy.check();
+  // Enabling applies immediately after an explicit confirmation.
+  await policy.click();
   await page
-    .getByRole("button", { name: "Salva preferenze analisi", exact: true })
+    .getByRole("alertdialog", { name: "Approvare automaticamente le regole?" })
+    .getByRole("button", { name: "Attiva approvazione", exact: true })
     .click();
   await page.waitForFunction(
     () => window.analysis.settings.autoApproveHighConfidence === true,
@@ -113,10 +116,12 @@ try {
     window.rows = [window.makeRun(1, 1, "running", 0, 0)];
     window.scheduler.workerRunning = true;
   });
-  await page.getByRole("link", { name: "Analisi", exact: true }).click();
   await page
-    .getByRole("button", { name: "Dettaglio tentativo #1", exact: true })
+    .getByRole("link", { name: "Torna a VoiceFlow", exact: true })
     .click();
+  await page.getByRole("link", { name: "Revisione", exact: true }).click();
+  await page.getByRole("tab", { name: "Esecuzioni", exact: true }).click();
+  await page.getByRole("link", { name: /Tentativo #1$/ }).click();
   const panel = page.locator('[aria-label="Dettaglio analisi"]');
   await panel.getByText("In corso", { exact: true }).waitFor();
   await page.evaluate(() => {
@@ -151,22 +156,6 @@ try {
       .waitFor();
   }
   await panel
-    .getByText("Molto alta · 91–100", { exact: false })
-    .first()
-    .waitFor();
-  await panel
-    .getByText("Alta · 75–90 · revisione manuale", { exact: false })
-    .first()
-    .waitFor();
-  await panel
-    .getByText("Media · 50–74 · revisione manuale", { exact: false })
-    .first()
-    .waitFor();
-  await panel
-    .getByText("Bassa · 0–49 · revisione manuale", { exact: false })
-    .first()
-    .waitFor();
-  await panel
     .getByText("Testo mantenuto · nessuna regola pubblicata", { exact: true })
     .waitFor();
   await panel.getByText("Approvata automaticamente", { exact: true }).waitFor();
@@ -192,7 +181,7 @@ try {
     fullPage: true,
   });
   pass(
-    "Production analysis route refreshes completed run with exact bands, source text, action, result, estimate meaning and distinct outcomes",
+    "Production analysis route refreshes completed run with exact confidence scores, source text, action, result, estimate meaning and distinct outcomes",
   );
   await page.evaluate(() => {
     window.proposal.confidence = 91;
@@ -202,11 +191,20 @@ try {
     .getByRole("link", { name: "Apri proposta #7", exact: true })
     .first()
     .click();
-  await page.getByText("Confidenza 91/100", { exact: false }).waitFor();
+  const proposal = page.locator('[data-proposal-detail="7"]');
+  await proposal.getByText("Confidenza 91/100", { exact: false }).waitFor();
+  // The queue row carries the bare score; the scale appears once, in the detail.
+  assert.equal(
+    await page.getByText("Confidenza 91/100", { exact: false }).count(),
+    1,
+  );
   await page
-    .getByText("Ultimo esito analisi: Approvata automaticamente", {
-      exact: true,
-    })
+    .locator('[data-proposal-id="7"]')
+    .getByText("Confidenza 91", { exact: true })
+    .waitFor();
+  await proposal.getByText("Ultimo esito analisi", { exact: true }).waitFor();
+  await proposal
+    .getByText("Approvata automaticamente", { exact: true })
     .waitFor();
   await page.screenshot({
     path: resolve(output, "suggestion-score.png"),
@@ -216,7 +214,8 @@ try {
     delete window.proposal.confidence;
     delete window.proposal.analysisOutcome;
   });
-  await page.getByRole("button", { name: "Aggiorna", exact: true }).click();
+  // Suggestions refresh on focus and events; there is no manual refresh.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.getByText("Confidenza sconosciuta", { exact: false }).waitFor();
   pass(
     "Linked suggestion shows latest score/outcome; old proposal remains unknown/manual",
@@ -225,32 +224,50 @@ try {
     window.proposal.confidence = 90;
     window.proposal.analysisOutcome = "manual-confidence";
   });
-  await page.getByRole("button", { name: "Aggiorna", exact: true }).click();
+  // Suggestions refresh on focus and events; there is no manual refresh.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.getByText("Confidenza 90/100", { exact: false }).waitFor();
   await page.getByRole("button", { name: "Modifica", exact: true }).click();
   const edit = page.getByRole("dialog");
   await edit.locator("#preferred").fill("VoiceFLOW");
   await edit.locator("#positiveExamples-0-output").fill("VoiceFLOW");
-  await edit.getByRole("button", { name: "Salva proposta", exact: true }).click();
+  await edit
+    .getByRole("button", { name: "Salva proposta", exact: true })
+    .click();
   await edit.waitFor({ state: "hidden" });
   await page.getByRole("heading", { name: "VoiceFLOW", exact: true }).waitFor();
   await page.getByText("Confidenza sconosciuta", { exact: false }).waitFor();
-  assert.equal(await page.getByText("Confidenza 90/100", { exact: false }).count(), 0);
-  assert.equal(await page.getByText("Ultimo esito analisi:", { exact: false }).count(), 0);
+  assert.equal(
+    await page.getByText("Confidenza 90/100", { exact: false }).count(),
+    0,
+  );
+  assert.equal(
+    await page.getByText("Ultimo esito analisi", { exact: true }).count(),
+    0,
+  );
   // The backend regression supplies a fresh score only when the edited candidate
   // matches the new finding. The UI must consume that refreshed snapshot.
   await page.evaluate(() => {
     window.proposal.confidence = 99;
     window.proposal.analysisOutcome = "blocked-human";
   });
-  await page.getByRole("button", { name: "Aggiorna", exact: true }).click();
+  // Suggestions refresh on focus and events; there is no manual refresh.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await page.getByRole("heading", { name: "VoiceFLOW", exact: true }).waitFor();
   await page.getByText("Confidenza 99/100", { exact: false }).waitFor();
-  await page.getByRole("link", { name: "Analisi", exact: true }).click();
-  await page.getByRole("button", { name: "Dettaglio tentativo #1", exact: true }).click();
-  await panel.locator('[aria-label="Rilievo: Rilievo 90"]').getByText("Confidenza 90/100", { exact: false }).waitFor();
-  await panel.locator('[aria-label="Rilievo: Rilievo 90"]').getByText("VoiceFlow", { exact: true }).waitFor();
-  pass("Manual edit clears current score/outcome; re-ingestion refreshes score while the original action and score stay in history");
+  await page.getByRole("tab", { name: "Esecuzioni", exact: true }).click();
+  await page.getByRole("link", { name: /Tentativo #1$/ }).click();
+  await panel
+    .locator('[aria-label="Rilievo: Rilievo 90"]')
+    .getByText("Confidenza 90/100", { exact: false })
+    .waitFor();
+  await panel
+    .locator('[aria-label="Rilievo: Rilievo 90"]')
+    .getByText("VoiceFlow", { exact: true })
+    .waitFor();
+  pass(
+    "Manual edit clears current score/outcome; re-ingestion refreshes score while the original action and score stay in history",
+  );
   await page.setViewportSize({ width: 780, height: 620 });
   assert.equal(
     await page.evaluate(
@@ -261,7 +278,12 @@ try {
   assert.deepEqual(errors, []);
   assert.equal(
     await page.evaluate(() =>
-      window.calls.some((c) => c.cmd === "start_capture" || (c.cmd === "suggestions_review" && c.args.request.action.kind !== "edit")),
+      window.calls.some(
+        (c) =>
+          c.cmd === "start_capture" ||
+          (c.cmd === "suggestions_review" &&
+            c.args.request.action.kind !== "edit"),
+      ),
     ),
     false,
   );

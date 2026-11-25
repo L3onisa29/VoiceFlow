@@ -1,76 +1,39 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { historyApi, type HistoryPage } from "@/lib/history";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { historyApi } from "@/lib/history";
+import { queryKeys } from "@/lib/query-client";
+import { useDebouncedValue, useHistoryConnection } from "./use-query-events";
+import { toUserMessage } from "@/lib/errors";
 
 export function useHistory(search: string) {
-  const [data, setData] = useState<HistoryPage | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const request = useRef(0);
-  const [revision, setRevision] = useState(0);
-  const refresh = useCallback(() => setRevision((value) => value + 1), []);
-  const load = useCallback(
-    async (beforeId: number | null = null) => {
-      const current = ++request.current;
-      setLoading(true);
-      setError(null);
-      try {
-        const page = await historyApi.page(search, beforeId);
-        if (current === request.current) {
-          setData((previous) =>
-            beforeId && previous
-              ? { ...page, entries: [...previous.entries, ...page.entries] }
-              : page,
-          );
-        }
-      } catch (error) {
-        if (current === request.current) setError(String(error));
-      } finally {
-        if (current === request.current) setLoading(false);
-      }
-    },
-    [search],
-  );
-
-  useEffect(() => {
-    // Invalidate immediately so old searches cannot replace newer results.
-    ++request.current;
-    setLoading(true);
-    const timer = window.setTimeout(() => void load(), 200);
-    return () => {
-      window.clearTimeout(timer);
-      ++request.current;
-    };
-  }, [load, revision]);
-
-  useEffect(() => {
-    let disposed = false;
-    let release: (() => void) | undefined;
-    void listen("history-changed", refresh)
-      .then((unlisten) => {
-        if (disposed) unlisten();
-        else {
-          release = unlisten;
-          refresh();
-        }
-      })
-      .catch((error) => {
-        if (!disposed) setError(String(error));
-      });
-    window.addEventListener("focus", refresh);
-    return () => {
-      disposed = true;
-      release?.();
-      window.removeEventListener("focus", refresh);
-    };
-  }, [refresh]);
-
+  const client = useQueryClient();
+  const debounced = useDebouncedValue(search, 200);
+  const waiting = debounced !== search;
+  const connectionError = useHistoryConnection((s) => s.error);
+  const query = useInfiniteQuery({
+    queryKey: [...queryKeys.historyPages, debounced],
+    queryFn: ({ pageParam }) => historyApi.page(debounced, pageParam),
+    initialPageParam: null as number | null,
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
+    enabled: !waiting,
+  });
+  const pages = query.data?.pages;
   return {
-    data,
-    loading,
-    error,
-    refresh,
-    loadMore: () =>
-      data?.nextCursor && !loading ? load(data.nextCursor) : undefined,
+    pages: waiting ? null : (pages ?? null),
+    hasNextPage: !waiting && query.hasNextPage,
+    // Background refetches (focus, history events) keep the list usable.
+    loading: waiting || query.isLoading,
+    error: waiting
+      ? null
+      : query.error
+        ? toUserMessage(query.error)
+        : connectionError,
+    refresh: () => {
+      void client.invalidateQueries({ queryKey: queryKeys.historyPages });
+    },
+    loadMore: async () => {
+      if (!waiting && query.hasNextPage && !query.isFetchingNextPage)
+        return (await query.fetchNextPage()).isSuccess;
+      return false;
+    },
   };
 }

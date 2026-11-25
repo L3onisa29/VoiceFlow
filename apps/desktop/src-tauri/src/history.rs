@@ -39,14 +39,77 @@ pub struct ProcessingMetadata {
     pub groups: Vec<String>,
     pub dictionary_version: Option<String>,
     pub cleanup_version: String,
+    /// Recogniser confidence, dropped markers and language tags. Sessions recorded
+    /// before this field existed have none; it is never backfilled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognition: Option<voiceflow_core::recognition::Recognition>,
+    /// Applications per rule in this session, by processor key. An empty map means the
+    /// session was tracked and nothing fired; absent means it predates the counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_hits: Option<std::collections::BTreeMap<String, u32>>,
+    /// Latency and decoding counters of this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<Timing>,
+    /// The session ended on an error and was saved with the text decoded until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
 }
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Timing {
+    /// From the start request to the microphone being open.
+    pub key_to_microphone_ms: Option<u32>,
+    /// From the stop request to the end of delivery. `pasted` tells whether the text
+    /// went to the active field or only to the clipboard.
+    pub stop_to_paste_ms: Option<u32>,
+    pub pasted: bool,
+    pub inference_ms: u32,
+    pub chunks: u32,
+    /// Utterances closed by the two-second silence rule.
+    pub silence_closures: u32,
+    /// Whether the session started on a decoder primed in advance.
+    pub prepared_decoder: bool,
+    /// Application that was frontmost when the dictation ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_app: Option<String>,
+}
+/// Per-session measurements kept in `processing_json` for the app only.
+/// They are not evidence about the text, so the analyser never receives them.
+pub(crate) const LOCAL_PROCESSING_FIELDS: [&str; 4] =
+    ["recognition", "ruleHits", "timing", "interrupted"];
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CorrectionCategory {
     Recognition,
     Cleanup,
     Style,
+}
+
+impl CorrectionCategory {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Recognition => "recognition",
+            Self::Cleanup => "cleanup",
+            Self::Style => "style",
+        }
+    }
+}
+
+/// Where a correction was made: in the HUD while dictating, or reviewing it later.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RevisionOrigin {
+    Live,
+    Review,
+}
+impl RevisionOrigin {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Review => "review",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +121,10 @@ pub struct Revision {
     pub text: String,
     pub reverted: bool,
     pub category: Option<CorrectionCategory>,
+    /// Absent for whole-text edits made before sentence corrections existed.
+    pub origin: Option<RevisionOrigin>,
+    /// Sentence of the produced text this revision changes. Absent for whole-text edits.
+    pub segment: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +155,37 @@ pub struct UndoRequest {
     expected_version: i64,
 }
 
+/// One sentence changed. `text` is the whole text after this change and the earlier
+/// steps, so every revision keeps a complete before/after pair.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChangeStep {
+    pub segment: i64,
+    pub text: String,
+    /// What the correction teaches. Absent for content changes, which teach nothing.
+    pub category: Option<CorrectionCategory>,
+    /// The sentence goes back to the produced text: earlier lessons about it are dropped.
+    #[serde(default)]
+    pub restore: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChangesRequest {
+    pub id: i64,
+    pub expected_version: i64,
+    pub request_key: String,
+    pub origin: RevisionOrigin,
+    pub steps: Vec<ChangeStep>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgetRequest {
+    id: i64,
+    revision_id: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RememberRequest {
@@ -105,6 +203,27 @@ pub struct HistoryEntry {
     pub word_count: i64,
     pub duration_seconds: f64,
     pub language: String,
+    /// Words the recogniser was unsure of. Zero for sessions recorded without scores.
+    pub uncertain_words: i64,
+    /// `<unk>` markers in the original ASR that the produced text silently dropped.
+    pub unknown_removed: i64,
+}
+/// Both flags are derived when read, so sessions saved before they existed are covered
+/// by whatever their original ASR already shows.
+const ENTRY_COLUMNS: &str = "id, created_at, text, word_count, duration_seconds, language,
+    COALESCE(json_extract(processing_json,'$.recognition.lowWordsTotal'),0),
+    (length(IFNULL(original_asr_json,'')) - length(replace(IFNULL(original_asr_json,''),'<unk>',''))) / 5";
+fn entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    Ok(HistoryEntry {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        text: row.get(2)?,
+        word_count: row.get(3)?,
+        duration_seconds: row.get(4)?,
+        language: row.get(5)?,
+        uncertain_words: row.get(6)?,
+        unknown_removed: row.get(7)?,
+    })
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -123,6 +242,29 @@ pub struct HistoryPage {
     next_cursor: Option<i64>,
     stats: HistoryStats,
 }
+
+/// A row of the recent dictations picker.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentEntry {
+    pub id: i64,
+    pub created_at: i64,
+    pub text: String,
+    pub produced_text: String,
+    pub duration_seconds: f64,
+    /// Absent for sessions saved before delivery was measured.
+    pub pasted: Option<bool>,
+    pub interrupted: bool,
+    pub destination_app: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecentQuery {
+    search: String,
+}
+
+const RECENT_LIMIT: i64 = 50;
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -179,7 +321,7 @@ impl HistoryStore {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            (0..=2).contains(&version),
+            (0..=3).contains(&version),
             "Questo storico richiede una versione più recente di VoiceFlow."
         );
         if version == 0 {
@@ -228,6 +370,13 @@ impl HistoryStore {
                  PRAGMA user_version = 2;",
             )?;
         }
+        if version < 3 {
+            tx.execute_batch(
+                "ALTER TABLE history_revisions ADD COLUMN origin TEXT CHECK(origin IS NULL OR origin IN ('live', 'review'));
+                 ALTER TABLE history_revisions ADD COLUMN segment INTEGER CHECK(segment IS NULL OR segment >= 0);
+                 PRAGMA user_version = 3;",
+            )?;
+        }
         crate::suggestions::migrate(&tx)?;
         crate::analysis::migrate(&tx)?;
         tx.commit()?;
@@ -274,13 +423,11 @@ impl HistoryStore {
                     total_words: row.get(0)?, total_sessions: row.get(1)?, total_seconds: row.get(2)?, words_per_minute: row.get(3)?,
                 }),
             )?;
-            let mut entries = tx.prepare(
-                "SELECT id, created_at, text, word_count, duration_seconds, language FROM transcriptions
+            let mut entries = tx.prepare(&format!(
+                "SELECT {ENTRY_COLUMNS} FROM transcriptions
                  WHERE (?1 IS NULL OR id < ?1) AND instr(search_text, ?2) > 0
-                 ORDER BY id DESC LIMIT ?3",
-            )?.query_map(params![query.before_id, search, (PAGE_SIZE + 1) as i64], |row| Ok(HistoryEntry {
-                id: row.get(0)?, created_at: row.get(1)?, text: row.get(2)?, word_count: row.get(3)?, duration_seconds: row.get(4)?, language: row.get(5)?,
-            }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                 ORDER BY id DESC LIMIT ?3"),
+            )?.query_map(params![query.before_id, search, (PAGE_SIZE + 1) as i64], entry)?.collect::<rusqlite::Result<Vec<_>>>()?;
             let has_more = entries.len() > PAGE_SIZE;
             entries.truncate(PAGE_SIZE);
             let next_cursor = if has_more { entries.last().map(|entry| entry.id) } else { None };
@@ -377,13 +524,170 @@ impl HistoryStore {
                 "SELECT EXISTS(SELECT 1 FROM history_revisions WHERE id = ?1 AND transcription_id = ?2 AND reverted = 0)",
                 params![request.revision_id, request.id], |row| row.get(0))?;
             ensure!(active, "Correzione assente o annullata.");
-            let category = match request.category {
-                CorrectionCategory::Recognition => "recognition",
-                CorrectionCategory::Cleanup => "cleanup",
-                CorrectionCategory::Style => "style",
-            };
             tx.execute("INSERT INTO confirmed_corrections(revision_id, category, confirmed_at) VALUES (?1, ?2, ?3) ON CONFLICT(revision_id) DO UPDATE SET category = excluded.category",
-                params![request.revision_id, category, timestamp()?])?;
+                params![request.revision_id, request.category.key(), timestamp()?])?;
+            let result = read_detail(&tx, request.id)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    pub fn recent(&self, query: RecentQuery) -> Result<Vec<RecentEntry>> {
+        ensure!(
+            query.search.chars().count() <= 200,
+            "La ricerca può contenere al massimo 200 caratteri."
+        );
+        let search = query.search.trim().to_lowercase();
+        self.access(|connection| {
+            let entries = connection
+                .prepare(
+                    "SELECT id, created_at, text, produced_text, duration_seconds,
+                        json_extract(processing_json, '$.timing.pasted'),
+                        COALESCE(json_extract(processing_json, '$.interrupted'), 0),
+                        json_extract(processing_json, '$.timing.destinationApp')
+                     FROM transcriptions WHERE instr(search_text, ?1) > 0
+                     ORDER BY id DESC LIMIT ?2",
+                )?
+                .query_map(params![search, RECENT_LIMIT], |row| {
+                    Ok(RecentEntry {
+                        id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        text: row.get(2)?,
+                        produced_text: row.get(3)?,
+                        duration_seconds: row.get(4)?,
+                        pasted: row.get(5)?,
+                        interrupted: row.get(6)?,
+                        destination_app: row.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(entries)
+        })
+    }
+
+    /// Save sentence corrections as a chain of revisions, one per sentence, in one
+    /// transaction. Each revision carries its own category, so a recognition fix and a
+    /// content change made together never teach the same lesson.
+    pub fn save_changes(&self, request: ChangesRequest) -> Result<HistoryDetail> {
+        valid_id(request.id)?;
+        ensure!(request.expected_version >= 0, "Versione non valida.");
+        ensure!(
+            !request.request_key.is_empty() && request.request_key.len() <= 80,
+            "Chiave di salvataggio non valida."
+        );
+        ensure!(
+            (1..=500).contains(&request.steps.len()),
+            "Nessuna correzione da salvare."
+        );
+        for step in &request.steps {
+            ensure!((0..=100_000).contains(&step.segment), "Frase non valida.");
+            ensure!(
+                !step.text.trim().is_empty() && step.text.len() <= 1_000_000,
+                "Inserisci un testo tra 1 e 1.000.000 byte."
+            );
+            ensure!(
+                !(step.restore && step.category.is_some()),
+                "Una frase ripristinata non può insegnare una correzione."
+            );
+        }
+        self.access(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let key = |index: usize| format!("{}:{index}", request.request_key);
+            let applied: Option<String> = tx
+                .query_row(
+                    "SELECT text FROM history_revisions WHERE transcription_id = ?1 AND request_key = ?2",
+                    params![request.id, key(request.steps.len() - 1)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(applied) = applied {
+                // A retried save: the whole chain was committed by the first attempt.
+                ensure!(
+                    applied == request.steps[request.steps.len() - 1].text,
+                    "Chiave di salvataggio già usata per un altro testo."
+                );
+            } else {
+                let detail = read_detail(&tx, request.id)?;
+                ensure!(
+                    detail.edit_version == request.expected_version,
+                    "Il testo è cambiato. Chiudi e riapri la trascrizione."
+                );
+                let mut current = detail.entry.text;
+                let mut parent = detail.current_revision;
+                let now = timestamp()?;
+                for (index, step) in request.steps.iter().enumerate() {
+                    ensure!(step.text != current, "Il testo non è cambiato.");
+                    tx.execute(
+                        "INSERT INTO history_revisions(transcription_id, request_key, created_at, parent_id, before_text, text, origin, segment)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![request.id, key(index), now, parent, current, step.text, request.origin.key(), step.segment],
+                    )?;
+                    let revision = tx.last_insert_rowid();
+                    if step.restore {
+                        tx.execute(
+                            "DELETE FROM confirmed_corrections WHERE revision_id IN (
+                                SELECT id FROM history_revisions WHERE transcription_id = ?1 AND segment = ?2 AND id <> ?3)",
+                            params![request.id, step.segment, revision],
+                        )?;
+                    }
+                    if let Some(category) = step.category {
+                        tx.execute(
+                            "INSERT INTO confirmed_corrections(revision_id, category, confirmed_at) VALUES (?1, ?2, ?3)",
+                            params![revision, category.key(), now],
+                        )?;
+                    }
+                    current = step.text.clone();
+                    parent = Some(revision);
+                }
+                tx.execute(
+                    "UPDATE transcriptions SET text = ?1, search_text = ?2, current_revision = ?3, edit_version = edit_version + 1 WHERE id = ?4",
+                    params![current, current.to_lowercase(), parent, request.id],
+                )?;
+            }
+            let result = read_detail(&tx, request.id)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    /// Corrections made in the HUD while dictating, saved on the session just recorded.
+    /// Categories come from the HUD and are remembered at once: the user saw and chose
+    /// each sentence before it was delivered.
+    pub fn record_live_changes(&self, session_key: &str, steps: Vec<ChangeStep>) -> Result<()> {
+        let id: i64 = self
+            .access(|connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT id FROM transcriptions WHERE session_key = ?1",
+                        [session_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            })?
+            .context("Trascrizione non presente nello storico.")?;
+        let mut request_key = format!("live-{session_key}");
+        request_key.truncate(80);
+        self.save_changes(ChangesRequest {
+            id,
+            expected_version: 0,
+            request_key,
+            origin: RevisionOrigin::Live,
+            steps,
+        })?;
+        Ok(())
+    }
+
+    /// The correction stays in the text but no longer teaches anything.
+    pub fn forget(&self, request: ForgetRequest) -> Result<HistoryDetail> {
+        valid_id(request.id)?;
+        valid_id(request.revision_id)?;
+        self.access(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM confirmed_corrections WHERE revision_id = ?1 AND revision_id IN (
+                    SELECT id FROM history_revisions WHERE transcription_id = ?2)",
+                params![request.revision_id, request.id],
+            )?;
             let result = read_detail(&tx, request.id)?;
             tx.commit()?;
             Ok(result)
@@ -407,13 +711,11 @@ fn timestamp() -> Result<i64> {
 
 fn read_detail(connection: &Connection, id: i64) -> Result<HistoryDetail> {
     let (entry, raw, produced_text, processing, edit_version, current_revision) = connection.query_row(
-        "SELECT id, created_at, text, word_count, duration_seconds, language, original_asr_json, produced_text, processing_json, edit_version, current_revision FROM transcriptions WHERE id = ?1",
-        [id], |row| Ok((HistoryEntry {
-            id: row.get(0)?, created_at: row.get(1)?, text: row.get(2)?, word_count: row.get(3)?, duration_seconds: row.get(4)?, language: row.get(5)?,
-        }, row.get::<_, Option<String>>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, i64>(9)?, row.get::<_, Option<i64>>(10)?)),
+        &format!("SELECT {ENTRY_COLUMNS}, original_asr_json, produced_text, processing_json, edit_version, current_revision FROM transcriptions WHERE id = ?1"),
+        [id], |row| Ok((entry(row)?, row.get::<_, Option<String>>(8)?, row.get::<_, String>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, i64>(11)?, row.get::<_, Option<i64>>(12)?)),
     ).optional()?.context("Trascrizione non più presente nello storico.")?;
     let revisions = connection.prepare(
-        "SELECT r.id, r.created_at, r.before_text, r.text, r.reverted, c.category FROM history_revisions r LEFT JOIN confirmed_corrections c ON c.revision_id = r.id WHERE r.transcription_id = ?1 ORDER BY r.id DESC",
+        "SELECT r.id, r.created_at, r.before_text, r.text, r.reverted, c.category, r.origin, r.segment FROM history_revisions r LEFT JOIN confirmed_corrections c ON c.revision_id = r.id WHERE r.transcription_id = ?1 ORDER BY r.id DESC",
     )?.query_map([id], |row| {
         let category: Option<String> = row.get(5)?;
         let category = category.map(|category| match category.as_str() {
@@ -422,7 +724,13 @@ fn read_detail(connection: &Connection, id: i64) -> Result<HistoryDetail> {
             "style" => Ok(CorrectionCategory::Style),
             _ => Err(rusqlite::Error::InvalidQuery),
         }).transpose()?;
-        Ok(Revision { id: row.get(0)?, created_at: row.get(1)?, before_text: row.get(2)?, text: row.get(3)?, reverted: row.get(4)?, category })
+        let origin: Option<String> = row.get(6)?;
+        let origin = origin.map(|origin| match origin.as_str() {
+            "live" => Ok(RevisionOrigin::Live),
+            "review" => Ok(RevisionOrigin::Review),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }).transpose()?;
+        Ok(Revision { id: row.get(0)?, created_at: row.get(1)?, before_text: row.get(2)?, text: row.get(3)?, reverted: row.get(4)?, category, origin, segment: row.get(7)? })
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(HistoryDetail {
         entry,
@@ -486,6 +794,30 @@ pub async fn history_undo(
     request: UndoRequest,
 ) -> Result<HistoryDetail, String> {
     run(store.inner().clone(), move |store| store.undo(request)).await
+}
+#[tauri::command]
+pub async fn history_recent(
+    store: tauri::State<'_, HistoryStore>,
+    query: RecentQuery,
+) -> Result<Vec<RecentEntry>, String> {
+    run(store.inner().clone(), move |store| store.recent(query)).await
+}
+#[tauri::command]
+pub async fn history_save_changes(
+    store: tauri::State<'_, HistoryStore>,
+    request: ChangesRequest,
+) -> Result<HistoryDetail, String> {
+    run(store.inner().clone(), move |store| {
+        store.save_changes(request)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn history_forget(
+    store: tauri::State<'_, HistoryStore>,
+    request: ForgetRequest,
+) -> Result<HistoryDetail, String> {
+    run(store.inner().clone(), move |store| store.forget(request)).await
 }
 #[tauri::command]
 pub async fn history_remember(
@@ -944,6 +1276,386 @@ mod tests {
                 .stats
                 .total_sessions,
             0
+        );
+    }
+
+    #[test]
+    fn uncertain_words_and_removed_markers_are_flagged_for_old_and_new_sessions() {
+        use voiceflow_core::recognition::{Recognition, WordPosition};
+        let f = Fixture::new();
+        // Saved before recognition data existed: only the original ASR can speak.
+        let legacy_raw = vec!["<unk> voce <unk>".into(), "chiara".into()];
+        let legacy_metadata =
+            crate::service::processing_metadata(&crate::settings::Settings::default()).unwrap();
+        let old_json = serde_json::to_string(&legacy_metadata).unwrap();
+        for field in LOCAL_PROCESSING_FIELDS {
+            assert!(!old_json.contains(field), "{field}");
+        }
+        f.store
+            .record(&CompletedDictation {
+                session_key: "legacy",
+                created_at: 1,
+                text: "voce chiara",
+                duration_seconds: 2.0,
+                language: "auto",
+                original_asr: Some(&legacy_raw),
+                processing: Some(&legacy_metadata),
+            })
+            .unwrap();
+        let mut metadata = legacy_metadata.clone();
+        metadata.recognition = Some(Recognition {
+            mean_confidence: Some(0.91),
+            scored_tokens: 12,
+            threshold: 0.5,
+            low_words: vec![WordPosition {
+                utterance: 0,
+                word: 1,
+            }],
+            low_words_total: 3,
+            unknown_removed: 0,
+            language_tags: [("<it-IT>".to_owned(), 2)].into(),
+        });
+        metadata.rule_hits = Some([("dictionary:-4".to_owned(), 2)].into());
+        metadata.timing = Some(Timing {
+            key_to_microphone_ms: Some(84),
+            stop_to_paste_ms: Some(612),
+            pasted: true,
+            inference_ms: 3_100,
+            chunks: 27,
+            silence_closures: 1,
+            prepared_decoder: true,
+            destination_app: Some("Mail".into()),
+        });
+        f.store
+            .record(&CompletedDictation {
+                session_key: "scored",
+                created_at: 2,
+                text: "una parola incerta",
+                duration_seconds: 2.0,
+                language: "auto",
+                original_asr: Some(&["una parola incerta".into()]),
+                processing: Some(&metadata),
+            })
+            .unwrap();
+        f.record("plain", "senza originale", 1.0);
+        let page = f.store.page(HistoryQuery::default()).unwrap();
+        let flags: Vec<_> = page
+            .entries
+            .iter()
+            .map(|e| (e.uncertain_words, e.unknown_removed))
+            .collect();
+        assert_eq!(flags, [(0, 0), (3, 0), (0, 2)]);
+        let reopened = HistoryStore::new(f.root.join("history.sqlite3"));
+        let scored = reopened.detail(2).unwrap();
+        assert_eq!(scored.processing, Some(metadata));
+        assert_eq!(scored.entry.uncertain_words, 3);
+        let legacy = reopened.detail(1).unwrap();
+        assert_eq!(legacy.processing, Some(legacy_metadata));
+        assert_eq!(legacy.entry.unknown_removed, 2);
+    }
+
+    fn step(segment: i64, text: &str, category: Option<CorrectionCategory>) -> ChangeStep {
+        ChangeStep {
+            segment,
+            text: text.into(),
+            category,
+            restore: false,
+        }
+    }
+
+    fn changes(
+        version: i64,
+        key: &str,
+        origin: RevisionOrigin,
+        steps: Vec<ChangeStep>,
+    ) -> ChangesRequest {
+        ChangesRequest {
+            id: 1,
+            expected_version: version,
+            request_key: key.into(),
+            origin,
+            steps,
+        }
+    }
+
+    #[test]
+    fn sentence_changes_become_one_revision_each_with_its_own_lesson() {
+        let f = Fixture::new();
+        f.record("s", "Ciao voice flow. Va tutto gira gira bene.", 4.0);
+        let detail = f
+            .store
+            .save_changes(changes(
+                0,
+                "live-1",
+                RevisionOrigin::Live,
+                vec![
+                    step(
+                        0,
+                        "Ciao VoiceFlow. Va tutto gira gira bene.",
+                        Some(CorrectionCategory::Recognition),
+                    ),
+                    step(
+                        1,
+                        "Ciao VoiceFlow. Va tutto gira bene.",
+                        Some(CorrectionCategory::Cleanup),
+                    ),
+                    step(1, "Ciao VoiceFlow. Va tutto gira bene davvero.", None),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            detail.entry.text,
+            "Ciao VoiceFlow. Va tutto gira bene davvero."
+        );
+        assert_eq!(
+            detail.produced_text,
+            "Ciao voice flow. Va tutto gira gira bene."
+        );
+        assert_eq!(detail.edit_version, 1);
+        assert_eq!(detail.revisions.len(), 3);
+        // Newest first: content, cleanup, recognition. Each one chains on the previous.
+        let [content, cleanup, recognition] = &detail.revisions[..] else {
+            panic!()
+        };
+        assert_eq!(content.category, None);
+        assert_eq!(cleanup.category, Some(CorrectionCategory::Cleanup));
+        assert_eq!(recognition.category, Some(CorrectionCategory::Recognition));
+        assert_eq!(recognition.before_text, detail.produced_text);
+        assert_eq!(cleanup.before_text, recognition.text);
+        assert_eq!(content.before_text, cleanup.text);
+        assert!(
+            detail
+                .revisions
+                .iter()
+                .all(|r| r.origin == Some(RevisionOrigin::Live))
+        );
+        assert_eq!(recognition.segment, Some(0));
+        assert_eq!(detail.current_revision, Some(content.id));
+        // A retried save returns the same state instead of adding a second chain.
+        let steps = || {
+            vec![
+                step(
+                    0,
+                    "Ciao VoiceFlow. Va tutto gira gira bene.",
+                    Some(CorrectionCategory::Recognition),
+                ),
+                step(
+                    1,
+                    "Ciao VoiceFlow. Va tutto gira bene.",
+                    Some(CorrectionCategory::Cleanup),
+                ),
+                step(1, "Ciao VoiceFlow. Va tutto gira bene davvero.", None),
+            ]
+        };
+        let retried = f
+            .store
+            .save_changes(changes(0, "live-1", RevisionOrigin::Live, steps()))
+            .unwrap();
+        assert_eq!(retried.revisions.len(), 3);
+        // The same key cannot carry a different chain.
+        let mut different = steps();
+        different[2].text = "Altro".into();
+        assert!(
+            f.store
+                .save_changes(changes(0, "live-1", RevisionOrigin::Live, different))
+                .is_err()
+        );
+        // Stale version and unchanged text are rejected without writing.
+        assert!(
+            f.store
+                .save_changes(changes(
+                    0,
+                    "other",
+                    RevisionOrigin::Review,
+                    vec![step(0, "x", None)]
+                ))
+                .is_err()
+        );
+        assert!(
+            f.store
+                .save_changes(changes(
+                    1,
+                    "same",
+                    RevisionOrigin::Review,
+                    vec![step(0, &detail.entry.text, None)]
+                ))
+                .is_err()
+        );
+        assert_eq!(f.store.detail(1).unwrap().revisions.len(), 3);
+        // Undo walks the chain one sentence at a time.
+        let undone = f
+            .store
+            .undo(UndoRequest {
+                id: 1,
+                expected_version: 1,
+            })
+            .unwrap();
+        assert_eq!(undone.entry.text, "Ciao VoiceFlow. Va tutto gira bene.");
+    }
+
+    #[test]
+    fn restoring_a_sentence_forgets_only_its_lessons_and_forget_keeps_the_text() {
+        let f = Fixture::new();
+        f.record("s", "Uno tauri. Due flo.", 2.0);
+        let saved = f
+            .store
+            .save_changes(changes(
+                0,
+                "a",
+                RevisionOrigin::Live,
+                vec![
+                    step(0, "Uno Tauri. Due flo.", Some(CorrectionCategory::Style)),
+                    step(
+                        1,
+                        "Uno Tauri. Due Flow.",
+                        Some(CorrectionCategory::Recognition),
+                    ),
+                ],
+            ))
+            .unwrap();
+        let restored = f
+            .store
+            .save_changes(changes(
+                1,
+                "b",
+                RevisionOrigin::Review,
+                vec![ChangeStep {
+                    segment: 0,
+                    text: "Uno tauri. Due Flow.".into(),
+                    category: None,
+                    restore: true,
+                }],
+            ))
+            .unwrap();
+        assert_eq!(restored.entry.text, "Uno tauri. Due Flow.");
+        let category = |detail: &HistoryDetail, segment| {
+            detail
+                .revisions
+                .iter()
+                .filter(|r| r.segment == Some(segment))
+                .map(|r| r.category)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(category(&restored, 0), vec![None, None]);
+        assert_eq!(
+            category(&restored, 1),
+            vec![Some(CorrectionCategory::Recognition)]
+        );
+        assert_eq!(restored.revisions[0].origin, Some(RevisionOrigin::Review));
+        let recognition = saved.revisions[0].id;
+        let forgotten = f
+            .store
+            .forget(ForgetRequest {
+                id: 1,
+                revision_id: recognition,
+            })
+            .unwrap();
+        assert_eq!(forgotten.entry.text, "Uno tauri. Due Flow.");
+        assert!(forgotten.revisions.iter().all(|r| r.category.is_none()));
+        // A restored sentence cannot also claim a lesson.
+        assert!(
+            f.store
+                .save_changes(changes(
+                    2,
+                    "c",
+                    RevisionOrigin::Review,
+                    vec![ChangeStep {
+                        segment: 0,
+                        text: "Uno tauri. Due flo.".into(),
+                        category: Some(CorrectionCategory::Style),
+                        restore: true,
+                    }]
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recent_lists_delivery_destination_and_interruptions_newest_first() {
+        let f = Fixture::new();
+        f.record("plain", "Senza metadati", 1.0);
+        let mut metadata =
+            crate::service::processing_metadata(&crate::settings::Settings::default()).unwrap();
+        metadata.timing = Some(Timing {
+            pasted: true,
+            destination_app: Some("Mail".into()),
+            ..Timing::default()
+        });
+        f.store
+            .record(&CompletedDictation {
+                session_key: "pasted",
+                created_at: 2,
+                text: "Ciao Marco",
+                duration_seconds: 3.0,
+                language: "it",
+                original_asr: None,
+                processing: Some(&metadata),
+            })
+            .unwrap();
+        metadata.timing = None;
+        metadata.interrupted = Some(true);
+        f.store
+            .record(&CompletedDictation {
+                session_key: "broken",
+                created_at: 3,
+                text: "Ok per la call",
+                duration_seconds: 1.0,
+                language: "it",
+                original_asr: None,
+                processing: Some(&metadata),
+            })
+            .unwrap();
+        let recent = f.store.recent(RecentQuery::default()).unwrap();
+        assert_eq!(
+            recent.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        assert!(recent[0].interrupted && recent[0].pasted.is_none());
+        assert_eq!(
+            (recent[1].pasted, recent[1].destination_app.as_deref()),
+            (Some(true), Some("Mail"))
+        );
+        assert!(!recent[2].interrupted && recent[2].pasted.is_none());
+        assert_eq!(recent[1].produced_text, "Ciao Marco");
+        let found = f
+            .store
+            .recent(RecentQuery {
+                search: "MARCO".into(),
+            })
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(
+            f.store
+                .recent(RecentQuery {
+                    search: "x".repeat(201)
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_history_gains_sentence_columns_and_keeps_old_revisions() {
+        let f = Fixture::new();
+        f.record("s", "prima", 1.0);
+        f.store.edit(edit(1, 0, "old", "dopo")).unwrap();
+        // Back to the v2 shape: revisions without origin or sentence.
+        let connection = Connection::open(f.root.join("history.sqlite3")).unwrap();
+        connection
+            .execute_batch("ALTER TABLE history_revisions DROP COLUMN origin; ALTER TABLE history_revisions DROP COLUMN segment; PRAGMA user_version = 2;")
+            .unwrap();
+        drop(connection);
+        let detail = f.store.detail(1).unwrap();
+        assert_eq!(detail.revisions.len(), 1);
+        assert_eq!(
+            (detail.revisions[0].origin, detail.revisions[0].segment),
+            (None, None)
+        );
+        assert_eq!(
+            Connection::open(f.root.join("history.sqlite3"))
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
         );
     }
 }

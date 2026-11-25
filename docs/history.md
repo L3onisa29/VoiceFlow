@@ -2,6 +2,12 @@
 
 La pagina Dettatura mostra lo storico sotto la trascrizione e i controlli di registrazione. L'interfaccia usa i componenti shadcn/ui già adottati dal progetto.
 
+Il dettaglio mette in primo piano il testo corrente e mantiene raggiungibili
+copia e salvataggio. Il confronto mostra risultato elaborato e originale;
+revisioni, conferma categorizzata, privacy e metadati sono sezioni secondarie.
+Chiudere o cambiare pagina con una bozza richiede di scegliere se continuare a
+modificare o scartarla. Un errore di salvataggio conserva testo e focus.
+
 ## Archivio
 
 Il backend usa `rusqlite` con SQLite incluso nell'app. Il file è `~/Library/Application Support/VoiceFlow/history.sqlite3`, con permessi `0600`. Il dizionario continua a usare il suo database, senza migrazioni dei dati esistenti. Non servono account, servizi esterni o connessioni di rete.
