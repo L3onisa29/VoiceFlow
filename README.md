@@ -39,7 +39,7 @@ across updates built with the same identity.
 
 Paste sends Command+V and never submits the destination form. If delivery fails,
 the transcript remains available to copy. T3 Code uses the standard paste path.
-Audio and transcripts stay on the Mac; no API key or remote model is required.
+Dictation audio and transcripts are processed on the Mac; dictation requires no API key or remote model. Optional analysis sends selected texts to OpenAI only after explicit saved consent. See [settings](docs/settings.md) and [analysis](docs/analysis.md).
 
 ## Project structure
 
@@ -59,18 +59,41 @@ Python implementation remains recoverable from Git history before the cleanup.
 
 ```bash
 pnpm desktop:check
-pnpm desktop:ui
+pnpm exec playwright install chromium
+pnpm test:ui
 pnpm test:signing
+pnpm test:desktop-runtime
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-pnpm desktop:build
+pnpm test:native-helper
 ```
 
-CI runs the TypeScript check, UI build, signing-policy tests, Rust formatting,
-Clippy, Rust tests and a release compilation on macOS. CI does not distribute an
+CI runs the TypeScript check, seven UI suites, signing and runtime unit tests,
+Rust formatting, Clippy, Rust tests, release compilation and native helper smoke
+on macOS. CI does not distribute an
 unsigned app or require the local signing certificate. Packaged builds use
 `pnpm desktop:build` on the signing machine.
+
+`pnpm test:ui` builds once and runs all seven suites sequentially against the
+compiled UI. Playwright intercepts local fixture URLs and Tauri IPC; it opens no
+HTTP listener and makes no provider or audio calls. The pinned Playwright package
+uses Chromium installed by `pnpm exec playwright install chromium`; CI uses
+`--with-deps`. `PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs` remains
+an optional override. Screenshots and JSON reports are written to `artifacts/`,
+with the aggregate result at `artifacts/ui/result.json`.
+
+`pnpm test:native-helper` builds the production release helper and tests manual
+consent blocking, manual no-work and automatic disabled on temporary SQLite
+databases. A first-PATH sentinel CLI prevents real provider calls. It asserts
+zero analysis attempts and unchanged scheduling, then removes the temporary data.
+To exercise a packaged helper already built, run
+`node scripts/verify-native-helper.ts /path/to/voiceflow-analysis`.
+
+After opening a signed app, `pnpm desktop:verify-runtime` checks the running
+project bundle. An optional executable path checks an installed copy, for example
+`pnpm desktop:verify-runtime /Applications/VoiceFlow.app/Contents/MacOS/voiceflow-desktop`.
+This command inspects running processes; it does not launch the app.
 
 For real-model streaming verification, install `ffmpeg` and the macOS Alice and
 Samantha voices, then run:

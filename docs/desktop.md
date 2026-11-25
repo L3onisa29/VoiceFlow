@@ -40,7 +40,14 @@ Two seconds of low audio energy commits the phrase and resets the decoder
 without ending dictation. This initial endpoint detector uses an RMS threshold,
 not a trained VAD. Soft speech and noise need real-microphone evaluation.
 
-The model loads once per process. ONNX Runtime runs on CPU with four intra-op
+The model loads once per process. Startup also runs silent inference before
+reporting the model ready. Each new decoder primes its encoder context before
+the microphone opens. During preparation the native indicator keeps animating
+and the main window explains that recording has not started. Recording controls
+are reserved immediately when submitted; repeated shortcuts during loading or
+finalization are ignored rather than queued for later playback.
+
+ONNX Runtime runs on CPU with four intra-op
 threads. No NVIDIA GPU, CUDA, Python process or API key is needed.
 
 ### Interaction and storage
@@ -73,6 +80,12 @@ threads. No NVIDIA GPU, CUDA, Python process or API key is needed.
 - The app captures the focused element at **stop**, then checks its PID and AX
   identity again after finalization. Web editors exposed as AXWebArea or AXGroup
   are accepted. Secure text fields and VoiceFlow itself are excluded.
+- Focus is read from the frontmost application's Accessibility object, with the
+  system-wide object as a fallback. Electron's documented `AXManualAccessibility`
+  attribute exposes its native editor tree before capture begins. Missing AX
+  responses are retried for up to 600 ms at stop and before delivery, with bounded
+  messaging timeouts. A changed app or a different resolved element still prevents
+  paste. The microphone closes before waiting for the destination.
 - Paste waits for physical modifier keys to be released, then posts Command+V to
   the macOS HID event stream. It never sends Return. If focus changes during
   finalization, it reports an error and preserves the complete text for recovery.
@@ -93,9 +106,13 @@ The optional command formatter recognizes `a capo`, `nuovo paragrafo`,
 when quoting those phrases literally. Semantic formatting will be a separate
 text processor; this build sends no audio or transcript to remote APIs.
 
-Only language and format preferences are saved, atomically, to
-`~/Library/Application Support/VoiceFlow/desktop-settings.json`. No audio or
-transcript history is written by the app. Explicit benchmarks write synthetic
+Language, format and local cleanup preferences are saved in SQLite at
+`~/Library/Application Support/VoiceFlow/desktop-settings.sqlite3`. On first
+initialization, the app imports the legacy `desktop-settings.json` in a transaction
+and retains the original file; subsequent launches use SQLite only. Failed imports
+can be retried, while unreadable databases and newer schemas are not replaced.
+Completed transcript history is stored locally in `history.sqlite3`; audio is not
+persisted. Explicit benchmarks write synthetic
 transcripts under ignored `artifacts/streaming/`.
 
 The bundle identifier is `com.voiceflow.desktop`. Microphone usage description
