@@ -11,6 +11,12 @@ use std::{
 
 pub struct Permit(File);
 impl Permit {
+    pub fn adopt(fd: RawFd, path: &Path) -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        Self::validate_inherited(fd, path)?;
+        // Validated CLI descriptor is uniquely adopted by the launcher.
+        Ok(Self(unsafe { File::from_raw_fd(fd) }))
+    }
     pub fn validate_inherited(fd: RawFd, path: &Path) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         anyhow::ensure!(fd >= 3, "Permesso del worker mancante.");

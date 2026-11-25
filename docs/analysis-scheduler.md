@@ -1,6 +1,6 @@
 # Pianificazione locale dell'analisi
 
-In Impostazioni, salva prima il consenso in **Analisi con OpenAI**. In **Pianificazione locale**, seleziona l'attivazione del LaunchAgent e salva. I due consensi sono separati e inizialmente disattivati. L'approvazione delle proposte linguistiche resta manuale nella pagina Suggerimenti, salvo attivazione esplicita del criterio facoltativo per i nuovi rilievi con confidenza superiore a 90 e controlli locali superati. Aprire l'app o leggere lo stato non abilita il job.
+In Impostazioni, salva prima il consenso in **Analisi**. In **Automazione**, seleziona **Analisi programmata** e premi **Salva pianificazione**. I due consensi sono separati e inizialmente disattivati. L'approvazione delle proposte linguistiche resta manuale nella pagina Suggerimenti, salvo attivazione esplicita del criterio facoltativo per i nuovi rilievi con confidenza superiore a 90 e controlli locali superati. Aprire l'app o leggere lo stato non abilita il job.
 
 La fascia iniziale è 02:30–06:00 nell'ora locale del Mac; 03:00–05:00 è una configurazione valida. La durata ammessa è da 1 minuto a 12 ore. Una fine precedente all'inizio indica il giorno seguente, per esempio 23:00–01:00. Inizio e fine uguali sono rifiutati. Il worker controlla nuovamente fascia e consenso prima della preparazione, prima della richiesta e durante il lavoro.
 
@@ -8,11 +8,16 @@ Il LaunchAgent `com.voiceflow.desktop.analysis` lavora nella sessione GUI dell'u
 
 ## Stato e riparazione
 
-L'app distingue preferenza richiesta, presenza del plist, rilevamento del job tramite `launchctl print`, configurazione del plist e proprietà del worker tramite lock del kernel. “Job caricato” significa registrato in launchd, non prova che un'analisi sia riuscita. I risultati, gli errori del provider e i contatori sono nella pagina Analisi, insieme agli ultimi avvii del job. La pagina rilegge automaticamente i dati durante il lavoro e quando torna in primo piano; il pannello delle Impostazioni mantiene il pulsante Aggiorna stato.
+L'app distingue preferenza richiesta, presenza del plist, rilevamento del job tramite `launchctl print`, configurazione del plist e proprietà del worker tramite lock del kernel. "Pronta" significa che la programmazione è rilevata e corrisponde alla preferenza salvata; non prova che un'analisi sia riuscita. Diagnostica e contatori dei retry sono in Avanzate. I risultati, gli errori del provider e i contatori sono nella pagina Analisi, insieme agli ultimi avvii del job. La pagina rilegge automaticamente i dati durante il lavoro e quando torna in primo piano; il pannello delle Impostazioni mantiene il pulsante Aggiorna stato.
 
 **Salva pianificazione** installa o aggiorna. **Ripara pianificazione** riconcilia una configurazione salvata dopo un errore di installazione o dopo lo spostamento del bundle. Entrambe le azioni sono idempotenti. **Disattiva pianificazione** salva OFF prima di chiamare `launchctl disable` e `bootout`. Se launchctl fallisce, OFF resta salvato e i processi rispettano la revoca. Ripetere la disattivazione completa la rimozione. Disattivare il consenso OpenAI interrompe comunque il worker, anche se il LaunchAgent resta registrato.
 
 La riconciliazione e l'ispezione di launchctl avvengono fuori dal thread UI. Ogni comando ha un limite di due secondi; il lock di configurazione può attendere al massimo due secondi. Un errore conserva lo stato desiderato e viene mostrato insieme allo stato rilevato. Il percorso di dettatura non apre il database dello scheduler e non chiama launchctl.
+
+La pagina Analisi offre anche **Esegui ora**. Usa lo stesso helper per un solo
+lotto, anche fuori fascia o con programmazione disattivata, mantenendo gli altri
+vincoli. Non salva una nuova fascia e non modifica il LaunchAgent. Provare un
+avvio manuale non prova che launchd scatti all'ora prevista.
 
 ## Fascia, risveglio e limiti
 

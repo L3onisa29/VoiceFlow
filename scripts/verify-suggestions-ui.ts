@@ -1,14 +1,14 @@
 // Production UI verification with Tauri IPC fixtures. No HTTP listener or audio.
-// Pass an installed Playwright module through PLAYWRIGHT_MODULE.
+// Uses pinned Playwright; PLAYWRIGHT_MODULE optionally selects another installation.
 import assert from "node:assert/strict";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const modulePath = process.env.PLAYWRIGHT_MODULE;
-if (!modulePath)
-  throw new Error("Set PLAYWRIGHT_MODULE to an installed Playwright index.mjs");
-const { chromium } = await import(pathToFileURL(modulePath).href);
+const { chromium } = await import(
+  modulePath ? pathToFileURL(modulePath).href : "playwright"
+);
 const root = resolve(import.meta.dirname, "..");
 const output = resolve(root, "artifacts/suggestions-disfluencies");
 await mkdir(output, { recursive: true });
@@ -54,6 +54,7 @@ mockIPC(async(cmd,args)=>{
  if(cmd==='history_page')return {entries:[],nextCursor:null,stats:{totalWords:0,totalSessions:0,totalSeconds:0,wordsPerMinute:0}};
  if(cmd==='dictionary_snapshot')return {terms:[],groups:[{id:1,name:'Progetto'}],selectedGroupIds:[1],version:3,conflicts:[]};
  if(cmd==='suggestions_snapshot')return structuredClone(window.review);
+ if(cmd==='suggestions_replay')return {sessions:40,version:window.review.version,rules:[{proposalId:1,active:window.review.proposals[0].state==='approved',changedSessions:3,excerpts:[{sessionId:7,before:'uso voice flow oggi',after:'uso VoiceFlow oggi'}],error:null,atPublication:null,usage:window.review.proposals[0].state==='approved'?{activations:0,sessionsWithActivation:0,trackedSessions:12}:null},{proposalId:2,active:false,changedSessions:0,excerpts:[],error:null,atPublication:null,usage:null}]};
  if(cmd==='suggestions_review'){
   if(window.failSave)throw new Error('Scrittura non riuscita. Riprova.');
   const request=args.request;const p=window.review.proposals.find(p=>p.id===request.id);const action=request.action;
@@ -82,57 +83,147 @@ const pass = (name: string) => {
   console.log("PASS", name);
 };
 const filter = async (label: string) => {
-  await page.getByLabel("Mostra", { exact: true }).click();
+  await page.getByRole("combobox", { name: "Mostra", exact: true }).click();
   await page.getByRole("option", { name: label, exact: true }).click();
 };
+const row = (id: number) => page.locator(`[data-proposal-id="${id}"]`);
+const detail = page.locator("[data-proposal-detail]");
+const dialog = page.getByRole("dialog");
+const toasts = page.getByRole("region", { name: /Notifiche/ });
+const reviewCalls = () =>
+  page.evaluate(
+    "window.calls.filter(c=>c.cmd==='suggestions_review').length",
+  ) as Promise<number>;
+const openSection = (name: RegExp | string) =>
+  detail.getByRole("button", { name, exact: typeof name === "string" }).click();
 try {
-  await page.goto("https://voiceflow.test/#/suggestions");
+  await page.goto("https://voiceflow.test/#/review");
   await page
-    .getByRole("heading", { name: "Suggerimenti", exact: true })
-    .waitFor();
-  const card = page.locator('[data-proposal-id="1"]');
-  const cleanup = page.locator('[data-proposal-id="2"]');
-  await card.getByText("VoiceFlow", { exact: true }).first().waitFor();
-  await card.locator("summary").first().click();
-  await card
-    .getByText("Sessione #7 · Revisione #11", { exact: true })
-    .waitFor();
-  await card
-    .getByText("Correzione umana confermata", { exact: true })
-    .waitFor();
-  await cleanup.locator("summary").first().click();
-  await cleanup
-    .getByText("Fonte osservata, ipotesi da valutare", { exact: true })
+    .getByRole("heading", { level: 1, name: "Revisione", exact: true })
     .waitFor();
   assert.equal(
     await page
-      .locator('[data-proposal-id="3"]')
+      .getByRole("tab", { name: "Proposte", exact: true })
+      .getAttribute("aria-selected"),
+    "true",
+  );
+  const queue = page.getByRole("region", { name: "Coda delle proposte" });
+  await queue.getByText("3 proposte", { exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole("button", { name: "Aggiorna", exact: true }).count(),
+    0,
+  );
+  // Master–detail: the first proposal of the queue is open without a link.
+  await row(1).getByText("voice flow → VoiceFlow", { exact: true }).waitFor();
+  await row(1).getByText("Terminologia", { exact: true }).waitFor();
+  await detail
+    .getByRole("heading", { level: 2, name: "VoiceFlow", exact: true })
+    .waitFor();
+  assert.equal(await detail.getAttribute("data-proposal-detail"), "1");
+  await detail.getByText("Confidenza sconosciuta", { exact: true }).waitFor();
+  // The confidence disclaimer is explained once, on demand.
+  assert.equal(
+    await page
+      .getByText("La confidenza è una stima del provider", { exact: false })
+      .count(),
+    0,
+  );
+  await detail
+    .getByRole("button", { name: "Come leggere la confidenza", exact: true })
+    .hover();
+  await page
+    .getByText("La confidenza è una stima del provider", { exact: false })
+    .waitFor();
+  await page.mouse.move(0, 0);
+  await openSection(/^1 riferimento · 1 sessione · 1 correzione umana/);
+  await detail
+    .getByText("Sessione #7 · Revisione #11", { exact: true })
+    .waitFor();
+  await detail
+    .getByText("Correzione umana confermata", { exact: true })
+    .waitFor();
+  await row(2).click();
+  await page.waitForURL(/proposal=2/);
+  await detail
+    .getByRole("heading", { name: "Falsa partenza", exact: true })
+    .waitFor();
+  await openSection(/^1 riferimento · 1 sessione · 0 correzioni umane/);
+  await detail
+    .getByText("Fonte osservata, ipotesi da valutare", { exact: true })
+    .waitFor();
+  await row(3).click();
+  await detail.getByText("Pubblicazione bloccata", { exact: true }).waitFor();
+  assert.equal(
+    await detail
       .getByRole("button", { name: "Approva", exact: true })
       .isDisabled(),
     true,
   );
-  assert.equal(
-    await page.evaluate("window.calls.some(c=>c.cmd==='suggestions_review')"),
-    false,
-  );
+  // A blocked approval stays blocked from the keyboard too.
+  await page.keyboard.press("a");
+  assert.equal(await dialog.count(), 0);
+  assert.equal(await reviewCalls(), 0);
   await page.screenshot({
     path: resolve(output, "review-1060.png"),
     fullPage: true,
   });
   pass(
-    "Real source identifiers, human correction versus hypothesis, truthful counts, conflict blocking, no activation on read",
+    "Master–detail queue with real source identifiers, human correction versus hypothesis, truthful counts, conflict blocking, confidence explained once, no activation on read",
   );
-  await card.getByRole("button", { name: "Approva", exact: true }).click();
-  const dialog = page.getByRole("dialog");
+  await row(1).click();
+  await detail
+    .getByRole("heading", { name: "VoiceFlow", exact: true })
+    .waitFor();
+  const replayed = detail.getByLabel("Riprova sullo storico");
+  await replayed
+    .getByText("Riprova sullo storico: cambia 3 sessioni su 40.", {
+      exact: true,
+    })
+    .waitFor();
+  await replayed
+    // One excerpt is stored for the three changed sessions.
+    .getByRole("button", {
+      name: "Estratti prima e dopo (1 di 3)",
+      exact: true,
+    })
+    .click();
+  await replayed.getByText("uso VoiceFlow oggi").waitFor();
+  await row(2).click();
+  await detail
+    .getByText(
+      "Riprova sullo storico: non cambia nessuna sessione salvata (40 riprovate).",
+      { exact: true },
+    )
+    .waitFor();
+  await detail
+    .getByText(/senza effetto sullo storico non viene pubblicata in automatico/)
+    .waitFor();
+  assert.equal(await reviewCalls(), 0);
+  pass(
+    "History replay shows per-rule session counts and excerpts without any write",
+  );
+  await row(1).click();
+  await detail
+    .getByRole("heading", { name: "VoiceFlow", exact: true })
+    .waitFor();
+  await detail.getByRole("button", { name: "Approva", exact: true }).click();
   await dialog
     .getByText(/definizione approvata e le sue versioni restano/)
     .waitFor();
+  await dialog
+    .getByText("Riprova sullo storico: cambia 3 sessioni su 40.", {
+      exact: true,
+    })
+    .waitFor();
   await dialog.getByRole("button", { name: "Annulla", exact: true }).click();
-  assert.equal(
-    await page.evaluate("window.calls.some(c=>c.cmd==='suggestions_review')"),
-    false,
-  );
-  await card.getByRole("button", { name: "Approva", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert.equal(await reviewCalls(), 0);
+  // The A shortcut opens the same confirmation; it never publishes directly.
+  await page.keyboard.press("a");
+  await dialog
+    .getByRole("heading", { name: "Approva e pubblica", exact: true })
+    .waitFor();
+  assert.equal(await reviewCalls(), 0);
   await page.evaluate("window.failSave=true");
   await dialog
     .getByRole("button", { name: "Approva e pubblica", exact: true })
@@ -146,34 +237,48 @@ try {
   const calls = await page.evaluate(
     "window.calls.filter(c=>c.cmd==='suggestions_review').map(c=>c.args.request)",
   );
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].requestKey, calls[1].requestKey);
   assert.equal(calls[0].expectedVersion, 0);
   assert.equal(calls[0].dictionaryVersion, 3);
-  await page
-    .getByRole("status")
-    .filter({ hasText: "Versione 1 pubblicata" })
+  await toasts.getByText("Versione 1 pubblicata", { exact: true }).waitFor();
+  // The queue moves on to the next proposal to review.
+  await page.waitForURL(/proposal=2/);
+  await detail
+    .getByRole("heading", { name: "Falsa partenza", exact: true })
     .waitFor();
   pass(
-    "Explicit approval policy, cancel without write, visible write failure and idempotent retry",
+    "Explicit approval policy (button and A shortcut), cancel without write, visible write failure, idempotent retry, toast and advance to next",
   );
   await filter("Approvate e attive");
-  await card.getByRole("button", { name: "Disattiva", exact: true }).click();
+  await row(1).click();
+  await detail.getByRole("button", { name: "Disattiva", exact: true }).click();
+  await toasts.getByText("Versione 2 pubblicata", { exact: true }).waitFor();
   await filter("Disattivate");
-  await card.getByRole("button", { name: "Riattiva", exact: true }).waitFor();
+  await row(1).click();
+  await detail.getByRole("button", { name: "Riattiva", exact: true }).waitFor();
+  const versions = page.getByRole("region", { name: "Versioni pubblicate" });
+  await versions.locator('[data-publication-version="1"]').waitFor();
+  await versions
+    .getByRole("button", { name: "Azioni versione 1", exact: true })
+    .click();
   await page
-    .getByRole("button", { name: "Ripristina versione 1", exact: true })
+    .getByRole("menuitem", { name: "Ripristina versione 1", exact: true })
     .click();
   await dialog
     .getByRole("button", { name: "Conferma ripristino", exact: true })
     .click();
   await dialog.waitFor({ state: "hidden" });
+  await toasts.getByText("Versione 3 pubblicata", { exact: true }).waitFor();
   await filter("Approvate e attive");
-  await card.getByText("Approvata · attiva", { exact: true }).waitFor();
+  await row(1).click();
+  await detail.getByText("Approvata · attiva", { exact: true }).waitFor();
   pass(
     "Disable and restore previous publication remain distinct from approval history",
   );
-  await filter("Da valutare e rimandate");
-  await cleanup.getByRole("button", { name: "Modifica", exact: true }).click();
+  await filter("Da revisionare");
+  await row(2).click();
+  await detail.getByRole("button", { name: "Modifica", exact: true }).click();
   await page.setViewportSize({ width: 780, height: 620 });
   await dialog
     .getByLabel("Espressione completa, da 2 a 7 parole", { exact: true })
@@ -213,6 +318,11 @@ try {
       .isDisabled(),
     true,
   );
+  // Letters typed in the editor never trigger the review shortcuts.
+  const beforeEdit = await reviewCalls();
+  await dialog.getByLabel("Motivazione", { exact: true }).press("r");
+  await dialog.getByLabel("Motivazione", { exact: true }).press("Backspace");
+  assert.equal(await reviewCalls(), beforeEdit);
   await dialog
     .getByLabel("Motivazione", { exact: true })
     .scrollIntoViewIfNeeded();
@@ -223,8 +333,11 @@ try {
     .getByRole("button", { name: "Salva proposta", exact: true })
     .click();
   await dialog.waitFor({ state: "hidden" });
+  await toasts.getByText("Proposta salvata", { exact: true }).waitFor();
   assert.equal(await page.evaluate("window.review.version"), 3);
-  await cleanup
+  // Under the two-pane width the linked proposal is shown alone.
+  assert.equal(await queue.isVisible(), false);
+  await detail
     .getByText("Esempio rivisto dalla persona", { exact: true })
     .waitFor();
   assert.deepEqual(
@@ -233,10 +346,10 @@ try {
     ),
     { kind: "repeat-phrase", phrase: ["le", "ultime"] },
   );
-  await cleanup
+  await detail
     .getByRole("heading", { name: "Ripetizione di frase", exact: true })
     .waitFor();
-  await cleanup
+  await detail
     .getByText(
       "Elimina la prima occorrenza di “le ultime” quando ripetuta due volte.",
       { exact: true },
@@ -245,9 +358,14 @@ try {
   pass(
     "Phrase repetition edits preserve the new shape and context without activation",
   );
-  await cleanup.getByRole("button", { name: "Rimanda", exact: true }).click();
-  await cleanup.getByText("Rimandata", { exact: true }).waitFor();
-  await cleanup.getByRole("button", { name: "Rifiuta", exact: true }).click();
+  // R defers and moves to the next item; K goes back; X opens the rejection.
+  await page.keyboard.press("r");
+  await toasts.getByText("Proposta rimandata", { exact: true }).waitFor();
+  await page.waitForURL(/proposal=3/);
+  await page.keyboard.press("k");
+  await page.waitForURL(/proposal=2/);
+  await detail.getByText("Rimandata", { exact: true }).waitFor();
+  await page.keyboard.press("x");
   assert.equal(
     await dialog
       .getByRole("button", { name: "Conferma rifiuto", exact: true })
@@ -261,24 +379,40 @@ try {
     .getByRole("button", { name: "Conferma rifiuto", exact: true })
     .click();
   await dialog.waitFor({ state: "hidden" });
+  await toasts.getByText("Proposta rifiutata", { exact: true }).waitFor();
+  assert.deepEqual(
+    await page.evaluate(
+      "window.calls.filter(c=>c.cmd==='suggestions_review').slice(-2).map(c=>c.args.request.action.kind)",
+    ),
+    ["defer", "reject"],
+  );
+  await page.waitForURL(/proposal=3/);
+  await page
+    .getByRole("button", { name: "Torna alla coda", exact: true })
+    .click();
   await filter("Rifiutate");
-  await cleanup
-    .getByText("Motivo del rifiuto precedente: Ripetizione intenzionale", {
-      exact: true,
-    })
+  await row(2).click();
+  await detail
+    .getByText("Motivo del rifiuto precedente", { exact: true })
     .waitFor();
+  await detail.getByText("Ripetizione intenzionale", { exact: true }).waitFor();
   assert.equal(
-    await cleanup.getByRole("button", { name: "Approva", exact: true }).count(),
+    await detail.getByRole("button", { name: "Approva", exact: true }).count(),
     0,
   );
   pass(
-    "Structured cleanup editing works at 780×620, saving never activates, defer and mandatory rejection reason persist",
+    "Structured cleanup editing works at 780×620, saving never activates, keyboard defer/previous/reject, mandatory rejection reason persists",
   );
   await page.evaluate("window.review.proposals[0].evidence=[]");
-  await page.getByRole("button", { name: "Aggiorna", exact: true }).click();
+  // No manual refresh: a focus event revalidates the snapshot.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page
+    .getByRole("button", { name: "Torna alla coda", exact: true })
+    .click();
   await filter("Approvate e attive");
-  await card.locator("summary").first().click();
-  await card.getByText(/Le sessioni sorgenti sono state eliminate/).waitFor();
+  await row(1).click();
+  await openSection(/^0 riferimenti · 0 sessioni/);
+  await detail.getByText(/Le sessioni sorgenti sono state eliminate/).waitFor();
   await page.screenshot({
     path: resolve(output, "active-780.png"),
     fullPage: true,

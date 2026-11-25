@@ -39,3 +39,16 @@ export function minuteValue(time: string) {
   const [h, m] = time.split(":").map(Number);
   return h * 60 + m;
 }
+/** Minutes covered by the window; an end before the start ends the next day. */
+export function windowMinutes(startMinute: number, endMinute: number) {
+  return (endMinute - startMinute + 1440) % 1440;
+}
+/** Null when the time is valid, otherwise the message shown under the field. */
+export function windowError(startMinute: number, endMinute: number) {
+  if (!Number.isInteger(startMinute) || !Number.isInteger(endMinute))
+    return "Inserisci un orario valido.";
+  const length = windowMinutes(startMinute, endMinute);
+  return length >= 1 && length <= 720
+    ? null
+    : "La fascia deve durare da 1 minuto a 12 ore.";
+}

@@ -1,3 +1,4 @@
+use super::AnalysisSettings;
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
@@ -34,6 +35,10 @@ impl Cancellation for AtomicBool {
 #[serde(deny_unknown_fields)]
 pub struct ProviderReply {
     pub candidates: Vec<serde_json::Value>,
+    /// Absent in replies produced before the list existed: those sources are then
+    /// not counted as checked for misspellings.
+    #[serde(default)]
+    pub misspellings: Option<Vec<serde_json::Value>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
@@ -62,6 +67,7 @@ pub trait Provider: Send + Sync {
     fn analyze(
         &self,
         prompt: &str,
+        settings: &AnalysisSettings,
         timeout: Duration,
         cancel: &dyn Cancellation,
     ) -> std::result::Result<ProviderReply, ProviderError>;
@@ -177,7 +183,7 @@ impl Drop for Scratch {
     }
 }
 const OUTPUT_CAP: usize = 524_288;
-// Capability switches verified against installed CLI 0.157.0. Unsupported future flags fail closed.
+// Capability switches verified against installed CLI 0.157.1. Unsupported future flags fail closed.
 const DISABLED: &[&str] = &[
     "artifact",
     "agent_message_board",
@@ -223,7 +229,12 @@ const DISABLED: &[&str] = &[
     "daemon_auto_start",
     "unbounded_connection_retries",
 ];
-fn command(executables: &Executables, scratch: &Path, schema: &Path) -> Command {
+fn command(
+    executables: &Executables,
+    scratch: &Path,
+    schema: &Path,
+    settings: &AnalysisSettings,
+) -> Command {
     let mut cmd = Command::new(&executables.codex);
     cmd.current_dir(scratch).env_clear();
     for name in ["HOME", "CODEX_HOME"] {
@@ -259,13 +270,18 @@ fn command(executables: &Executables, scratch: &Path, schema: &Path) -> Command 
         "--output-schema",
     ])
     .arg(schema);
+    cmd.arg("--model").arg(&settings.model);
+    cmd.arg("-c").arg(format!(
+        "model_reasoning_effort={}",
+        serde_json::to_string(&settings.reasoning_effort).expect("reasoning effort serializes")
+    ));
     for feature in DISABLED {
         cmd.args(["--disable", feature]);
     }
     cmd.args(["--enable", "skip_host_skill_discovery"]);
     for setting in [
         "model_provider=\"openai\"",
-        "tools.view_image=false",
+        "suppress_unstable_features_warning=true",
         "memories.use_memories=false",
         "approval_policy=\"never\"",
         "web_search=\"disabled\"",
@@ -327,6 +343,7 @@ impl Provider for CodexProvider {
     fn analyze(
         &self,
         prompt: &str,
+        settings: &AnalysisSettings,
         timeout: Duration,
         cancel: &dyn Cancellation,
     ) -> std::result::Result<ProviderReply, ProviderError> {
@@ -344,7 +361,7 @@ impl Provider for CodexProvider {
             include_str!("../../../../../docs/schemas/analysis-output-v1.json"),
         )
         .map_err(|_| ProviderError::Io)?;
-        let mut cmd = command(&self.executables, &scratch.0, &schema);
+        let mut cmd = command(&self.executables, &scratch.0, &schema, settings);
         if self.worker_group {
             cmd.process_group(unsafe { libc::getpgrp() });
         }
@@ -432,6 +449,7 @@ fn parse_events(bytes: &[u8]) -> std::result::Result<ProviderReply, ProviderErro
     let text = std::str::from_utf8(bytes).map_err(|_| ProviderError::Malformed)?;
     let mut final_text = None;
     let mut completed = false;
+    let mut turn_started = false;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let event: serde_json::Value =
             serde_json::from_str(line).map_err(|_| ProviderError::Malformed)?;
@@ -440,6 +458,17 @@ fn parse_events(bytes: &[u8]) -> std::result::Result<ProviderReply, ProviderErro
             Some("turn.failed" | "error") => return Err(ProviderError::Exit),
             Some(lifecycle @ ("item.started" | "item.updated" | "item.completed")) => {
                 let item = &event["item"];
+                // CLI 0.157.1 emits this local startup notice when the code-mode host
+                // is deliberately disabled. It reports no tool activity. Only accept
+                // this exact notice before the model's turn; all other errors fail closed.
+                if !turn_started
+                    && lifecycle == "item.completed"
+                    && item["type"] == "error"
+                    && item["message"]
+                        == "Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."
+                {
+                    continue;
+                }
                 // Check every lifecycle event. This detects activity after it happened;
                 // the CLI capability flags remain the preventive control.
                 if !matches!(item["type"].as_str(), Some("agent_message" | "reasoning")) {
@@ -453,7 +482,8 @@ fn parse_events(bytes: &[u8]) -> std::result::Result<ProviderReply, ProviderErro
                     final_text = Some(text.to_owned());
                 }
             }
-            Some("thread.started" | "turn.started") => (),
+            Some("thread.started") => (),
+            Some("turn.started") => turn_started = true,
             _ => return Err(ProviderError::Malformed),
         }
     }
@@ -462,7 +492,7 @@ fn parse_events(bytes: &[u8]) -> std::result::Result<ProviderReply, ProviderErro
     }
     let reply: ProviderReply = serde_json::from_str(&final_text.ok_or(ProviderError::Malformed)?)
         .map_err(|_| ProviderError::Malformed)?;
-    if reply.candidates.len() > 16 {
+    if reply.candidates.len() > 16 || reply.misspellings.as_ref().is_some_and(|m| m.len() > 48) {
         return Err(ProviderError::OutputLimit);
     }
     Ok(reply)

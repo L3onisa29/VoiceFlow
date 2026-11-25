@@ -1,13 +1,16 @@
 //! Local, incremental analysis. The provider receives RAM-only payloads and cannot publish rules.
 pub(crate) mod findings;
 mod provider;
+pub(crate) mod rejections;
 pub mod runs;
 pub use runs::{RunDetail, RunKey, RunPage};
 mod schema;
 use crate::{
     dictionary::{DictionarySnapshot, DictionaryStore},
     history::HistoryStore,
-    suggestions::{CandidateRejection, EvidenceRef, IngestFailure, IngestRequest, SuggestionStore},
+    suggestions::{
+        CandidateRejection, EvidenceRef, IngestFailure, IngestRequest, SuggestionStore, coded,
+    },
 };
 use anyhow::{Context, Result, ensure};
 pub use provider::{
@@ -30,12 +33,45 @@ impl std::fmt::Display for DailyLimit {
 }
 impl std::error::Error for DailyLimit {}
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOrigin {
+    Automatic,
+    Manual,
+}
+impl RunOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+fn default_model() -> String {
+    "gpt-6-luna".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnalysisSettings {
     pub enabled: bool,
     #[serde(default)]
     pub auto_approve_high_confidence: bool,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
     pub max_sources: u32,
     pub max_input_bytes: u32,
     pub max_requests_per_day: u32,
@@ -47,6 +83,8 @@ impl Default for AnalysisSettings {
         Self {
             enabled: false,
             auto_approve_high_confidence: false,
+            model: default_model(),
+            reasoning_effort: ReasoningEffort::default(),
             max_sources: 20,
             max_input_bytes: 65_536,
             max_requests_per_day: 2,
@@ -57,6 +95,16 @@ impl Default for AnalysisSettings {
 }
 impl AnalysisSettings {
     fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.model.is_empty()
+                && self.model.len() <= 128
+                && self.model.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && self
+                    .model
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
+            "Modello non valido. Usa un identificativo di massimo 128 caratteri, senza spazi."
+        );
         ensure!(
             (1..=100).contains(&self.max_sources)
                 && (4096..=262_144).contains(&self.max_input_bytes)
@@ -77,6 +125,8 @@ pub struct AnalysisStatus {
     pub elapsed_seconds_today: i64,
     pub reserved_seconds_today: i64,
     pub pending_sources: i64,
+    /// Sources set aside after repeated all-rejected outcomes. Still unanalysed.
+    pub parked_sources: i64,
     pub excluded_sessions: i64,
     pub last_state: Option<String>,
     pub last_error: Option<String>,
@@ -129,8 +179,22 @@ pub struct PreparedBatch {
     privacy_version: i64,
     sources: Vec<Source>,
     context: Vec<serde_json::Value>,
+    /// Rejection codes of the previous attempt on this batch. Empty on a first attempt.
+    feedback: Vec<serde_json::Value>,
 }
 impl PreparedBatch {
+    /// Bytes of a request without any source: instructions plus the data envelope.
+    fn fixed_bytes() -> Result<usize> {
+        Ok(Self {
+            id: 0,
+            privacy_version: 0,
+            sources: vec![],
+            context: vec![],
+            feedback: vec![],
+        }
+        .prompt()?
+        .len())
+    }
     pub fn id(&self) -> i64 {
         self.id
     }
@@ -138,12 +202,29 @@ impl PreparedBatch {
         self.sources.len()
     }
     pub fn prompt(&self) -> Result<String> {
+        let catalog = voiceflow_core::cleanup::CompiledCatalog::builtin();
+        let repetitions: Vec<_> = catalog
+            .definition()
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                if let voiceflow_core::cleanup::Operation::Repeat { word } = &rule.operation {
+                    Some(word.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut data = serde_json::json!({"sources":self.sources,"relevantRulesAndHypotheses":self.context,"localCleanup":{"version":catalog.version(),"repeatedWords":repetitions}});
+        let mut instructions = include_str!("prompt.txt").to_owned();
+        if !self.feedback.is_empty() {
+            data["previousAttemptRejections"] = serde_json::json!(self.feedback);
+            instructions.push_str(rejections::RETRY_INSTRUCTION);
+            instructions.push('\n');
+        }
         Ok(format!(
-            "{}\nUNTRUSTED_DATA_JSON\n{}",
-            include_str!("prompt.txt"),
-            serde_json::to_string(
-                &serde_json::json!({"sources":self.sources,"relevantRulesAndHypotheses":self.context})
-            )?
+            "{instructions}\nUNTRUSTED_DATA_JSON\n{}",
+            serde_json::to_string(&data)?
         ))
     }
 }
@@ -162,7 +243,7 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         INSERT INTO analysis_schema SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM analysis_schema);",
     )?;
     ensure!(
-        (1..=3).contains(
+        (1..=4).contains(
             &c.query_row("SELECT version FROM analysis_schema", [], |r| r
                 .get::<_, i64>(0))?
         ),
@@ -185,6 +266,9 @@ pub(crate) fn migrate(c: &Connection) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS analysis_undo AFTER UPDATE OF reverted ON history_revisions WHEN NEW.reverted=1 BEGIN DELETE FROM analysis_events WHERE revision_id=NEW.id; END;")?;
     runs::migrate(c)?;
     findings::migrate(c)?;
+    runs::migrate_metadata(c)?;
+    rejections::migrate(c)?;
+    crate::suggestions::spellings::migrate(c)?;
     let inserted = c.execute(
         "INSERT OR IGNORE INTO analysis_settings(id,json) VALUES(1,?1)",
         [serde_json::to_string(&AnalysisSettings::default())?],
@@ -226,8 +310,35 @@ fn source(c: &Connection, id: i64, max: usize) -> Result<Source> {
         before_text: before,
         after_text: after,
         category,
-        processing: processing.map(|s| serde_json::from_str(&s)).transpose()?,
+        processing: processing
+            .map(|s| -> Result<serde_json::Value> {
+                let mut value: serde_json::Value = serde_json::from_str(&s)?;
+                // App-only measurements stay local: the payload and its fingerprint keep
+                // exactly the fields they had before those measurements existed.
+                if let Some(fields) = value.as_object_mut() {
+                    for field in crate::history::LOCAL_PROCESSING_FIELDS {
+                        fields.remove(field);
+                    }
+                }
+                Ok(value)
+            })
+            .transpose()?,
     })
+}
+/// Milliseconds still available today, or None once the request or time budget is spent.
+/// Reads attempt metadata only, so the launcher can ask before starting a worker.
+pub(crate) fn budget_left(
+    c: &Connection,
+    config: &AnalysisSettings,
+    now_ms: i64,
+) -> Result<Option<i64>> {
+    let (requests, ms): (u32, i64) = c.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(CASE WHEN state IN ('running','interrupted') THEN reserved_ms ELSE elapsed_ms END),0) FROM analysis_attempts WHERE started_at>=?1",
+        [now_ms - now_ms.rem_euclid(86_400_000)],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let limit = (config.max_seconds_per_day as i64) * 1000;
+    Ok((requests < config.max_requests_per_day && ms < limit).then_some(limit - ms))
 }
 /// Called inside C2's candidate transaction. A global session ID alone grants no access.
 pub(crate) fn validate_scope(c: &Connection, batch_id: i64, refs: &[EvidenceRef]) -> Result<()> {
@@ -235,12 +346,18 @@ pub(crate) fn validate_scope(c: &Connection, batch_id: i64, refs: &[EvidenceRef]
     let valid:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM analysis_batches WHERE id=?1 AND privacy_version=?2 AND state='running')",params![batch_id,version],|r|r.get(0))?;
     ensure!(
         config.enabled && valid,
-        CandidateRejection(anyhow::anyhow!("Consenso revocato o lotto non attivo."))
+        CandidateRejection(anyhow::Error::new(coded(
+            "batch-inactive",
+            "Consenso revocato o lotto non attivo."
+        )))
     );
     for reference in refs {
         let row:Option<(i64,String)>=c.query_row("SELECT e.id,b.fingerprint FROM analysis_batch_sources b JOIN analysis_events e ON e.id=b.event_id WHERE b.batch_id=?1 AND e.session_id=?2 AND e.revision_id IS ?3",params![batch_id,reference.session_id,reference.revision_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let (id, hash) = row.ok_or_else(|| {
-            CandidateRejection(anyhow::anyhow!("Evidenza fuori dal lotto preparato."))
+            CandidateRejection(anyhow::Error::new(coded(
+                "evidence-outside-batch",
+                "Evidenza fuori dal lotto preparato.",
+            )))
         })?;
         let current = source(c, id, 262_144).map_err(|error| {
             // Missing/removed source is a domain rejection; a query or decoding fault is not.
@@ -248,14 +365,20 @@ pub(crate) fn validate_scope(c: &Connection, batch_id: i64, refs: &[EvidenceRef]
                 error.downcast_ref::<rusqlite::Error>(),
                 Some(rusqlite::Error::QueryReturnedNoRows)
             ) {
-                anyhow::Error::from(CandidateRejection(error))
+                anyhow::Error::from(CandidateRejection(anyhow::Error::new(coded(
+                    "source-unavailable",
+                    format!("{error:#}"),
+                ))))
             } else {
                 error
             }
         })?;
         ensure!(
             current.fingerprint()? == hash && current.refs().contains(reference),
-            CandidateRejection(anyhow::anyhow!("Sorgente cambiata dopo la preparazione."))
+            CandidateRejection(anyhow::Error::new(coded(
+                "source-changed",
+                "Sorgente cambiata dopo la preparazione."
+            )))
         );
     }
     Ok(())
@@ -279,7 +402,7 @@ impl AnalysisStore {
         let (requests,bytes,ms,reserved):(u32,i64,i64,i64)=c.query_row("SELECT COUNT(*),COALESCE(SUM(input_bytes),0),COALESCE(SUM(elapsed_ms),0),COALESCE(SUM(CASE WHEN state IN ('running','interrupted') THEN reserved_ms ELSE 0 END),0) FROM analysis_attempts WHERE started_at>=?1",[now_ms-now_ms.rem_euclid(86_400_000)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         let last:Option<(String,Option<String>)>=c.query_row("SELECT state,error FROM analysis_batches ORDER BY id DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let (accepted,rejected):(i64,i64)=c.query_row("SELECT COALESCE(SUM(accepted),0),COALESCE(SUM(rejected),0) FROM analysis_batches",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        Ok(AnalysisStatus{settings,requests_today:requests,input_bytes_today:bytes,elapsed_seconds_today:(ms+999)/1000,reserved_seconds_today:(reserved+999)/1000,pending_sources:c.query_row("SELECT COUNT(*) FROM analysis_events e WHERE done=0 AND NOT EXISTS(SELECT 1 FROM analysis_exclusions x WHERE x.session_id=e.session_id)",[],|r|r.get(0))?,excluded_sessions:c.query_row("SELECT COUNT(*) FROM analysis_exclusions",[],|r|r.get(0))?,last_state:last.as_ref().map(|r|r.0.clone()),last_error:last.and_then(|r|r.1),accepted_candidates:accepted,rejected_candidates:rejected})
+        Ok(AnalysisStatus{settings,requests_today:requests,input_bytes_today:bytes,elapsed_seconds_today:(ms+999)/1000,reserved_seconds_today:(reserved+999)/1000,pending_sources:c.query_row("SELECT COUNT(*) FROM analysis_events e WHERE done=0 AND NOT EXISTS(SELECT 1 FROM analysis_exclusions x WHERE x.session_id=e.session_id) AND NOT EXISTS(SELECT 1 FROM analysis_parked p WHERE p.event_id=e.id)",[],|r|r.get(0))?,parked_sources:c.query_row("SELECT COUNT(*) FROM analysis_parked p JOIN analysis_events e ON e.id=p.event_id WHERE e.done=0 AND NOT EXISTS(SELECT 1 FROM analysis_exclusions x WHERE x.session_id=e.session_id)",[],|r|r.get(0))?,excluded_sessions:c.query_row("SELECT COUNT(*) FROM analysis_exclusions",[],|r|r.get(0))?,last_state:last.as_ref().map(|r|r.0.clone()),last_error:last.and_then(|r|r.1),accepted_candidates:accepted,rejected_candidates:rejected})
     })
     }
     pub fn configure(&self, config: AnalysisSettings, consent: bool) -> Result<()> {
@@ -288,11 +411,21 @@ impl AnalysisStore {
             !config.enabled || consent,
             "Conferma l'invio dei testi selezionati a OpenAI."
         );
+        // Checked when saving only, so a stored value is never invalidated by a longer
+        // prompt: below this floor no dictation could fit beside the fixed instructions.
+        let floor = PreparedBatch::fixed_bytes()? + 1024;
+        ensure!(
+            config.max_input_bytes as usize >= floor,
+            "Limite di byte troppo basso: istruzioni e intestazione ne occupano già {}. Imposta almeno {floor}.",
+            floor - 1024
+        );
         self.history.access(|c|{
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if settings(&tx)?.0 == config { return Ok(()); }
         tx.execute("UPDATE analysis_settings SET json=?1,privacy_version=privacy_version+1 WHERE id=1",[serde_json::to_string(&config)?])?;
-        tx.execute("UPDATE analysis_batches SET state='cancelled',error='privacy-changed' WHERE state IN ('prepared','running','failed')",[])?;tx.commit()?;Ok(())
+        tx.execute("UPDATE analysis_batches SET state='cancelled',error='privacy-changed' WHERE state IN ('prepared','running','failed')",[])?;
+        // A different model, effort or limit is a fair reason to offer parked sources again.
+        tx.execute("DELETE FROM analysis_parked",[])?;tx.commit()?;Ok(())
     })
     }
     pub fn excluded(&self, id: i64) -> Result<bool> {
@@ -320,18 +453,25 @@ impl AnalysisStore {
         self.history.access(|c|{
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (config,version)=settings(&tx)?;ensure!(config.enabled,"Analisi disattivata.");
-            let pending:Option<i64>=tx.query_row("SELECT id FROM analysis_batches WHERE state IN ('prepared','running','failed') ORDER BY id LIMIT 1",[],|r|r.get(0)).optional()?;
+            let oldest=|| tx.query_row("SELECT id FROM analysis_batches WHERE state IN ('prepared','running','failed') ORDER BY id LIMIT 1",[],|r|r.get::<_,i64>(0)).optional();
+            let mut pending=oldest()?;
+            // Replacement batches have no attempts yet, so this terminates.
+            while let Some(id)=pending {
+                if !rejections::supersede(&tx,id,version)? {break;}
+                pending=oldest()?;
+            }
             if let Some(id)=pending {
                 let batch=self.reconstruct(&tx,id,&config,version,&dictionary)?;
-                if !batch.sources.is_empty() { return Ok(Some(batch)); }
+                // Commit any batch replacement made above together with this choice.
+                if !batch.sources.is_empty() { tx.commit()?; return Ok(Some(batch)); }
                 tx.execute("UPDATE analysis_batches SET state='cancelled',error='source-changed' WHERE id=?1",[id])?;
             }
             let cursor:i64=tx.query_row("SELECT cursor FROM analysis_scan WHERE id=1",[],|r|r.get(0))?;
-            let scan=|after:i64|->Result<Vec<i64>> {Ok(tx.prepare("SELECT id FROM analysis_events e WHERE done=0 AND id>?1 AND NOT EXISTS(SELECT 1 FROM analysis_exclusions x WHERE x.session_id=e.session_id) ORDER BY id LIMIT 128")?.query_map([after],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)};
+            let scan=|after:i64|->Result<Vec<i64>> {Ok(tx.prepare("SELECT id FROM analysis_events e WHERE done=0 AND id>?1 AND NOT EXISTS(SELECT 1 FROM analysis_exclusions x WHERE x.session_id=e.session_id) AND NOT EXISTS(SELECT 1 FROM analysis_parked p WHERE p.event_id=e.id) ORDER BY id LIMIT 128")?.query_map([after],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)};
             let mut ids=scan(cursor)?;
             if ids.is_empty() && cursor>0 {ids=scan(0)?;}
             let mut scanned=cursor;
-            let mut batch=PreparedBatch{id:0,privacy_version:version,sources:vec![],context:vec![]};
+            let mut batch=PreparedBatch{id:0,privacy_version:version,sources:vec![],context:vec![],feedback:vec![]};
             for id in ids {
                 scanned=id;
                 // Oversized sources are left pending, never silently truncated or marked analyzed.
@@ -369,6 +509,7 @@ impl AnalysisStore {
             privacy_version: privacy,
             sources: vec![],
             context: vec![],
+            feedback: vec![],
         };
         for (event, hash) in entries {
             if let Ok(s) = source(c, event, config.max_input_bytes as usize)
@@ -376,6 +517,11 @@ impl AnalysisStore {
             {
                 batch.sources.push(s);
             }
+        }
+        // Small and more useful than context, so it is added first. It never displaces a source.
+        batch.feedback = rejections::feedback(c, id, &batch.sources)?;
+        if batch.prompt()?.len() > config.max_input_bytes as usize {
+            batch.feedback.clear();
         }
         add_context(c, &mut batch, config.max_input_bytes as usize, dictionary)?;
         Ok(batch)
@@ -391,6 +537,7 @@ impl AnalysisStore {
     })
     }
     /// One bounded request. Caller owns scheduling/worker lease. Providers run outside all DB locks.
+    #[cfg(test)]
     pub fn run(
         &self,
         batch: PreparedBatch,
@@ -398,21 +545,31 @@ impl AnalysisStore {
         cancel: &dyn Cancellation,
         now_ms: i64,
     ) -> Result<BatchOutcome> {
+        self.run_invoked(batch, provider, cancel, now_ms, RunOrigin::Automatic, None)
+    }
+    pub fn run_invoked(
+        &self,
+        batch: PreparedBatch,
+        provider: &dyn Provider,
+        cancel: &dyn Cancellation,
+        now_ms: i64,
+        origin: RunOrigin,
+        invocation_id: Option<i64>,
+    ) -> Result<BatchOutcome> {
         ensure!(!cancel.cancelled(), "Analisi annullata.");
         let dictionary = self.dictionary.snapshot()?;
-        let (prompt,timeout,attempt)=self.history.access(|c|{
+        let (prompt,timeout,attempt,config)=self.history.access(|c|{
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (config,version)=settings(&tx)?;ensure!(config.enabled&&version==batch.privacy_version,"Consenso revocato.");
             let current=self.reconstruct(&tx,batch.id,&config,version,&dictionary)?;
             ensure!(!current.sources.is_empty(),"Nessuna sorgente ancora valida nel lotto.");
             let prompt=current.prompt()?;ensure!(prompt.len()<=config.max_input_bytes as usize,"Lotto oltre il limite.");
-            let (requests,ms):(u32,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN state IN ('running','interrupted') THEN reserved_ms ELSE elapsed_ms END),0) FROM analysis_attempts WHERE started_at>=?1",[now_ms-now_ms.rem_euclid(86_400_000)],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            ensure!(requests<config.max_requests_per_day&&ms<(config.max_seconds_per_day as i64)*1000,DailyLimit);
-            let timeout=Duration::from_millis(((config.request_timeout_seconds as u64)*1000).min((config.max_seconds_per_day as i64*1000-ms) as u64));
+            let remaining=budget_left(&tx,&config,now_ms)?.ok_or(DailyLimit)?;
+            let timeout=Duration::from_millis(((config.request_timeout_seconds as u64)*1000).min(remaining as u64));
             ensure!(tx.execute("UPDATE analysis_batches SET state='running',error=NULL WHERE id=?1 AND state IN ('prepared','failed')",[batch.id])?==1,"Lotto già avviato o concluso.");
-            tx.execute("INSERT INTO analysis_attempts(batch_id,started_at,input_bytes,reserved_ms,state,source_count,accepted) VALUES(?1,?2,?3,?4,'running',?5,0)",params![batch.id,now_ms,prompt.len() as i64,timeout.as_millis() as i64,current.sources.len() as i64])?;let attempt=tx.last_insert_rowid();
+            tx.execute("INSERT INTO analysis_attempts(batch_id,started_at,input_bytes,reserved_ms,state,source_count,accepted,origin,model,reasoning_effort,invocation_id) VALUES(?1,?2,?3,?4,'running',?5,0,?6,?7,?8,?9)",params![batch.id,now_ms,prompt.len() as i64,timeout.as_millis() as i64,current.sources.len() as i64,origin.as_str(),config.model,serde_json::to_value(config.reasoning_effort)?.as_str(),invocation_id])?;let attempt=tx.last_insert_rowid();
             for source in &current.sources {tx.execute("INSERT INTO analysis_attempt_sources(attempt_id,session_id,revision_id) VALUES(?1,?2,?3)",params![attempt,source.session_id,source.revision_id])?;}
-            tx.commit()?;Ok((prompt,timeout,attempt))
+            tx.commit()?;Ok((prompt,timeout,attempt,config))
         })?;
         let stop = || {
             cancel.cancelled()
@@ -425,10 +582,13 @@ impl AnalysisStore {
                     .unwrap_or(true)
         };
         let start = Instant::now();
-        let response = provider.analyze(&prompt, timeout, &stop);
+        let response = provider.analyze(&prompt, &config, timeout, &stop);
         let elapsed = start.elapsed().as_millis().min(i64::MAX as u128) as i64;
         let mut accepted = 0;
         let mut rejected = 0;
+        let mut reasons: Vec<rejections::Rejection> = vec![];
+        // Sessions examined for misspellings by this attempt, once it is known to count.
+        let mut spelling_checked: Vec<i64> = vec![];
         let (state, error) = if stop() {
             ("cancelled", Some("cancelled"))
         } else {
@@ -436,51 +596,122 @@ impl AnalysisStore {
                 Err(ref error) => ("failed", Some(error.code())),
                 Ok(reply) if reply.candidates.len() > 16 => ("failed", Some("output-limit")),
                 Ok(reply) => {
+                    let provider::ProviderReply {
+                        candidates,
+                        misspellings,
+                    } = reply;
                     let mut infrastructure_failure = false;
                     let suggestions =
                         SuggestionStore::new(self.history.clone(), self.dictionary.clone());
-                    for value in reply.candidates {
+                    for (position, value) in candidates.into_iter().enumerate() {
                         if stop() {
                             break;
                         }
+                        // Built before the value is consumed: a code and in-batch references only.
+                        let reason = |code| {
+                            rejections::Rejection::new(position, code, &value, &batch.sources)
+                        };
                         if !schema::candidate(&value) {
                             rejected += 1;
+                            reasons.push(reason("schema"));
                             continue;
                         }
                         let result = if value.get("name").is_none() {
                             // Preserve the old ingest contract without inventing finding text or a score.
-                            match serde_json::from_value::<IngestRequest>(value) {
+                            match serde_json::from_value::<IngestRequest>(value.clone()) {
                                 Ok(request) => {
                                     suggestions.ingest_prepared(request, batch.id, attempt)
                                 }
-                                Err(_) => Err(IngestFailure::InvalidCandidate),
+                                Err(_) => Err(IngestFailure::InvalidCandidate("schema")),
                             }
                         } else {
-                            match findings::Finding::parse(value) {
+                            match findings::Finding::parse(value.clone()) {
                                 Ok(request) => {
                                     suggestions.ingest_finding(request, batch.id, attempt, cancel)
                                 }
-                                Err(_) => Err(IngestFailure::InvalidCandidate),
+                                Err(error) => Err(IngestFailure::InvalidCandidate(
+                                    crate::suggestions::rejection_code(&error),
+                                )),
                             }
                         };
                         match result {
                             Ok(()) => accepted += 1,
-                            Err(IngestFailure::InvalidCandidate) => rejected += 1,
+                            Err(IngestFailure::InvalidCandidate(code)) => {
+                                rejected += 1;
+                                reasons.push(reason(code));
+                            }
                             Err(IngestFailure::Infrastructure) => {
                                 infrastructure_failure = true;
                                 break;
                             }
                         }
                     }
-                    if stop() {
+                    let mut outcome = if stop() {
                         ("cancelled", Some("cancelled"))
                     } else if infrastructure_failure {
                         ("failed", Some("ingest-storage"))
+                    } else if rejected > 0 && accepted == 0 {
+                        ("failed", Some("all-candidates-rejected"))
                     } else if rejected > 0 {
                         ("partial", Some("candidate-rejected"))
                     } else {
                         ("completed", None)
+                    };
+                    // Spelling pairs are read only when the candidates left the batch
+                    // consumable, and never fail an attempt on their own: an unusable
+                    // pair is dropped and its reason recorded.
+                    if matches!(outcome.0, "completed" | "partial")
+                        && let Some(pairs) = misspellings
+                    {
+                        let sessions: Vec<i64> = batch
+                            .sources
+                            .iter()
+                            .filter(|source| source.revision_id.is_none())
+                            .map(|source| source.session_id)
+                            .collect();
+                        let mut observed = vec![];
+                        let mut storage_failure = false;
+                        for (position, value) in pairs.into_iter().enumerate() {
+                            if stop() {
+                                break;
+                            }
+                            let reason = |code| {
+                                rejections::Rejection::spelling(
+                                    position,
+                                    code,
+                                    &value,
+                                    &batch.sources,
+                                )
+                            };
+                            if !schema::misspelling(&value) {
+                                reasons.push(reason("schema"));
+                                continue;
+                            }
+                            match suggestions.observe_spelling(value.clone(), batch.id, attempt) {
+                                Ok(pair) => observed.push(pair),
+                                Err(IngestFailure::InvalidCandidate(code)) => {
+                                    reasons.push(reason(code))
+                                }
+                                Err(IngestFailure::Infrastructure) => {
+                                    storage_failure = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !storage_failure && !stop() {
+                            storage_failure = suggestions
+                                .settle_spellings(&observed, batch.id, attempt, &sessions, cancel)
+                                .is_err();
+                        }
+                        if stop() {
+                            outcome = ("cancelled", Some("cancelled"));
+                        } else if storage_failure {
+                            outcome = ("failed", Some("ingest-storage"));
+                        } else {
+                            spelling_checked = sessions;
+                        }
                     }
+                    outcome
                 }
             }
         };
@@ -490,6 +721,7 @@ impl AnalysisStore {
                 "UPDATE analysis_attempts SET elapsed_ms=?1,state=?2,ended_at=?4,error=?5,accepted=?6,rejected=?7 WHERE id=?3",
                 params![elapsed, state, attempt, now()?, error, accepted as i64, rejected as i64],
             )?;
+            rejections::save(&tx, attempt, &reasons)?;
             tx.execute(
                 "UPDATE analysis_batches SET state=?1,error=?2,accepted=?3,rejected=?4 WHERE id=?5",
                 params![state, error, accepted as i64, rejected as i64, batch.id],
@@ -506,6 +738,7 @@ impl AnalysisStore {
                         )?;
                     }
                 }
+                crate::suggestions::spellings::mark_checked(&tx, &spelling_checked)?;
             }
             tx.commit()?;
             Ok(())

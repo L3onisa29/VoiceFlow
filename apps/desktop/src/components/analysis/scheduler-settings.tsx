@@ -1,273 +1,374 @@
-import { useEffect, useState } from "react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { useEffect, useRef, useState } from "react";
+import { RefreshCw } from "lucide-react";
+import { toast } from "sonner";
+import { ConfirmSettingDialog } from "@/components/settings/confirm-setting-dialog";
+import { SettingsAdvanced } from "@/components/settings/settings-advanced";
+import { SettingsRow } from "@/components/settings/settings-row";
+import {
+  SettingsGroup,
+  SettingsSection,
+} from "@/components/settings/settings-section";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Field,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { toUserMessage } from "@/lib/errors";
 import {
+  invalidateLocalQueries,
+  queryClient,
+  queryKeys,
+} from "@/lib/query-client";
+import {
+  minuteValue,
   schedulerApi,
   timeValue,
-  minuteValue,
+  windowError,
   type Schedule,
   type SchedulerStatus,
 } from "@/lib/scheduler";
+
+type SavingKey = "enabled" | "startMinute" | "endMinute" | "repair";
+type TimeKey = "startMinute" | "endMinute";
+type Texts = Partial<Record<TimeKey, string>>;
+
+function without(record: Texts, key: TimeKey): Texts {
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
 export function SchedulerSettings() {
   const [status, setStatus] = useState<SchedulerStatus | null>(null);
-  const [draft, setDraft] = useState<Schedule | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState<SavingKey | null>(null);
+  const [confirm, setConfirm] = useState(false);
+  // Text being edited in a time field; applied on blur or Enter.
+  const [drafts, setDrafts] = useState<Texts>({});
+  const [errors, setErrors] = useState<Texts>({});
+  const inFlight = useRef(false);
+  const loaded = useRef(false);
   const [refresh, setRefresh] = useState(0);
+
   useEffect(() => {
     let active = true;
+    setLoading(true);
     void schedulerApi
       .status()
       .then((value) => {
-        if (active) {
-          setStatus(value);
-          setDraft(value.schedule);
-          setError(null);
-        }
+        if (!active) return;
+        loaded.current = true;
+        setStatus(value);
+        setDrafts({});
+        setErrors({});
+        setLoadError(null);
+        void invalidateLocalQueries(queryClient, [queryKeys.analysis]);
       })
       .catch((error) => {
-        if (active) setError(String(error));
+        if (!active) return;
+        // With a status already shown the page stays usable: report only.
+        if (loaded.current) toast.error(toUserMessage(error));
+        else setLoadError(toUserMessage(error));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
       });
     return () => {
       active = false;
     };
   }, [refresh]);
-  async function save(schedule: Schedule) {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
+
+  /** Sends the full schedule; consent follows the requested `enabled`. */
+  async function apply(key: SavingKey, schedule: Schedule) {
+    if (inFlight.current) return false;
+    inFlight.current = true;
+    setSaving(key);
     try {
       const value = await schedulerApi.configure(schedule, schedule.enabled);
       setStatus(value);
-      setDraft(value.schedule);
+      // A partial launchd failure stays visible in the inline alert.
+      if (!value.lastError)
+        toast.success(
+          key === "enabled" && !schedule.enabled
+            ? "Analisi programmata disattivata"
+            : "Impostazione salvata",
+        );
+      return true;
     } catch (error) {
-      setError(String(error));
+      toast.error(toUserMessage(error));
+      return false;
     } finally {
-      setBusy(false);
+      inFlight.current = false;
+      setSaving(null);
     }
   }
+
+  async function commitTime(key: TimeKey) {
+    const text = drafts[key];
+    if (!status || text === undefined || inFlight.current) return;
+    const minute = minuteValue(text);
+    if (minute === status.schedule[key]) {
+      setDrafts((current) => without(current, key));
+      setErrors((current) => without(current, key));
+      return;
+    }
+    const next = { ...status.schedule, [key]: minute };
+    const invalid = windowError(next.startMinute, next.endMinute);
+    if (invalid) {
+      setErrors((current) => ({ ...current, [key]: invalid }));
+      return;
+    }
+    setErrors((current) => without(current, key));
+    await apply(key, next);
+    // Applied or reverted: the field shows the persisted value again.
+    setDrafts((current) => without(current, key));
+  }
+
+  const busy = saving !== null;
+  const healthy =
+    status !== null && status.loaded && status.matchesConfiguration;
+
   return (
-    <Card role="region" aria-labelledby="scheduler-settings">
-      <CardHeader>
-        <CardTitle>
-          <h2 id="scheduler-settings">Pianificazione locale</h2>
-        </CardTitle>
-        <CardDescription>
-          Lavora anche con la finestra chiusa, durante la fascia scelta e con il
-          Mac acceso e l'utente connesso.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-5">
-        {error && (
+    <SettingsSection
+      id="scheduler-settings"
+      title="Automazione"
+      description="Analisi programmata nella fascia scelta, anche a finestra chiusa, con il Mac acceso e l'utente connesso."
+      actions={
+        status && (
+          <>
+            {status.schedule.enabled && (
+              <Badge variant={healthy ? "success" : "destructive"}>
+                {healthy ? "Pronta" : "Da riparare"}
+              </Badge>
+            )}
+            {status.workerRunning && (
+              <Badge variant="secondary">Analisi in corso</Badge>
+            )}
+            {status.recording && (
+              <Badge variant="secondary">Dettatura prioritaria attiva</Badge>
+            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Aggiorna stato pianificazione"
+              disabled={busy || loading}
+              onClick={() => setRefresh((value) => value + 1)}
+            >
+              {loading ? <Spinner /> : <RefreshCw />}
+            </Button>
+          </>
+        )
+      }
+    >
+      {!status ? (
+        loadError ? (
           <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-        {!status || !draft ? (
-          error ? (
-            <Button variant="outline" onClick={() => setRefresh((v) => v + 1)}>
+            <AlertTitle>Pianificazione non disponibile</AlertTitle>
+            <AlertDescription>{loadError}</AlertDescription>
+            <Button
+              className="col-start-2 mt-2 justify-self-start"
+              variant="outline"
+              size="sm"
+              disabled={loading}
+              onClick={() => setRefresh((value) => value + 1)}
+            >
               Riprova pianificazione
             </Button>
-          ) : (
-            <Skeleton className="h-40" />
-          )
+          </Alert>
         ) : (
-          <>
-            <div className="flex flex-wrap gap-2">
-              <Badge variant={status.schedule.enabled ? "default" : "outline"}>
+          <Skeleton className="h-40" />
+        )
+      ) : (
+        <>
+          {status.lastError && (
+            <Alert variant="destructive">
+              <AlertTitle>
                 {status.schedule.enabled
-                  ? "Pianificazione richiesta"
-                  : "Pianificazione disattivata"}
-              </Badge>
-              <Badge variant="secondary">
-                {status.loaded
-                  ? "Job caricato in macOS"
-                  : "Job non rilevato in macOS"}
-              </Badge>
-              <Badge variant="outline">
-                {status.workerRunning ? "Worker in esecuzione" : "Worker fermo"}
-              </Badge>
-            </div>
-            {status.lastError && (
-              <Alert variant="destructive">
-                <AlertDescription>{status.lastError}</AlertDescription>
-              </Alert>
-            )}
-            {status.schedule.enabled &&
-              (!status.loaded || !status.matchesConfiguration) && (
-                <Alert>
-                  <AlertDescription>
-                    La configurazione richiesta non coincide con il job
-                    installato. Usa Ripara pianificazione.
-                  </AlertDescription>
-                </Alert>
-              )}
-            {!status.helperAvailable && (
-              <Alert>
-                <AlertDescription>
-                  Helper non disponibile. Apri una build firmata completa di
-                  VoiceFlow per installare il job.
-                </AlertDescription>
-              </Alert>
-            )}
-            <form
-              className="flex flex-col gap-5"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void save(draft);
-              }}
+                  ? "Pianificazione non applicata"
+                  : "Rimozione non completata"}
+              </AlertTitle>
+              <AlertDescription>{status.lastError}</AlertDescription>
+              <Button
+                className="col-start-2 mt-2 justify-self-start"
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() => void apply("repair", status.schedule)}
+              >
+                {saving === "repair" && <Spinner data-icon="inline-start" />}
+                {status.schedule.enabled
+                  ? "Ripara pianificazione"
+                  : "Riprova disattivazione"}
+              </Button>
+            </Alert>
+          )}
+          {status.schedule.enabled && !healthy && !status.lastError && (
+            <Alert>
+              <AlertTitle>L'analisi programmata non è pronta</AlertTitle>
+              <AlertDescription>
+                La programmazione di macOS non corrisponde alla preferenza
+                salvata.
+              </AlertDescription>
+              <Button
+                className="col-start-2 mt-2 justify-self-start"
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() => void apply("repair", status.schedule)}
+              >
+                {saving === "repair" && <Spinner data-icon="inline-start" />}
+                Ripara pianificazione
+              </Button>
+            </Alert>
+          )}
+          {!status.helperAvailable && (
+            <Alert>
+              <AlertTitle>Componente di analisi non disponibile</AlertTitle>
+              <AlertDescription>
+                Apri una versione completa e firmata di VoiceFlow per attivare
+                la pianificazione.
+              </AlertDescription>
+            </Alert>
+          )}
+          <SettingsGroup>
+            <SettingsRow
+              htmlFor="scheduler-consent"
+              label="Analisi programmata"
+              description="Usa il consenso OpenAI e l'approvazione automatica impostati in Analisi."
+              disabled={busy || !status.helperAvailable}
+              saving={saving === "enabled"}
             >
-              <FieldGroup>
-                <Field orientation="horizontal">
-                  <Checkbox
-                    id="scheduler-consent"
-                    checked={draft.enabled}
-                    disabled={busy || !status.helperAvailable}
-                    onCheckedChange={(checked) =>
-                      setDraft({ ...draft, enabled: checked === true })
-                    }
-                  />
-                  <div className="flex flex-col gap-2">
-                    <FieldLabel htmlFor="scheduler-consent">
-                      Attiva il LaunchAgent per l'analisi pianificata
-                    </FieldLabel>
-                    <FieldDescription>
-                      Richiede anche il consenso OpenAI salvato sopra. Le
-                      proposte restano da approvare nei Suggerimenti.
-                    </FieldDescription>
-                  </div>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="scheduler-start">
-                    Inizio fascia locale
-                  </FieldLabel>
-                  <Input
-                    id="scheduler-start"
-                    type="time"
-                    required
-                    disabled={busy}
-                    value={timeValue(draft.startMinute)}
-                    onChange={(e) =>
-                      setDraft({
-                        ...draft,
-                        startMinute: minuteValue(e.target.value),
-                      })
-                    }
-                  />
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="scheduler-end">
-                    Fine fascia locale
-                  </FieldLabel>
-                  <Input
-                    id="scheduler-end"
-                    type="time"
-                    required
-                    disabled={busy}
-                    value={timeValue(draft.endMinute)}
-                    onChange={(e) =>
-                      setDraft({
-                        ...draft,
-                        endMinute: minuteValue(e.target.value),
-                      })
-                    }
-                  />
-                </Field>
-              </FieldGroup>
-              <p className="text-sm text-muted-foreground">
-                Da 1 minuto a 12 ore. Se la fine precede l'inizio, la fascia
-                termina il giorno seguente. Segue il fuso locale del Mac. Un
-                risveglio fuori fascia non avvia analisi; durante la dettatura
-                il lavoro viene interrotto, anche in pausa e finalizzazione.
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <Button disabled={busy} type="submit">
-                  Salva pianificazione
-                </Button>
-                {status.schedule.enabled && (
-                  <>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={busy}
-                      onClick={() => void save(status.schedule)}
-                    >
-                      Ripara pianificazione
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={busy}
-                      onClick={() =>
-                        void save({ ...status.schedule, enabled: false })
-                      }
-                    >
-                      Disattiva pianificazione
-                    </Button>
-                  </>
-                )}
-                <Button
-                  type="button"
-                  variant="ghost"
+              <Checkbox
+                id="scheduler-consent"
+                checked={status.schedule.enabled}
+                disabled={busy || !status.helperAvailable}
+                aria-describedby="scheduler-consent-description"
+                onCheckedChange={(checked) => {
+                  if (checked === true) setConfirm(true);
+                  else
+                    void apply("enabled", {
+                      ...status.schedule,
+                      enabled: false,
+                    });
+                }}
+              />
+            </SettingsRow>
+            {(
+              [
+                ["startMinute", "scheduler-start", "Inizio fascia"],
+                ["endMinute", "scheduler-end", "Fine fascia"],
+              ] as const
+            ).map(([key, id, label]) => (
+              <SettingsRow
+                key={key}
+                htmlFor={id}
+                label={label}
+                description={
+                  key === "endMinute"
+                    ? "Da 1 minuto a 12 ore. Se precede l'inizio, termina il giorno dopo."
+                    : "Ora locale del Mac."
+                }
+                disabled={busy}
+                saving={saving === key}
+                error={errors[key]}
+              >
+                <Input
+                  id={id}
+                  type="time"
+                  required
                   disabled={busy}
-                  onClick={() => setRefresh((v) => v + 1)}
-                >
-                  Aggiorna stato pianificazione
-                </Button>
-              </div>
-            </form>
-            <p className="text-sm text-muted-foreground">
-              {status.recording
-                ? "Dettatura prioritaria attiva."
-                : "Nessuna dettatura rilevata."}{" "}
-              {status.phase === "interrupted"
-                ? "Ultimo worker interrotto; recupero dei checkpoint al prossimo avvio consentito."
-                : status.phase === "deferred"
-                  ? "Analisi rinviata dopo un errore."
-                  : ""}{" "}
-              Tentativi falliti o interrotti oggi UTC: {status.retryCount}.
-              Massimo 3 al giorno, attesa di almeno 5 minuti fra retry, entro i
-              limiti dell'analisi.
-            </p>
-            {status.nextAttempt > 0 && (
-              <p className="text-sm text-muted-foreground">
-                Nuovo tentativo non prima del{" "}
-                {new Date(status.nextAttempt).toLocaleString("it-IT")}, sempre
-                entro la fascia scelta e i limiti disponibili.
+                  aria-invalid={errors[key] ? true : undefined}
+                  aria-describedby={
+                    errors[key]
+                      ? `${id}-description ${id}-error`
+                      : `${id}-description`
+                  }
+                  value={drafts[key] ?? timeValue(status.schedule[key])}
+                  onChange={(event) => {
+                    const text = event.target.value;
+                    setDrafts((current) => ({ ...current, [key]: text }));
+                  }}
+                  onBlur={() => void commitTime(key)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void commitTime(key);
+                    }
+                    if (event.key === "Escape") {
+                      setDrafts((current) => without(current, key));
+                      setErrors((current) => without(current, key));
+                    }
+                  }}
+                />
+              </SettingsRow>
+            ))}
+          </SettingsGroup>
+          <SettingsAdvanced label="Avanzate · Diagnostica automazione">
+            <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+              <p>
+                {status.loaded
+                  ? "Programmazione rilevata in macOS."
+                  : "Programmazione non rilevata in macOS."}
               </p>
-            )}
-            {status.workerRunning && status.leaseUntil > 0 && (
-              <p className="text-sm text-muted-foreground">
-                Scadenza massima del worker:{" "}
-                {new Date(status.leaseUntil).toLocaleString("it-IT")}. Il blocco
-                del processo impedisce sovrapposizioni anche se l'orario risulta
-                scaduto.
+              {status.phase === "interrupted" && (
+                <p>
+                  Ultima analisi interrotta: le fonti in attesa riprendono al
+                  prossimo avvio consentito.
+                </p>
+              )}
+              {status.phase === "deferred" && (
+                <p>Analisi rinviata dopo un errore.</p>
+              )}
+              <p>
+                Tentativi falliti o interrotti oggi (UTC): {status.retryCount}{" "}
+                su 3, a distanza di almeno 5 minuti.
               </p>
-            )}
-            <p className="text-sm text-muted-foreground">
-              L'interruzione dei processi locali non annulla una richiesta già
-              accettata da OpenAI e non garantisce l'annullamento del costo.
-            </p>
-          </>
-        )}
-      </CardContent>
-    </Card>
+              {status.nextAttempt > 0 && (
+                <p>
+                  Prossimo tentativo non prima del{" "}
+                  {new Date(status.nextAttempt).toLocaleString("it-IT")}.
+                </p>
+              )}
+              {status.workerRunning && status.leaseUntil > 0 && (
+                <p>
+                  Scadenza massima dell'analisi:{" "}
+                  {new Date(status.leaseUntil).toLocaleString("it-IT")}.
+                </p>
+              )}
+              <p>
+                La dettatura interrompe l'analisi. Interrompere i processi
+                locali non annulla una richiesta già accettata da OpenAI né il
+                suo costo.
+              </p>
+            </div>
+          </SettingsAdvanced>
+          <ConfirmSettingDialog
+            open={confirm}
+            title="Attivare l'analisi programmata?"
+            description={`VoiceFlow avvierà l'analisi ogni giorno tra le ${timeValue(status.schedule.startMinute)} e le ${timeValue(status.schedule.endMinute)}, anche a finestra chiusa.`}
+            details={
+              <>
+                <p>
+                  Invia a OpenAI solo se il consenso in Analisi è attivo e
+                  applica la stessa approvazione automatica delle regole.
+                </p>
+                <p>
+                  Ogni richiesta rientra nei limiti giornalieri dell'analisi e
+                  può avere un costo.
+                </p>
+              </>
+            }
+            confirmLabel="Attiva"
+            onClose={() => setConfirm(false)}
+            onConfirm={() =>
+              void apply("enabled", { ...status.schedule, enabled: true })
+            }
+          />
+        </>
+      )}
+    </SettingsSection>
   );
 }

@@ -13,6 +13,9 @@ use voiceflow_core::{
     formatting::{FormatMode, TextProcessor},
 };
 
+pub mod replay;
+pub mod spellings;
+
 #[derive(Clone)]
 pub struct SuggestionStore {
     history: HistoryStore,
@@ -69,10 +72,65 @@ impl std::fmt::Display for CandidateRejection {
     }
 }
 impl std::error::Error for CandidateRejection {}
+/// Validation failure with a stable machine code. The code is ours: it never carries
+/// provider or source text, so it can be stored and shown after the sources are gone.
+#[derive(Debug)]
+pub(crate) struct Coded {
+    pub code: &'static str,
+    message: String,
+}
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for Coded {}
+pub(crate) fn coded(code: &'static str, message: impl Into<String>) -> Coded {
+    debug_assert!(
+        crate::analysis::rejections::hint(code).is_some(),
+        "codice di rifiuto senza descrizione: {code}"
+    );
+    Coded {
+        code,
+        message: message.into(),
+    }
+}
+fn reject(code: &'static str, message: &str) -> CandidateRejection {
+    CandidateRejection(anyhow::Error::new(coded(code, message)))
+}
+/// Give an uncoded failure (compiler, parser) a code without changing its message.
+fn recode(code: &'static str) -> impl Fn(anyhow::Error) -> anyhow::Error {
+    move |error| {
+        if error.is::<Coded>() || error.is::<CandidateRejection>() {
+            error
+        } else {
+            anyhow::Error::new(coded(code, format!("{error:#}")))
+        }
+    }
+}
+pub(crate) fn rejection_code(error: &anyhow::Error) -> &'static str {
+    if let Some(coded) = error.downcast_ref::<Coded>() {
+        coded.code
+    } else if let Some(rejection) = error.downcast_ref::<CandidateRejection>() {
+        rejection_code(&rejection.0)
+    } else {
+        "rule-invalid"
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IngestFailure {
-    InvalidCandidate,
+    /// Stable rejection code, see `analysis::rejections`.
+    InvalidCandidate(&'static str),
     Infrastructure,
+}
+impl IngestFailure {
+    fn classify(error: anyhow::Error) -> Self {
+        if error.is::<CandidateRejection>() {
+            Self::InvalidCandidate(rejection_code(&error))
+        } else {
+            Self::Infrastructure
+        }
+    }
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,6 +246,7 @@ pub(crate) fn migrate(connection: &Connection) -> Result<()> {
     connection.prepare("SELECT s.id,s.identity,s.candidate_json,s.revision,s.state,s.rejection_reason,s.approved_at,e.session_id,e.revision_id,e.original_index,e.evidence_key FROM suggestions s LEFT JOIN suggestion_evidence e ON e.proposal_id=s.id LIMIT 0")?;
     connection.prepare("SELECT version,previous_version,action,created_at,rules_json,dictionary_version,builtin_version FROM suggestion_publications LIMIT 0")?;
     connection.execute_batch("CREATE INDEX IF NOT EXISTS suggestion_evidence_session ON suggestion_evidence(session_id);")?;
+    replay::migrate(connection)?;
     let builtin = CompiledCatalog::builtin();
     connection.execute(
         "INSERT OR IGNORE INTO suggestion_catalogs VALUES(?1,?2)",
@@ -280,6 +339,46 @@ fn cleanup_rule(id: i64, candidate: &Candidate) -> Option<CleanupRule> {
         None
     }
 }
+
+/// Evaluate the declared rule on its cited excerpt. The result is computed by
+/// the same processor as live dictation, rather than inferred from an example.
+pub(crate) fn render_candidate_excerpt(candidate: &Candidate, text: &str) -> Result<String> {
+    let (before, after) = match &candidate.definition {
+        Definition::Terminology { context, .. } => {
+            (context.before.as_deref(), context.after.as_deref())
+        }
+        Definition::Cleanup { context, .. } => {
+            (context.before.as_deref(), context.after.as_deref())
+        }
+    };
+    let prefix = before.map(|word| format!("{word} ")).unwrap_or_default();
+    let suffix = after.map(|word| format!(" {word}")).unwrap_or_default();
+    let dictionary =
+        Dictionary::compile(dictionary_rules(1, candidate)).map_err(recode("rule-invalid"))?;
+    let catalog = CompiledCatalog::compile(
+        Catalog {
+            schema_version: 1,
+            version: "analysis-excerpt-v1".into(),
+            rules: cleanup_rule(1, candidate).into_iter().collect(),
+        },
+        "auto",
+    )
+    .map_err(recode("rule-invalid"))?;
+    let mut processor = TextProcessor::with_rules(FormatMode::Faithful, true, dictionary, catalog);
+    processor.update(&format!("{prefix}{text}{suffix}"), true)?;
+    processor
+        .parts()
+        .0
+        .strip_prefix(&prefix)
+        .and_then(|text| text.strip_suffix(&suffix))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::Error::new(coded(
+                "rule-changes-context",
+                "La regola modifica il contesto esterno all'estratto",
+            ))
+        })
+}
 fn dictionary_rules(id: i64, candidate: &Candidate) -> Vec<DictionaryRule> {
     if let Definition::Terminology {
         preferred,
@@ -305,10 +404,10 @@ fn dictionary_rules(id: i64, candidate: &Candidate) -> Vec<DictionaryRule> {
     }
 }
 fn validate(candidate: &Candidate, dictionary: &DictionarySnapshot) -> Result<()> {
-    text(&candidate.reason, 2000)?;
+    text(&candidate.reason, 2000).map_err(recode("reason-text"))?;
     ensure!(
         ["*", "it", "en"].contains(&candidate.language.as_str()),
-        "Lingua non valida."
+        coded("language", "Lingua non valida.")
     );
     ensure!(
         candidate.group_ids.len() <= 32
@@ -316,19 +415,22 @@ fn validate(candidate: &Candidate, dictionary: &DictionarySnapshot) -> Result<()
                 .group_ids
                 .iter()
                 .all(|id| dictionary.groups.iter().any(|g| g.id == *id)),
-        "Gruppi non più disponibili."
+        coded("groups", "Gruppi non più disponibili.")
     );
     for examples in [&candidate.positive_examples, &candidate.negative_examples] {
         ensure!(
             !examples.is_empty() && examples.len() <= 16,
-            "Servono da 1 a 16 esempi positivi e di controllo."
+            coded(
+                "examples-count",
+                "Servono da 1 a 16 esempi positivi e di controllo."
+            )
         );
         for e in examples {
-            text(&e.input, 2048)?;
-            text(&e.output, 2048)?;
+            text(&e.input, 2048).map_err(recode("example-text"))?;
+            text(&e.output, 2048).map_err(recode("example-text"))?;
             ensure!(
                 !e.input.contains(['<', '>']) && !e.output.contains(['<', '>']),
-                "Marcatori non ammessi negli esempi."
+                coded("example-markers", "Marcatori non ammessi negli esempi.")
             );
         }
     }
@@ -337,21 +439,28 @@ fn validate(candidate: &Candidate, dictionary: &DictionarySnapshot) -> Result<()
             .negative_examples
             .iter()
             .all(|e| e.input == e.output),
-        "Le frasi di controllo devono restare invariate."
+        coded(
+            "negative-example-changed",
+            "Le frasi di controllo devono restare invariate."
+        )
     );
     ensure!(
         candidate
             .positive_examples
             .iter()
             .all(|e| e.input != e.output),
-        "Gli esempi positivi devono mostrare una modifica."
+        coded(
+            "positive-example-unchanged",
+            "Gli esempi positivi devono mostrare una modifica."
+        )
     );
     if let Definition::Terminology { variants, .. } = &candidate.definition {
         ensure!(
             !variants.is_empty() && variants.len() <= 32,
-            "Servono da 1 a 32 varianti esplicite."
+            coded("variants-count", "Servono da 1 a 32 varianti esplicite.")
         );
-        let d = Dictionary::compile(dictionary_rules(1, candidate))?;
+        let d =
+            Dictionary::compile(dictionary_rules(1, candidate)).map_err(recode("rule-invalid"))?;
         let c = CompiledCatalog::compile(
             Catalog {
                 schema_version: 1,
@@ -377,7 +486,8 @@ fn validate(candidate: &Candidate, dictionary: &DictionarySnapshot) -> Result<()
                 rules: vec![cleanup_rule(1, candidate).unwrap()],
             },
             &candidate.language.replace('*', "it"),
-        )?;
+        )
+        .map_err(recode("rule-invalid"))?;
     }
     Ok(())
 }
@@ -399,10 +509,13 @@ fn check_examples<'a>(
         let output = format!("{confirmed}{partial}");
         ensure!(
             output == e.output,
-            "Conflitto sull'esempio «{}»: atteso «{}», ottenuto «{}».",
-            e.input,
-            e.output,
-            output
+            coded(
+                "example-mismatch",
+                format!(
+                    "Conflitto sull'esempio «{}»: atteso «{}», ottenuto «{}».",
+                    e.input, e.output, output
+                )
+            )
         );
     }
     Ok(())
@@ -426,6 +539,14 @@ fn rules_at(connection: &Connection, version: i64) -> Result<Vec<ApprovedRule>> 
         )
         .context("Versione non disponibile.")?;
     Ok(serde_json::from_str(&json)?)
+}
+// Read-only projection used by analysis history, with the same publication
+// semantics as the current suggestions snapshot.
+pub(crate) fn active_proposal_ids(connection: &Connection) -> Result<Vec<i64>> {
+    Ok(rules_at(connection, current(connection)?)?
+        .into_iter()
+        .map(|rule| rule.id)
+        .collect())
 }
 fn compile(
     dictionary: &DictionarySnapshot,
@@ -463,7 +584,7 @@ fn compile_with_baseline(
         {
             continue;
         }
-        if c.language == "*" || c.language == language {
+        if language == "auto" || c.language == "*" || c.language == language {
             ds.extend(dictionary_rules(rule.id, c));
         }
         if let Some(c) = cleanup_rule(rule.id, c) {
@@ -479,6 +600,30 @@ fn validate_combination(dictionary: &DictionarySnapshot, rules: &[ApprovedRule])
     for rule in rules {
         validate(&rule.candidate, dictionary)?;
     }
+    match combination_failures(dictionary, rules)?.into_iter().next() {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+/// Every expectation the combined dictionary, rules and builtins fail to meet, in a stable
+/// order. An error is reserved for a set that does not compile at all.
+/// A caller that adds one thing to an already published set compares the two lists, so an
+/// older inconsistency is not blamed on the newcomer.
+fn combination_failures(
+    dictionary: &DictionarySnapshot,
+    rules: &[ApprovedRule],
+) -> Result<Vec<anyhow::Error>> {
+    let mut failures = vec![];
+    let mut expect = |examples: &mut dyn Iterator<Item = &Example>,
+                      compiled: &Dictionary,
+                      catalog: &CompiledCatalog| {
+        for example in examples {
+            if let Err(failure) = check_examples(std::iter::once(example), compiled, catalog, true)
+            {
+                failures.push(failure);
+            }
+        }
+    };
     // Test all-groups and each individual group scope. No hidden automatic context selection.
     let mut scopes = vec![
         vec![],
@@ -491,35 +636,35 @@ fn validate_combination(dictionary: &DictionarySnapshot, rules: &[ApprovedRule])
         d.selected_group_ids = groups;
         for language in ["it", "en", "auto"] {
             let (compiled, catalog) = compile(&d, rules, 1, language)?;
-            ensure!(
-                compiled.conflicts().is_empty(),
-                "Conflitto tra varianti del dizionario e regole proposte: {:?}.",
-                compiled.conflicts()
-            );
+            if !compiled.conflicts().is_empty() {
+                // Nothing else is meaningful while two variants compete.
+                return Ok(vec![anyhow::anyhow!(
+                    "Conflitto tra varianti del dizionario e regole proposte: {:?}.",
+                    compiled.conflicts()
+                )]);
+            }
             for rule in rules {
                 let c = &rule.candidate;
-                if (c.language == "*" || c.language == language)
+                if (language == "auto" || c.language == "*" || c.language == language)
                     && (c.group_ids.is_empty()
                         || c.group_ids
                             .iter()
                             .any(|id| d.selected_group_ids.contains(id)))
                 {
-                    check_examples(
-                        c.positive_examples.iter().chain(&c.negative_examples),
+                    expect(
+                        &mut c.positive_examples.iter().chain(&c.negative_examples),
                         &compiled,
                         &catalog,
-                        true,
-                    )?;
+                    );
                 }
             }
             for rule in &catalog.definition().rules {
-                if rule.language == "*" || rule.language == language {
-                    check_examples(
-                        rule.positive_examples.iter().chain(&rule.negative_examples),
+                if language == "auto" || rule.language == "*" || rule.language == language {
+                    expect(
+                        &mut rule.positive_examples.iter().chain(&rule.negative_examples),
                         &compiled,
                         &catalog,
-                        true,
-                    )?;
+                    );
                 }
             }
             // Manual dictionary rules also keep their own expected behavior through cleanup/commands.
@@ -542,15 +687,14 @@ fn validate_combination(dictionary: &DictionarySnapshot, rules: &[ApprovedRule])
                 .flatten()
                 .collect::<Vec<_>>()
                 .join(" ");
-                check_examples(
-                    std::iter::once(&Example {
+                expect(
+                    &mut std::iter::once(&Example {
                         input,
                         output: expected,
                     }),
                     &compiled,
                     &catalog,
-                    true,
-                )?;
+                );
             }
             for input in [
                 "non va bene",
@@ -561,25 +705,24 @@ fn validate_combination(dictionary: &DictionarySnapshot, rules: &[ApprovedRule])
                 "do not remove 123",
                 "very very important",
             ] {
-                check_examples(
-                    std::iter::once(&Example {
+                expect(
+                    &mut std::iter::once(&Example {
                         input: input.into(),
                         output: input.into(),
                     }),
                     &compiled,
                     &catalog,
-                    true,
-                )?;
+                );
             }
         }
     }
-    Ok(())
+    Ok(failures)
 }
 pub(crate) fn evidence(connection: &Connection, reference: EvidenceRef) -> Result<Evidence> {
     ensure!(
         reference.session_id > 0
             && !(reference.revision_id.is_some() && reference.original_index.is_some()),
-        CandidateRejection(anyhow::anyhow!("Riferimento evidenza non valido."))
+        reject("evidence-reference", "Riferimento evidenza non valido.")
     );
     let (produced, raw): (String, Option<String>) = connection
         .query_row(
@@ -589,22 +732,21 @@ pub(crate) fn evidence(connection: &Connection, reference: EvidenceRef) -> Resul
         )
         .optional()?
         .ok_or_else(|| {
-            CandidateRejection(anyhow::anyhow!(
-                "Sessione sorgente eliminata o inesistente."
-            ))
+            reject(
+                "session-missing",
+                "Sessione sorgente eliminata o inesistente.",
+            )
         })?;
     let (before, after, human_confirmed) = if let Some(id) = reference.revision_id {
-        connection.query_row("SELECT r.before_text,r.text,EXISTS(SELECT 1 FROM confirmed_corrections c WHERE c.revision_id=r.id) AND r.reverted=0 FROM history_revisions r WHERE r.id=?1 AND r.transcription_id=?2", params![id,reference.session_id], |r|Ok((r.get(0)?,Some(r.get(1)?),r.get(2)?))).optional()?.ok_or_else(|| CandidateRejection(anyhow::anyhow!("Revisione non appartenente alla sessione.")))?
+        connection.query_row("SELECT r.before_text,r.text,EXISTS(SELECT 1 FROM confirmed_corrections c WHERE c.revision_id=r.id) AND r.reverted=0 FROM history_revisions r WHERE r.id=?1 AND r.transcription_id=?2", params![id,reference.session_id], |r|Ok((r.get(0)?,Some(r.get(1)?),r.get(2)?))).optional()?.ok_or_else(|| reject("revision-foreign","Revisione non appartenente alla sessione."))?
     } else if let Some(index) = reference.original_index {
-        let parts: Vec<String> = serde_json::from_str(&raw.ok_or_else(|| {
-            CandidateRejection(anyhow::anyhow!("Originale ASR non disponibile."))
-        })?)?;
+        let parts: Vec<String> = serde_json::from_str(
+            &raw.ok_or_else(|| reject("asr-unavailable", "Originale ASR non disponibile."))?,
+        )?;
         (
             parts
                 .get(index as usize)
-                .ok_or_else(|| {
-                    CandidateRejection(anyhow::anyhow!("Segmento originale inesistente."))
-                })?
+                .ok_or_else(|| reject("segment-missing", "Segmento originale inesistente."))?
                 .clone(),
             None,
             false,
@@ -638,7 +780,10 @@ fn validate_evidence(candidate: &Candidate, e: &Evidence) -> Result<()> {
     if e.reference.revision_id.is_some() {
         ensure!(
             e.human_confirmed,
-            "La revisione deve essere ricordata e non annullata."
+            coded(
+                "revision-not-confirmed",
+                "La revisione deve essere ricordata e non annullata."
+            )
         );
     }
     ensure!(
@@ -649,7 +794,10 @@ fn validate_evidence(candidate: &Candidate, e: &Evidence) -> Result<()> {
                 && e.after
                     .as_ref()
                     .is_none_or(|after| contains_example(after, &example.output))),
-        "L'evidenza non contiene alcun esempio positivo proposto."
+        coded(
+            "evidence-lacks-example",
+            "L'evidenza non contiene alcun esempio positivo proposto."
+        )
     );
     Ok(())
 }
@@ -695,13 +843,7 @@ impl SuggestionStore {
         attempt_id: i64,
     ) -> std::result::Result<(), IngestFailure> {
         self.ingest_scoped(request, Some((batch_id, attempt_id)), None, &|| false)
-            .map_err(|error| {
-                if error.is::<CandidateRejection>() {
-                    IngestFailure::InvalidCandidate
-                } else {
-                    IngestFailure::Infrastructure
-                }
-            })
+            .map_err(IngestFailure::classify)
     }
     pub(crate) fn ingest_finding(
         &self,
@@ -732,13 +874,7 @@ impl SuggestionStore {
                 tx.commit()?; Ok(())
             })
         };
-        result.map_err(|error| {
-            if error.is::<CandidateRejection>() {
-                IngestFailure::InvalidCandidate
-            } else {
-                IngestFailure::Infrastructure
-            }
-        })
+        result.map_err(IngestFailure::classify)
     }
     fn ingest_scoped(
         &self,
@@ -749,7 +885,7 @@ impl SuggestionStore {
     ) -> Result<()> {
         ensure!(
             !request.evidence.is_empty() && request.evidence.len() <= 64,
-            CandidateRejection(anyhow::anyhow!("Servono da 1 a 64 riferimenti reali."))
+            reject("evidence-count", "Servono da 1 a 64 riferimenti reali.")
         );
         let candidate = normalize(request.candidate);
         self.access(|connection| {
@@ -763,6 +899,13 @@ impl SuggestionStore {
             }
             validate(&candidate,&dictionary).map_err(CandidateRejection)?;
             for reference in &request.evidence { validate_evidence(&candidate,&evidence(&tx,reference.clone())?).map_err(CandidateRejection)?; }
+            // These validated repetitions are already handled for every new dictation.
+            // Consume the analysis result without creating another review card or rule.
+            if finding.is_some() && handled_by_local_cleanup(&candidate)? {
+                ensure!(!cancel.cancelled(), "Analisi annullata.");
+                tx.commit()?;
+                return Ok(());
+            }
             let identity = canonical(&candidate)?;
             let existing: Option<(i64,String)> = tx.query_row("SELECT id,candidate_json FROM suggestions WHERE identity=?1",[&identity],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let created = existing.is_none();
@@ -825,6 +968,7 @@ impl SuggestionStore {
         }
         // Processor validation happens outside write locks. The publication transaction
         // rechecks both versions and the proposal revision before any mutation.
+        let mut replayed = None;
         let prepared = self.access(|connection| {
             let tx = connection.transaction()?;
             let duplicate: bool = tx.query_row(
@@ -855,10 +999,14 @@ impl SuggestionStore {
                         request.expected_revision == Some(revision),
                         "Proposta aggiornata. Rileggi prima di confermare."
                     );
-                    active.push(ApprovedRule {
+                    let rule = ApprovedRule {
                         id,
                         candidate: serde_json::from_str(&json)?,
-                    });
+                    };
+                    // Every publication is replayed first. A manual approval may still
+                    // publish a rule that changes nothing; the count is kept with it.
+                    replayed = replay::changed_by(&tx, &dictionary, &active, &rule).ok();
+                    active.push(rule);
                 }
                 ReviewAction::Disable => active.retain(|r| Some(r.id) != request.id),
                 ReviewAction::Restore { version } => active = rules_at(&tx, *version)?,
@@ -921,6 +1069,7 @@ impl SuggestionStore {
                 ensure!(prepared.is_some(),"Validazione della pubblicazione mancante.");
                 tx.execute("INSERT INTO suggestion_publications(previous_version,action,created_at,rules_json,dictionary_version,builtin_version) VALUES(?1,?2,?3,?4,?5,?6)",params![version,action,now()?,serde_json::to_string(&active)?,dictionary.version,voiceflow_core::cleanup::BUILTIN_VERSION])?;
                 let next=tx.last_insert_rowid();tx.execute("UPDATE suggestion_state SET version=?1 WHERE id=1",[next])?;
+                if let (Some(id),Some(counts),ReviewAction::Approve)=(request.id,replayed,&request.action) { replay::record(&tx,next,id,counts)?; }
                 // Invalidate stale cards after rollback as well as direct mutations.
                 tx.execute("UPDATE suggestions SET revision=revision+1 WHERE approved_at IS NOT NULL",[])?;
             }
@@ -1090,9 +1239,19 @@ fn auto_publish(
             return Ok(("blocked-evidence", None));
         }
     }
-    active.push(ApprovedRule { id, candidate });
+    let rule = ApprovedRule { id, candidate };
+    let published = active.clone();
+    active.push(rule.clone());
     if validate_combination(dictionary, &active).is_err() {
         return Ok(("blocked-conflict", None));
+    }
+    // A conflict is reported as such above. A valid rule that would not have changed a
+    // single saved dictation is left to a person.
+    let Ok(replayed) = replay::changed_by(c, dictionary, &published, &rule) else {
+        return Ok(("blocked-conflict", None));
+    };
+    if replayed.0 == 0 {
+        return Ok(("manual-no-effect", None));
     }
     // Recheck within the publication transaction, after expensive compiler validation.
     crate::analysis::validate_scope(c, batch, &finding.evidence)?;
@@ -1104,6 +1263,7 @@ fn auto_publish(
     c.execute("INSERT INTO suggestion_publications(previous_version,action,created_at,rules_json,dictionary_version,builtin_version) VALUES(?1,?2,?3,?4,?5,?6)",params![version,format!("auto-approve:{id}"),now()?,serde_json::to_string(&active)?,dictionary.version,voiceflow_core::cleanup::BUILTIN_VERSION])?;
     let next = c.last_insert_rowid();
     c.execute("UPDATE suggestion_state SET version=?1 WHERE id=1", [next])?;
+    replay::record(c, next, id, replayed)?;
     c.execute(
         "UPDATE suggestions SET state='approved',approved_at=?1,rejection_reason=NULL WHERE id=?2",
         params![now()?, id],
@@ -1175,6 +1335,16 @@ fn read_snapshot(
             "SELECT confidence,outcome FROM analysis_findings WHERE proposal_id=?1 AND candidate_hash=?2 ORDER BY id DESC LIMIT 1",
             params![id,candidate_hash(&candidate)?], |r| Ok((r.get(0)?,r.get(1)?))
         ).optional()?;
+        if state == "proposed" && scored.is_some() && handled_by_local_cleanup(&candidate)? {
+            let veto: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM suggestion_human_veto WHERE identity=?1)",
+                [identity_hash(&canonical(&candidate)?)],
+                |r| r.get(0),
+            )?;
+            if !veto {
+                continue;
+            }
+        }
         proposals.push(Proposal {
             id,
             revision,
@@ -1197,6 +1367,30 @@ fn read_snapshot(
         dictionary_version: dictionary.version,
         groups: dictionary.groups.clone(),
     })
+}
+
+fn handled_by_local_cleanup(candidate: &Candidate) -> Result<bool> {
+    if !matches!(
+        &candidate.definition,
+        Definition::Cleanup {
+            operation: Operation::Repeat { .. } | Operation::RepeatPhrase { .. },
+            ..
+        }
+    ) {
+        return Ok(false);
+    }
+    for example in candidate
+        .positive_examples
+        .iter()
+        .chain(&candidate.negative_examples)
+    {
+        let mut processor = TextProcessor::new(FormatMode::Faithful, true);
+        processor.update(&example.input, true)?;
+        if processor.parts().0 != example.output {
+            return Ok(false);
+        }
+    }
+    Ok(!candidate.positive_examples.is_empty())
 }
 #[tauri::command]
 pub async fn suggestions_snapshot(
@@ -2235,6 +2429,165 @@ mod tests {
                 )?))
                 .unwrap(),
             text
+        );
+    }
+
+    #[test]
+    fn replay_counts_changed_sessions_for_published_and_proposed_rules() {
+        let f = Fixture::new();
+        let first = f.record("one", "apri voice flow e poi di nuovo voice flow adesso");
+        f.record("two", "volevo vorrei chiedere di voice flower");
+        f.record("three", "uso voice flow");
+        f.record("four", "niente da cambiare");
+        // No saved original: never replayed, never counted.
+        f.store
+            .history
+            .record(&CompletedDictation {
+                session_key: "legacy",
+                created_at: 10,
+                text: "voice flow",
+                duration_seconds: 1.,
+                language: "it",
+                original_asr: None,
+                processing: None,
+            })
+            .unwrap();
+        let s = f.ingest(first, terminology());
+        let term = s.proposals[0].id;
+        let s = f.ingest(first + 1, cleanup());
+        let clean = s.proposals[0].id;
+        let report = f.store.replay().unwrap();
+        assert_eq!((report.sessions, report.version), (4, 0));
+        let rule = |report: &replay::ReplayReport, id: i64| {
+            let r = report.rules.iter().find(|r| r.proposal_id == id).unwrap();
+            (r.active, r.changed_sessions, r.excerpts.len())
+        };
+        assert_eq!(rule(&report, term), (false, Some(2), 2));
+        assert_eq!(rule(&report, clean), (false, Some(1), 1));
+        let excerpt = &report
+            .rules
+            .iter()
+            .find(|r| r.proposal_id == clean)
+            .unwrap()
+            .excerpts[0];
+        assert_eq!(
+            (
+                excerpt.session_id,
+                excerpt.before.as_str(),
+                excerpt.after.as_str()
+            ),
+            (
+                first + 1,
+                "volevo vorrei chiedere di voice flower",
+                "vorrei chiedere di voice flower"
+            )
+        );
+        assert!(
+            report
+                .rules
+                .iter()
+                .all(|r| r.at_publication.is_none() && r.usage.is_none())
+        );
+        // Publishing replays first and keeps the count with the publication.
+        let s = f
+            .act(&s, Some(term), ReviewAction::Approve, "approve")
+            .unwrap();
+        let report = f.store.replay().unwrap();
+        assert_eq!(rule(&report, term), (true, Some(2), 2));
+        // The other rule is now measured on top of the published one: same effect.
+        assert_eq!(rule(&report, clean), (false, Some(1), 1));
+        let published = report.rules.iter().find(|r| r.proposal_id == term).unwrap();
+        assert_eq!(
+            published.at_publication,
+            Some(replay::PublicationReplay {
+                publication: s.version,
+                changed_sessions: 2,
+                sessions: 4
+            })
+        );
+        let text = serde_json::to_string(&report).unwrap();
+        assert!(text.contains("VoiceFlow e poi di nuovo VoiceFlow"));
+        // Counts only reach the database.
+        f.store
+            .history
+            .access(|c| {
+                let row: (i64, i64, i64, i64) = c.query_row(
+                    "SELECT publication,proposal_id,changed_sessions,sessions FROM suggestion_replays",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                assert_eq!(row, (s.version, term, 2, 4));
+                Ok(())
+            })
+            .unwrap();
+        // A rejected hypothesis is not replayed.
+        let s = f.store.snapshot().unwrap();
+        f.act(
+            &s,
+            Some(clean),
+            ReviewAction::Reject {
+                reason: "no".into(),
+            },
+            "reject",
+        )
+        .unwrap();
+        assert!(
+            f.store
+                .replay()
+                .unwrap()
+                .rules
+                .iter()
+                .all(|r| r.proposal_id != clean)
+        );
+    }
+    #[test]
+    fn rule_activations_are_counted_only_in_sessions_saved_after_approval() {
+        let f = Fixture::new();
+        let id = f.record("one", "voice flow");
+        let s = f.ingest(id, terminology());
+        let term = s.proposals[0].id;
+        f.act(&s, Some(term), ReviewAction::Approve, "approve")
+            .unwrap();
+        let approved_at = f.store.snapshot().unwrap().proposals[0]
+            .approved_at
+            .unwrap();
+        let metadata =
+            crate::service::processing_metadata(&crate::settings::Settings::default()).unwrap();
+        let save = |key: &str, created_at: i64, hits: Option<&[(&str, u32)]>| {
+            let mut metadata = metadata.clone();
+            metadata.rule_hits =
+                hits.map(|hits| hits.iter().map(|(k, n)| ((*k).to_owned(), *n)).collect());
+            f.store
+                .history
+                .record(&CompletedDictation {
+                    session_key: key,
+                    created_at,
+                    text: "testo",
+                    duration_seconds: 1.,
+                    language: "it",
+                    original_asr: Some(&["testo".into()]),
+                    processing: Some(&metadata),
+                })
+                .unwrap();
+        };
+        let key = format!("dictionary:{}", -term);
+        // Before the approval, or without the counter: not part of the denominator.
+        save("early", approved_at - 1, Some(&[(key.as_str(), 9)]));
+        save("untracked", approved_at + 1, None);
+        save(
+            "fired",
+            approved_at + 2,
+            Some(&[(key.as_str(), 3), ("cleanup:builtin", 1)]),
+        );
+        save("quiet", approved_at + 3, Some(&[]));
+        let report = f.store.replay().unwrap();
+        assert_eq!(
+            report.rules[0].usage,
+            Some(replay::RuleUsage {
+                activations: 3,
+                sessions_with_activation: 1,
+                tracked_sessions: 2
+            })
         );
     }
 }

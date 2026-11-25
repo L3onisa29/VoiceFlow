@@ -4,7 +4,7 @@ pub mod invocations;
 mod runtime;
 #[cfg(test)]
 mod tests;
-use crate::analysis::AnalysisStore;
+use crate::analysis::{AnalysisStore, RunOrigin};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Local, Timelike};
 use coordination::Permit;
@@ -92,10 +92,22 @@ impl Store {
             .recursive(true)
             .mode(0o700)
             .create(&self.data)?;
-        let c = Connection::open(self.data.join("analysis-scheduler.sqlite3"))?;
+        let mut c = Connection::open(self.data.join("analysis-scheduler.sqlite3"))?;
         c.busy_timeout(Duration::from_millis(100))?;
         c.execute_batch("CREATE TABLE IF NOT EXISTS scheduler(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT NOT NULL, last_error TEXT, phase TEXT NOT NULL DEFAULT 'idle', lease_until INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, retry_day INTEGER NOT NULL DEFAULT 0);")?;
         c.execute_batch("CREATE TABLE IF NOT EXISTS scheduler_invocations(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at INTEGER NOT NULL,ended_at INTEGER,reason TEXT NOT NULL,batch_id INTEGER);")?;
+        // Serialize additive migration across app and helper processes.
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_origin = tx
+            .prepare("PRAGMA table_info(scheduler_invocations)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|s| s == "origin");
+        if !has_origin {
+            tx.execute_batch("ALTER TABLE scheduler_invocations ADD COLUMN origin TEXT;")?;
+        }
+        tx.commit()?;
         c.execute(
             "INSERT OR IGNORE INTO scheduler(id,config) VALUES(1,?1)",
             [serde_json::to_string(&Schedule::default())?],

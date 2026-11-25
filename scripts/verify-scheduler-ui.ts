@@ -4,8 +4,9 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 const modulePath = process.env.PLAYWRIGHT_MODULE;
-if (!modulePath) throw new Error("Set PLAYWRIGHT_MODULE");
-const { chromium } = await import(pathToFileURL(modulePath).href);
+const { chromium } = await import(
+  modulePath ? pathToFileURL(modulePath).href : "playwright"
+);
 const root = resolve(import.meta.dirname, "..");
 const output = resolve(root, "artifacts/scheduler-d2");
 await mkdir(output, { recursive: true });
@@ -49,7 +50,7 @@ mockIPC(async(cmd,args)=>{
  if(cmd==='dictionary_snapshot')return {terms:[],groups:[],selectedGroupIds:[],version:1,conflicts:[]};
  if(cmd==='history_page')return {entries:[entry],nextCursor:null,stats:{totalWords:3,totalSessions:1,totalSeconds:10,wordsPerMinute:18}};
  if(cmd==='history_detail')return {entry,originalAsr:[entry.text],producedText:entry.text,processing:null,editVersion:0,currentRevision:null,revisions:[]};
- if(cmd==='scheduler_status')return structuredClone(window.scheduler);
+ if(cmd==='scheduler_status'){if(window.failSchedulerRead)throw new Error('Pianificazione non disponibile');return structuredClone(window.scheduler);}
  if(cmd==='scheduler_configure'){window.scheduler.schedule=structuredClone(args.schedule);window.scheduler.lastError=window.failScheduler?'Installazione launchd non riuscita. Preferenza salvata; usa Ripara pianificazione.':null;if(!window.failScheduler){window.scheduler.installed=args.schedule.enabled;window.scheduler.loaded=args.schedule.enabled;window.scheduler.matchesConfiguration=args.schedule.enabled;}return structuredClone(window.scheduler);}
  if(cmd==='analysis_status')return structuredClone(window.analysis);
  if(cmd==='analysis_configure'){if(window.failAnalysis)throw new Error('Salvataggio analisi non riuscito');window.analysis.settings=structuredClone(args.settings);return structuredClone(window.analysis);}
@@ -67,47 +68,105 @@ const pass = (name: string) => {
   console.log("PASS", name);
 };
 try {
-  await page.goto("https://voiceflow.test/#/settings");
-  const panel = page.getByRole("region", { name: "Pianificazione locale" });
-  await panel
-    .getByText("Pianificazione disattivata", { exact: true })
-    .waitFor();
-  assert.equal(await panel.getByRole("checkbox").isChecked(), false);
-  assert.equal(
-    await panel.getByLabel("Inizio fascia locale").inputValue(),
-    "02:30",
-  );
-  assert.equal(
-    await panel.getByLabel("Fine fascia locale").inputValue(),
-    "06:00",
-  );
-  assert.equal(
-    (
-      await page.evaluate(() =>
-        window.calls.filter((c) => c.cmd === "scheduler_configure"),
-      )
-    ).length,
-    0,
-  );
+  const configureCalls = () =>
+    page.evaluate(() =>
+      window.calls
+        .filter((c) => c.cmd === "scheduler_configure")
+        .map((c) => c.args),
+    );
+  const waitForConfigureCount = (count: number) =>
+    page.waitForFunction(
+      (count) =>
+        window.calls.filter((c) => c.cmd === "scheduler_configure").length ===
+        count,
+      count,
+    );
+  const waitForChecked = (checked: boolean) =>
+    page.waitForFunction(
+      (state) =>
+        document
+          .getElementById("scheduler-consent")
+          ?.getAttribute("data-state") === state,
+      checked ? "checked" : "unchecked",
+    );
+  await page.goto("https://voiceflow.test/#/settings?section=automation");
+  const panel = page.getByRole("region", { name: "Automazione", exact: true });
+  const toggle = panel.getByRole("checkbox", {
+    name: "Analisi programmata",
+    exact: true,
+  });
+  await toggle.waitFor();
+  assert.equal(await panel.getByRole("checkbox").count(), 1);
+  assert.equal(await toggle.isChecked(), false);
+  const start = panel.getByLabel("Inizio fascia", { exact: true });
+  const end = panel.getByLabel("Fine fascia", { exact: true });
+  assert.equal(await start.inputValue(), "02:30");
+  assert.equal(await end.inputValue(), "06:00");
+  assert.equal(await panel.getByText("Pronta", { exact: true }).count(), 0);
+  assert.equal((await configureCalls()).length, 0);
   pass("Default 02:30–06:00, disabled; startup reads never enable launchd");
-  await panel.getByRole("checkbox").check();
-  await panel.getByLabel("Inizio fascia locale").fill("03:00");
-  await panel.getByLabel("Fine fascia locale").fill("05:00");
+  // A window longer than 12 hours is refused before reaching launchd.
+  await start.fill("17:00");
+  await start.press("Enter");
+  await panel
+    .getByText("La fascia deve durare da 1 minuto a 12 ore.")
+    .waitFor();
+  assert.equal(await start.getAttribute("aria-invalid"), "true");
+  assert.equal((await configureCalls()).length, 0);
+  await start.press("Escape");
+  assert.equal(await start.inputValue(), "02:30");
+  await start.fill("03:00");
+  await start.press("Enter");
+  await waitForConfigureCount(1);
+  await end.fill("05:00");
+  await end.press("Enter");
+  await waitForConfigureCount(2);
+  assert.deepEqual(await configureCalls(), [
+    {
+      schedule: { enabled: false, startMinute: 180, endMinute: 360 },
+      consent: false,
+    },
+    {
+      schedule: { enabled: false, startMinute: 180, endMinute: 300 },
+      consent: false,
+    },
+  ]);
+  assert.equal(await toggle.isChecked(), false);
+  const navigation = page.getByRole("navigation", {
+    name: "Sezioni impostazioni",
+  });
+  await navigation
+    .getByRole("link", { name: "Dettatura", exact: true })
+    .click();
+  await navigation
+    .getByRole("link", { name: "Automazione", exact: true })
+    .click();
+  assert.equal(await start.inputValue(), "03:00");
+  assert.equal(await end.inputValue(), "05:00");
+  pass(
+    "Window edits are validated, apply on Enter without enabling the schedule, and survive category navigation",
+  );
   await page.evaluate(() => {
     window.failScheduler = true;
   });
-  await panel
-    .getByRole("button", { name: "Salva pianificazione", exact: true })
-    .click();
+  await toggle.click();
+  const dialog = page.getByRole("alertdialog", {
+    name: "Attivare l'analisi programmata?",
+  });
+  await dialog.getByText(/tra le 03:00 e le 05:00/).waitFor();
+  await dialog.getByRole("button", { name: "Annulla", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert.equal(await toggle.isChecked(), false);
+  assert.equal((await configureCalls()).length, 2);
+  await toggle.click();
+  await dialog.getByRole("button", { name: "Attiva", exact: true }).click();
+  await waitForConfigureCount(3);
   await panel
     .getByText("Installazione launchd non riuscita.", { exact: false })
     .waitFor();
-  await panel.getByText("Pianificazione richiesta", { exact: true }).waitFor();
-  await panel.getByText("Job non rilevato in macOS", { exact: true }).waitFor();
-  const configure = await page.evaluate(() =>
-    window.calls.find((c) => c.cmd === "scheduler_configure"),
-  );
-  assert.deepEqual(configure.args, {
+  await waitForChecked(true);
+  await panel.getByText("Da riparare", { exact: true }).waitFor();
+  assert.deepEqual((await configureCalls()).at(-1), {
     schedule: { enabled: true, startMinute: 180, endMinute: 300 },
     consent: true,
   });
@@ -120,7 +179,7 @@ try {
     0,
   );
   pass(
-    "Explicit schedule choice is separate from OpenAI and rule consent; partial launchd failure stays visible",
+    "Explicit schedule choice is confirmed and separate from OpenAI and rule consent; partial launchd failure stays visible",
   );
   await page.evaluate(() => {
     window.failScheduler = false;
@@ -128,7 +187,13 @@ try {
   await panel
     .getByRole("button", { name: "Ripara pianificazione", exact: true })
     .click();
-  await panel.getByText("Job caricato in macOS", { exact: true }).waitFor();
+  await panel.getByText("Pronta", { exact: true }).waitFor();
+  assert.equal(
+    await panel
+      .getByText("Installazione launchd non riuscita.", { exact: false })
+      .count(),
+    0,
+  );
   await page.evaluate(() => {
     window.scheduler.workerRunning = true;
     window.scheduler.recording = true;
@@ -138,10 +203,17 @@ try {
   await panel
     .getByRole("button", { name: "Aggiorna stato pianificazione", exact: true })
     .click();
-  await panel.getByText("Worker in esecuzione", { exact: true }).waitFor();
+  await panel.getByText("Analisi in corso", { exact: true }).waitFor();
   await panel
-    .getByText("Dettatura prioritaria attiva.", { exact: false })
+    .getByText("Dettatura prioritaria attiva", { exact: true })
     .waitFor();
+  await panel
+    .getByRole("button", { name: "Avanzate · Diagnostica automazione" })
+    .click();
+  await panel.getByText(/oggi \(UTC\): 2 su 3/).waitFor();
+  await panel
+    .getByRole("button", { name: "Avanzate · Diagnostica automazione" })
+    .click();
   pass(
     "Repair reconciles desired/installed state; live worker, capture and retry counters rendered",
   );
@@ -173,13 +245,43 @@ try {
   pass(
     "Desktop and supported 780×620 window controls remain inside the viewport",
   );
+  await page.evaluate(() => {
+    window.failScheduler = true;
+  });
+  await toggle.click();
+  await waitForConfigureCount(5);
+  // Disabling never asks for confirmation.
+  assert.equal(await page.getByRole("alertdialog").count(), 0);
+  assert.deepEqual((await configureCalls()).at(-1), {
+    schedule: { enabled: false, startMinute: 180, endMinute: 300 },
+    consent: false,
+  });
+  await waitForChecked(false);
   await panel
-    .getByRole("button", { name: "Disattiva pianificazione", exact: true })
-    .click();
-  await panel
-    .getByText("Pianificazione disattivata", { exact: true })
+    .getByRole("button", { name: "Riprova disattivazione", exact: true })
     .waitFor();
-  await panel.getByText("Job non rilevato in macOS", { exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.failScheduler = false;
+  });
+  await panel
+    .getByRole("button", { name: "Riprova disattivazione", exact: true })
+    .click();
+  await waitForConfigureCount(6);
+  assert.equal((await configureCalls()).at(-1).consent, false);
+  await waitForChecked(false);
+  assert.equal(
+    await panel
+      .getByRole("button", { name: "Riprova disattivazione", exact: true })
+      .count(),
+    0,
+  );
+  pass(
+    "Failed removal keeps scheduling disabled and offers an actionable retry",
+  );
+  assert.equal(
+    await panel.getByText("Da riparare", { exact: true }).count(),
+    0,
+  );
   await page.evaluate(() => {
     window.scheduler.helperAvailable = false;
     window.scheduler.phase = "interrupted";
@@ -188,9 +290,40 @@ try {
     .getByRole("button", { name: "Aggiorna stato pianificazione", exact: true })
     .click();
   assert.equal(await panel.getByRole("checkbox").isDisabled(), true);
-  await panel.getByText("Ultimo worker interrotto", { exact: false }).waitFor();
+  await panel
+    .getByRole("button", { name: "Avanzate · Diagnostica automazione" })
+    .click();
+  await panel
+    .getByText("Ultima analisi interrotta", { exact: false })
+    .waitFor();
   pass(
     "Disable persists OFF; missing packaged helper blocks enable; interrupted worker has recovery text",
+  );
+  await page.evaluate(() => {
+    window.failSchedulerRead = true;
+  });
+  await page
+    .getByRole("link", { name: "Torna a VoiceFlow", exact: true })
+    .click();
+  await page.getByRole("link", { name: "Impostazioni", exact: true }).click();
+  await page
+    .getByRole("navigation", { name: "Sezioni impostazioni" })
+    .getByRole("link", { name: "Automazione", exact: true })
+    .click();
+  await panel
+    .getByRole("button", { name: "Riprova pianificazione", exact: true })
+    .waitFor();
+  await page.evaluate(() => {
+    window.failSchedulerRead = false;
+  });
+  await panel
+    .getByRole("button", { name: "Riprova pianificazione", exact: true })
+    .click();
+  await panel
+    .getByRole("checkbox", { name: "Analisi programmata", exact: true })
+    .waitFor();
+  pass(
+    "Schedule read failure exposes retry and recovers without enabling automation",
   );
   const forbidden = await page.evaluate(() =>
     window.calls.filter((c) =>

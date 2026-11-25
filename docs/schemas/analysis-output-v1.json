@@ -50,7 +50,8 @@
               "keep",
               "remove",
               "replace"
-            ]
+            ],
+            "type": "string"
           },
           "confidence": {
             "type": "integer",
@@ -68,10 +69,19 @@
           "confidence"
         ]
       }
+    },
+    "misspellings": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 48,
+      "items": {
+        "$ref": "#/$defs/misspelling"
+      }
     }
   },
   "required": [
-    "candidates"
+    "candidates",
+    "misspellings"
   ],
   "$defs": {
     "context": {
@@ -137,7 +147,8 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
-              "const": "remove-false-start"
+              "const": "remove-false-start",
+              "type": "string"
             },
             "source": {
               "type": "array",
@@ -160,7 +171,8 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
-              "const": "repeat"
+              "const": "repeat",
+              "type": "string"
             },
             "word": {
               "type": "string",
@@ -178,16 +190,19 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
-              "const": "elision"
+              "const": "elision",
+              "type": "string"
             },
             "first": {
-              "const": "della"
+              "const": "della",
+              "type": "string"
             },
             "prefix": {
               "enum": [
                 "dell'",
-                "dell\u2019"
-              ]
+                "dell’"
+              ],
+              "type": "string"
             }
           },
           "required": [
@@ -205,7 +220,8 @@
           ],
           "properties": {
             "kind": {
-              "const": "repeat-phrase"
+              "const": "repeat-phrase",
+              "type": "string"
             },
             "phrase": {
               "type": "array",
@@ -228,7 +244,8 @@
           "additionalProperties": false,
           "properties": {
             "category": {
-              "const": "terminology"
+              "const": "terminology",
+              "type": "string"
             },
             "preferred": {
               "type": "string",
@@ -249,7 +266,8 @@
               "enum": [
                 "exact",
                 "unicode-lowercase"
-              ]
+              ],
+              "type": "string"
             },
             "context": {
               "$ref": "#/$defs/context"
@@ -268,7 +286,8 @@
           "additionalProperties": false,
           "properties": {
             "category": {
-              "const": "cleanup"
+              "const": "cleanup",
+              "type": "string"
             },
             "operation": {
               "$ref": "#/$defs/operation"
@@ -317,7 +336,8 @@
             "*",
             "it",
             "en"
-          ]
+          ],
+          "type": "string"
         },
         "groupIds": {
           "type": "array",
@@ -398,6 +418,45 @@
         "sessionId",
         "revisionId",
         "originalIndex"
+      ]
+    },
+    "misspelling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "intended": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          },
+          "minItems": 1,
+          "maxItems": 64
+        },
+        "confidence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "realWord": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "text",
+        "intended",
+        "evidence",
+        "confidence",
+        "realWord"
       ]
     }
   }

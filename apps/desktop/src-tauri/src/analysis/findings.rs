@@ -1,6 +1,6 @@
 //! Validated decisions. Source-linked text is deleted with any contributing source.
 use super::*;
-use crate::suggestions::{Candidate, Definition};
+use crate::suggestions::{Candidate, Definition, coded};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,24 +31,25 @@ pub(crate) struct Finding {
 }
 impl Finding {
     pub fn parse(value: serde_json::Value) -> Result<Self> {
-        let finding: Self = serde_json::from_value(value)?;
+        let finding: Self =
+            serde_json::from_value(value).map_err(|e| coded("schema", e.to_string()))?;
         ensure!(
             finding.confidence.is_some_and(|c| c <= 100),
-            "Confidenza richiesta."
+            coded("confidence-missing", "Confidenza richiesta.")
         );
         Ok(finding)
     }
     pub fn validate(&self, c: &Connection) -> Result<()> {
         ensure!(
             !self.evidence.is_empty() && self.evidence.len() <= 64,
-            "Evidenze mancanti."
+            coded("evidence-count", "Evidenze mancanti.")
         );
         for (text, max) in [(&self.name, 120), (&self.text, 2048), (&self.reason, 2000)] {
             ensure!(
                 !text.trim().is_empty()
                     && text.chars().count() <= max
                     && !text.chars().any(char::is_control),
-                "Rilievo non valido."
+                coded("finding-text", "Rilievo non valido.")
             );
         }
         ensure!(
@@ -70,33 +71,60 @@ impl Finding {
                         })
                     )
             ),
-            "Azione e regola incoerenti."
+            coded("action-rule-mismatch", "Azione e regola incoerenti.")
         );
+        let result_text = self
+            .candidate
+            .as_ref()
+            .map(|candidate| crate::suggestions::render_candidate_excerpt(candidate, &self.text))
+            .transpose()?;
         for reference in &self.evidence {
             let evidence = crate::suggestions::evidence(c, reference.clone())?;
             ensure!(
                 crate::suggestions::contains_example(&evidence.before, &self.text),
-                "Estratto inventato o non presente nella fonte."
+                coded(
+                    "excerpt-not-in-source",
+                    "Estratto inventato o non presente nella fonte."
+                )
             );
             if matches!(self.action, Action::Keep) {
                 ensure!(
                     evidence.after.as_ref().is_none_or(|after| {
                         crate::suggestions::contains_example(after, &self.text)
                     }),
-                    "Il mantenimento contraddice la correzione citata."
+                    coded(
+                        "keep-contradicts-correction",
+                        "Il mantenimento contraddice la correzione citata."
+                    )
                 );
             }
-            if let Some(candidate) = &self.candidate {
+            if let Some(result_text) = &result_text {
+                // One requirement, three distinguishable ways to miss it.
+                const UNSUPPORTED: &str =
+                    "L'azione sull'estratto deve essere supportata da ogni correzione citata.";
                 ensure!(
-                    candidate
+                    result_text != &self.text,
+                    coded("rule-no-effect", UNSUPPORTED)
+                );
+                ensure!(
+                    self.candidate
+                        .as_ref()
+                        .unwrap()
                         .positive_examples
                         .iter()
-                        .find(|e| e.input == self.text)
-                        .is_some_and(|e| e.input != e.output
-                            && evidence.after.as_ref().is_none_or(|after| {
-                                crate::suggestions::contains_example(after, &e.output)
-                            })),
-                    "L'azione sull'estratto deve essere supportata da ogni correzione citata."
+                        .any(|example| {
+                            crate::suggestions::contains_example(&evidence.before, &example.input)
+                                && crate::suggestions::contains_example(&example.input, &self.text)
+                                && example.input.replacen(&self.text, result_text, 1)
+                                    == example.output
+                        }),
+                    coded("example-not-grounded", UNSUPPORTED)
+                );
+                ensure!(
+                    evidence.after.as_ref().is_none_or(|after| {
+                        crate::suggestions::contains_example(after, result_text)
+                    }),
+                    coded("result-contradicts-correction", UNSUPPORTED)
                 );
             }
         }
@@ -113,7 +141,13 @@ impl Finding {
         outcome: &str,
         publication: Option<i64>,
     ) -> Result<()> {
-        c.execute("INSERT INTO analysis_findings(attempt_id,identity,proposal_id,name,excerpt,reason,action,confidence,outcome,publication,result_text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![attempt,self.key()?,proposal,self.name,self.text,self.reason,self.action.as_str(),self.confidence,outcome,publication,self.candidate.as_ref().and_then(|c|c.positive_examples.iter().find(|e|e.input==self.text)).map(|e|e.output.as_str()).unwrap_or(&self.text)])?;
+        let result_text = self
+            .candidate
+            .as_ref()
+            .map(|candidate| crate::suggestions::render_candidate_excerpt(candidate, &self.text))
+            .transpose()?
+            .unwrap_or_else(|| self.text.clone());
+        c.execute("INSERT INTO analysis_findings(attempt_id,identity,proposal_id,name,excerpt,reason,action,confidence,outcome,publication,result_text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![attempt,self.key()?,proposal,self.name,self.text,self.reason,self.action.as_str(),self.confidence,outcome,publication,result_text])?;
         let id = c.last_insert_rowid();
         // Store only a hash of the scored candidate. A later manual edit must not
         // inherit this score, and history must not gain another provider-text copy.
@@ -142,7 +176,7 @@ pub(super) fn migrate(c: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS suggestion_human_veto(identity TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS suggestion_auto_origin(proposal_id INTEGER PRIMARY KEY REFERENCES suggestions(id) ON DELETE CASCADE,eligible INTEGER NOT NULL);
         INSERT OR IGNORE INTO suggestion_auto_origin SELECT id,0 FROM suggestions;
-        UPDATE analysis_schema SET version=3;")?;
+        UPDATE analysis_schema SET version=3 WHERE version<3;")?;
     // Older action records only store a hash, so any manual action conservatively vetoes automation.
     let identities=c.prepare("SELECT identity FROM suggestions WHERE id IN (SELECT proposal_id FROM suggestion_actions WHERE request_key NOT LIKE 'analysis-auto:%')")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for identity in identities {

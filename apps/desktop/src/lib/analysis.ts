@@ -1,9 +1,31 @@
 import { invoke } from "@tauri-apps/api/core";
 import { z } from "zod";
 
+export const analysisReasoningSchema = z.enum([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+export const analysisReasoningOptions = [
+  { value: "low", label: "Basso" },
+  { value: "medium", label: "Medio · predefinito" },
+  { value: "high", label: "Alto" },
+  { value: "xhigh", label: "Molto alto" },
+  { value: "max", label: "Massimo" },
+] as const;
+
 export const analysisSettingsSchema = z.object({
   enabled: z.boolean(),
   autoApproveHighConfidence: z.boolean().default(false),
+  model: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/)
+    .default("gpt-6-luna"),
+  reasoningEffort: analysisReasoningSchema.default("medium"),
   maxSources: z.number().int().min(1).max(100),
   maxInputBytes: z.number().int().min(4096).max(262144),
   maxRequestsPerDay: z.number().int().min(1).max(20),
@@ -18,6 +40,7 @@ const statusSchema = z.object({
   elapsedSecondsToday: count,
   reservedSecondsToday: count,
   pendingSources: count,
+  parkedSources: count.default(0),
   excludedSessions: count,
   lastState: z.string().nullable(),
   lastError: z.string().nullable(),
@@ -40,25 +63,4 @@ export const analysisApi = {
   exclude: (id: number, excluded: boolean) =>
     invoke<void>("analysis_exclude", { id, excluded }),
 };
-export const analysisErrors: Record<string, string> = {
-  "ingest-storage":
-    "Errore di archiviazione. Le proposte già salvate restano disponibili; il lotto può essere riprovato.",
-  "provider-unavailable":
-    "Codex CLI o Node non disponibile. Verifica l'installazione.",
-  "provider-exit":
-    "Codex CLI non ha completato la richiesta. Verifica rete e accesso a Codex.",
-  "provider-io": "Comunicazione con Codex CLI interrotta.",
-  "invalid-output":
-    "Risposta incompleta o non valida. Nessuna proposta importata.",
-  "output-limit": "La risposta ha superato il limite di dimensione.",
-  "candidate-rejected":
-    "Alcune proposte non hanno superato la validazione. Le altre sono disponibili nei suggerimenti.",
-  timeout: "Tempo massimo raggiunto. Nessuna nuova regola attivata.",
-  cancelled: "Analisi interrotta.",
-  "privacy-changed":
-    "Lotto annullato dopo una modifica al consenso o alle esclusioni.",
-  "source-changed":
-    "Le sorgenti del lotto sono state eliminate o modificate. Il worker preparerà un nuovo lotto.",
-  interrupted:
-    "Esecuzione interrotta. Il worker potrà riprendere entro i limiti impostati.",
-};
+export { analysisErrors } from "./analysis-errors";

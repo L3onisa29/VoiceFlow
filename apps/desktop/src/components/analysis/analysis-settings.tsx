@@ -1,29 +1,49 @@
-import { useEffect, useState } from "react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type KeyboardEvent,
+} from "react";
+import { RefreshCw } from "lucide-react";
+import { toast } from "sonner";
+import { ConfirmSettingDialog } from "@/components/settings/confirm-setting-dialog";
+import { SettingsAdvanced } from "@/components/settings/settings-advanced";
+import { SettingsRow } from "@/components/settings/settings-row";
+import {
+  SettingsGroup,
+  SettingsSection,
+} from "@/components/settings/settings-section";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-  Field,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-} from "@/components/ui/field";
+import { FieldGroup } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import {
   analysisApi,
   analysisErrors,
+  analysisReasoningOptions,
+  analysisReasoningSchema,
+  analysisSettingsSchema,
   type AnalysisSettings as Settings,
   type AnalysisStatus,
 } from "@/lib/analysis";
+import { toUserMessage } from "@/lib/errors";
+import {
+  invalidateLocalQueries,
+  queryClient,
+  queryKeys,
+} from "@/lib/query-client";
 
 const limits = [
   { key: "maxSources", label: "Fonti per lotto", min: 1, max: 100 },
@@ -37,236 +57,422 @@ const limits = [
   },
   { key: "maxSecondsPerDay", label: "Secondi al giorno", min: 1, max: 3600 },
 ] as const;
+
+type LimitKey = (typeof limits)[number]["key"];
+type TextKey = "model" | LimitKey;
+type SavingKey = keyof Settings;
+type Texts = Partial<Record<TextKey, string>>;
+
+function without(record: Texts, key: TextKey): Texts {
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
+const range = (min: number, max: number) =>
+  `Da ${min.toLocaleString("it-IT")} a ${max.toLocaleString("it-IT")}.`;
+
 export function AnalysisSettings() {
   const [status, setStatus] = useState<AnalysisStatus | null>(null);
-  const [draft, setDraft] = useState<Settings | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [retry, setRetry] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState<SavingKey | null>(null);
+  const [confirm, setConfirm] = useState<
+    "enabled" | "autoApproveHighConfidence" | null
+  >(null);
+  // Text being edited in a field; applied on blur or Enter.
+  const [drafts, setDrafts] = useState<Texts>({});
+  const [errors, setErrors] = useState<Texts>({});
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [refresh, setRefresh] = useState(0);
+  const inFlight = useRef(false);
+  const loaded = useRef(false);
+
   useEffect(() => {
     let active = true;
+    setLoading(true);
     void analysisApi
       .status()
       .then((value) => {
-        if (active) {
-          setStatus(value);
-          setDraft(value.settings);
-          setError(null);
-        }
+        if (!active) return;
+        loaded.current = true;
+        setStatus(value);
+        setDrafts({});
+        setErrors({});
+        setLoadError(null);
       })
       .catch((error) => {
-        if (active) setError(String(error));
+        if (!active) return;
+        if (loaded.current) toast.error(toUserMessage(error));
+        else setLoadError(toUserMessage(error));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
       });
     return () => {
       active = false;
     };
-  }, [retry]);
-  async function save(value: Settings) {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    setNotice(null);
+  }, [refresh]);
+
+  /**
+   * The backend stores consent, model, reasoning and limits together: every
+   * change sends the persisted settings merged with `patch`. On failure the
+   * persisted status is untouched, so the control shows the saved value again.
+   */
+  async function apply(key: SavingKey, patch: Partial<Settings>) {
+    if (!status || inFlight.current) return false;
+    const next = { ...status.settings, ...patch };
+    inFlight.current = true;
+    setSaving(key);
     try {
-      const result = await analysisApi.configure(value, value.enabled);
+      const result = await analysisApi.configure(next, next.enabled);
       setStatus(result);
-      setDraft(result.settings);
-      setNotice(
-        value.enabled
-          ? "Consenso, limiti e criterio di approvazione salvati."
-          : "Analisi disattivata. I lotti in corso saranno interrotti.",
+      void invalidateLocalQueries(queryClient, [queryKeys.analysis]);
+      toast.success(
+        key === "enabled" && !next.enabled
+          ? "Analisi disattivata"
+          : "Impostazione salvata",
       );
+      return true;
     } catch (error) {
-      setError(String(error));
+      toast.error(toUserMessage(error));
+      return false;
     } finally {
-      setBusy(false);
+      inFlight.current = false;
+      setSaving(null);
     }
   }
+
+  async function commit(key: TextKey) {
+    const text = drafts[key];
+    if (!status || text === undefined || inFlight.current) return;
+    const value = key === "model" ? text.trim() : Number(text);
+    if (value === status.settings[key]) {
+      setDrafts((current) => without(current, key));
+      setErrors((current) => without(current, key));
+      return;
+    }
+    const parsed = analysisSettingsSchema.shape[key].safeParse(
+      key !== "model" && text.trim() === "" ? Number.NaN : value,
+    );
+    if (!parsed.success) {
+      const limit = limits.find((item) => item.key === key);
+      setErrors((current) => ({
+        ...current,
+        [key]: limit
+          ? `Inserisci un numero intero. ${range(limit.min, limit.max)}`
+          : "Usa lettere, numeri, punti, trattini o trattini bassi.",
+      }));
+      if (limit) setAdvancedOpen(true);
+      return;
+    }
+    setErrors((current) => without(current, key));
+    await apply(key, { [key]: parsed.data } as Partial<Settings>);
+    setDrafts((current) => without(current, key));
+  }
+
+  function textProps(key: TextKey) {
+    return {
+      disabled: saving !== null,
+      "aria-invalid": errors[key] ? true : undefined,
+      onBlur: () => void commit(key),
+      onKeyDown: (event: KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void commit(key);
+        }
+        if (event.key === "Escape") {
+          setDrafts((current) => without(current, key));
+          setErrors((current) => without(current, key));
+        }
+      },
+      onChange: (event: ChangeEvent<HTMLInputElement>) => {
+        const text = event.target.value;
+        setDrafts((current) => ({ ...current, [key]: text }));
+      },
+    };
+  }
+
+  const busy = saving !== null;
+  const settings = status?.settings;
+
   return (
-    <Card role="region" aria-labelledby="analysis-settings">
-      <CardHeader>
-        <CardTitle>
-          <h2 id="analysis-settings">Analisi con OpenAI</h2>
-        </CardTitle>
-        <CardDescription>
-          Trova varianti di termini, false partenze e ripetizioni da rivedere
-          nei suggerimenti.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-5">
-        {error && (
+    <SettingsSection
+      id="analysis-settings"
+      title="Analisi"
+      description="Invia a OpenAI i testi selezionati per proporre correzioni. Ogni modifica si applica subito e interrompe i lotti in corso."
+      actions={
+        status && (
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Aggiorna stato analisi"
+            disabled={busy || loading}
+            onClick={() => setRefresh((value) => value + 1)}
+          >
+            {loading ? <Spinner /> : <RefreshCw />}
+          </Button>
+        )
+      }
+    >
+      {!status || !settings ? (
+        loadError ? (
           <Alert variant="destructive">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
-        {notice && (
-          <p role="status" className="text-sm text-muted-foreground">
-            {notice}
-          </p>
-        )}
-        {!status || !draft ? (
-          error ? (
+            <AlertTitle>Preferenze analisi non disponibili</AlertTitle>
+            <AlertDescription>{loadError}</AlertDescription>
             <Button
+              className="col-start-2 mt-2 justify-self-start"
               variant="outline"
-              onClick={() => setRetry((value) => value + 1)}
+              size="sm"
+              disabled={loading}
+              onClick={() => setRefresh((value) => value + 1)}
             >
               Riprova analisi
             </Button>
-          ) : (
-            <Skeleton className="h-40" />
-          )
+          </Alert>
         ) : (
-          <>
-            <div className="flex flex-wrap gap-2">
-              <Badge variant={status.settings.enabled ? "default" : "outline"}>
-                {status.settings.enabled
-                  ? "Consenso attivo"
-                  : "Analisi disattivata"}
-              </Badge>
-              <Badge variant="secondary">
-                {status.excludedSessions} sessioni escluse
-              </Badge>
-            </div>
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                void save(draft);
-              }}
-              className="flex flex-col gap-5"
+          <Skeleton className="h-40" />
+        )
+      ) : (
+        <>
+          {status.lastError && (
+            <Alert>
+              <AlertDescription>
+                {analysisErrors[status.lastError] ??
+                  "Analisi non completata. Aggiorna lo stato prima di riprovare."}
+              </AlertDescription>
+            </Alert>
+          )}
+          <SettingsGroup
+            title="Invio a OpenAI"
+            description={
+              status.excludedSessions > 0
+                ? `${status.excludedSessions} sessioni escluse dallo Storico.`
+                : undefined
+            }
+          >
+            <SettingsRow
+              htmlFor="analysis-consent"
+              label="Autorizzo l'invio dei testi selezionati a OpenAI tramite Codex CLI"
+              description="La dettatura resta sempre locale."
+              disabled={busy}
+              saving={saving === "enabled"}
             >
-              <FieldGroup>
-                <Field orientation="horizontal">
-                  <Checkbox
-                    id="analysis-consent"
-                    checked={draft.enabled}
-                    disabled={busy}
-                    onCheckedChange={(checked) =>
-                      setDraft({ ...draft, enabled: checked === true })
-                    }
-                  />
-                  <div className="flex flex-col gap-2">
-                    <FieldLabel htmlFor="analysis-consent">
-                      Autorizzo l'invio dei testi selezionati a OpenAI tramite
-                      Codex CLI
-                    </FieldLabel>
-                    <FieldDescription>
-                      Include originali ASR, risultati elaborati e correzioni
-                      ricordate delle sessioni non escluse, oltre alle
-                      definizioni pertinenti. L'analisi è facoltativa e
-                      disattivata inizialmente. Puoi escludere ogni sessione dal
-                      dettaglio dello storico.
-                    </FieldDescription>
-                  </div>
-                </Field>
-                <Field orientation="horizontal">
-                  <Checkbox
-                    id="analysis-auto-approve"
-                    checked={draft.autoApproveHighConfidence}
-                    disabled={busy}
-                    onCheckedChange={(checked) =>
-                      setDraft({
-                        ...draft,
-                        autoApproveHighConfidence: checked === true,
-                      })
-                    }
-                  />
-                  <div className="flex flex-col gap-2">
-                    <FieldLabel htmlFor="analysis-auto-approve">
-                      Approva automaticamente con confidenza superiore a 90
-                    </FieldLabel>
-                    <FieldDescription>
-                      91–100: approvazione automatica solo con evidenze valide,
-                      senza conflitti o veti manuali. 75–90 alta, 50–74 media,
-                      0–49 bassa: revisione manuale. La confidenza è una stima
-                      del provider sull'azione, non una misura dell'accuratezza
-                      ASR. Mantenere il testo non pubblica regole. Le ipotesi
-                      precedenti senza punteggio restano manuali.
-                    </FieldDescription>
-                  </div>
-                </Field>
+              <Checkbox
+                id="analysis-consent"
+                checked={settings.enabled}
+                disabled={busy}
+                aria-describedby="analysis-consent-description"
+                onCheckedChange={(checked) => {
+                  if (checked === true) setConfirm("enabled");
+                  else void apply("enabled", { enabled: false });
+                }}
+              />
+            </SettingsRow>
+            <SettingsRow
+              htmlFor="analysis-auto-approve"
+              label="Approva automaticamente con confidenza superiore a 90"
+              description="Sotto 91 o senza punteggio serve la tua revisione."
+              disabled={busy}
+              saving={saving === "autoApproveHighConfidence"}
+            >
+              <Checkbox
+                id="analysis-auto-approve"
+                checked={settings.autoApproveHighConfidence}
+                disabled={busy}
+                aria-describedby="analysis-auto-approve-description"
+                onCheckedChange={(checked) => {
+                  if (checked === true) setConfirm("autoApproveHighConfidence");
+                  else
+                    void apply("autoApproveHighConfidence", {
+                      autoApproveHighConfidence: false,
+                    });
+                }}
+              />
+            </SettingsRow>
+          </SettingsGroup>
+          <SettingsAdvanced label="Cosa viene inviato e cosa resta">
+            <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+              <p>
+                Trascrizioni originali, testi elaborati, correzioni ricordate e
+                definizioni pertinenti del dizionario.
+              </p>
+              <p>
+                Puoi escludere ogni sessione dal dettaglio dello Storico.
+                Escludere o eliminare una sessione impedisce nuovi invii, ma non
+                cancella i dati già ricevuti da OpenAI né le regole già
+                approvate.
+              </p>
+              <p>
+                Una richiesta già accettata da OpenAI può proseguire e avere un
+                costo anche dopo una modifica.
+              </p>
+            </div>
+          </SettingsAdvanced>
+          <SettingsGroup title="Modello">
+            <SettingsRow
+              htmlFor="analysis-model"
+              label="Modello di analisi"
+              description="Predefinito: gpt-6-luna. Deve essere disponibile nel tuo account Codex."
+              disabled={busy}
+              saving={saving === "model"}
+              error={errors.model}
+            >
+              <Input
+                id="analysis-model"
+                value={drafts.model ?? settings.model}
+                required
+                maxLength={128}
+                spellCheck={false}
+                autoCapitalize="none"
+                aria-describedby={
+                  errors.model
+                    ? "analysis-model-description analysis-model-error"
+                    : "analysis-model-description"
+                }
+                {...textProps("model")}
+              />
+            </SettingsRow>
+            <SettingsRow
+              htmlFor="analysis-reasoning"
+              label="Ragionamento"
+              description="Livelli più alti richiedono più tempo e token."
+              disabled={busy}
+              saving={saving === "reasoningEffort"}
+            >
+              <Select
+                value={settings.reasoningEffort}
+                disabled={busy}
+                onValueChange={(value) =>
+                  void apply("reasoningEffort", {
+                    reasoningEffort: analysisReasoningSchema.parse(value),
+                  })
+                }
+              >
+                <SelectTrigger
+                  id="analysis-reasoning"
+                  className="w-full"
+                  aria-describedby="analysis-reasoning-description"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {analysisReasoningOptions.map(({ value, label }) => (
+                      <SelectItem key={value} value={value}>
+                        {label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </SettingsRow>
+          </SettingsGroup>
+          <SettingsAdvanced
+            label="Avanzate · Limiti e utilizzo"
+            open={advancedOpen}
+            onOpenChange={setAdvancedOpen}
+          >
+            <div className="flex flex-col gap-4">
+              <FieldGroup className="gap-0">
                 {limits.map(({ key, label, min, max }) => (
-                  <Field key={key}>
-                    <FieldLabel htmlFor={`analysis-${key}`}>{label}</FieldLabel>
+                  <SettingsRow
+                    key={key}
+                    htmlFor={`analysis-${key}`}
+                    label={label}
+                    description={range(min, max)}
+                    disabled={busy}
+                    saving={saving === key}
+                    error={errors[key]}
+                  >
                     <Input
                       id={`analysis-${key}`}
                       type="number"
+                      inputMode="numeric"
                       min={min}
                       max={max}
                       required
-                      disabled={busy}
-                      value={Number.isNaN(draft[key]) ? "" : draft[key]}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          [key]: event.target.valueAsNumber,
-                        })
+                      value={drafts[key] ?? String(settings[key])}
+                      aria-describedby={
+                        errors[key]
+                          ? `analysis-${key}-description analysis-${key}-error`
+                          : `analysis-${key}-description`
                       }
+                      {...textProps(key)}
                     />
-                  </Field>
+                  </SettingsRow>
                 ))}
               </FieldGroup>
-              <p className="text-sm text-muted-foreground">
-                Una fonte è una trascrizione o una correzione ricordata. Le
-                fonti oltre il limite di byte restano in attesa. I limiti
-                giornalieri si azzerano a mezzanotte UTC. L'invio già accettato
-                dal fornitore potrebbe proseguire anche dopo l'interruzione.
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <Button type="submit" disabled={busy}>
-                  {busy ? "Salvataggio…" : "Salva preferenze analisi"}
-                </Button>
-                {status.settings.enabled && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() =>
-                      void save({ ...status.settings, enabled: false })
-                    }
-                  >
-                    Disattiva analisi
-                  </Button>
+              <div
+                className="flex flex-col gap-2 text-sm text-muted-foreground"
+                aria-label="Contatori analisi"
+              >
+                <p>
+                  Oggi UTC: {status.requestsToday} tentativi ·{" "}
+                  {status.inputBytesToday.toLocaleString("it-IT")} byte
+                  preparati · {status.elapsedSecondsToday} secondi misurati ·{" "}
+                  {status.reservedSecondsToday} secondi riservati
+                </p>
+                <p>
+                  {status.pendingSources} fonti in attesa ·{" "}
+                  {status.acceptedCandidates} proposte validate ·{" "}
+                  {status.rejectedCandidates} proposte non valide
+                </p>
+                {status.parkedSources > 0 && (
+                  <p>
+                    {status.parkedSources} fonti accantonate dopo due tentativi
+                    senza proposte valide. Tornano in coda con una
+                    configurazione diversa.
+                  </p>
                 )}
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={busy}
-                  onClick={() => setRetry((value) => value + 1)}
-                >
-                  Aggiorna stato analisi
-                </Button>
+                <p>
+                  Una fonte è una trascrizione o una correzione ricordata. Le
+                  fonti oltre il limite di byte restano in attesa. I limiti
+                  giornalieri si azzerano a mezzanotte UTC.
+                </p>
               </div>
-            </form>
-            <div className="flex flex-col gap-2" aria-label="Contatori analisi">
-              <p className="text-sm">
-                Oggi UTC: {status.requestsToday} tentativi ·{" "}
-                {status.inputBytesToday.toLocaleString("it-IT")} byte preparati
-                · {status.elapsedSecondsToday} secondi misurati ·{" "}
-                {status.reservedSecondsToday} secondi riservati
-              </p>
-              <p className="text-sm text-muted-foreground">
-                {status.pendingSources} fonti in attesa ·{" "}
-                {status.acceptedCandidates} proposte validate ·{" "}
-                {status.rejectedCandidates} proposte non valide. Nessun costo
-                monetario stimato.
-              </p>
-              {status.lastError && (
-                <Alert>
-                  <AlertDescription>
-                    {analysisErrors[status.lastError] ??
-                      "Analisi non completata. Aggiorna lo stato prima di riprovare."}
-                  </AlertDescription>
-                </Alert>
-              )}
-              <p className="text-sm text-muted-foreground">
-                Escludere o eliminare una sessione impedisce nuovi invii. Non
-                elimina i dati già ricevuti da OpenAI. Le regole già approvate
-                restano gestibili nei suggerimenti.
-              </p>
             </div>
-          </>
-        )}
-      </CardContent>
-    </Card>
+          </SettingsAdvanced>
+          <ConfirmSettingDialog
+            open={confirm === "enabled"}
+            title="Inviare i testi a OpenAI?"
+            description="L'analisi invia a OpenAI, tramite Codex CLI, i testi delle sessioni non escluse."
+            details={
+              <>
+                <p>
+                  Include trascrizioni originali, testi elaborati, correzioni
+                  ricordate e definizioni pertinenti. La dettatura resta locale.
+                </p>
+                <p>
+                  Puoi escludere singole sessioni dallo Storico. I dati già
+                  ricevuti da OpenAI non vengono cancellati.
+                </p>
+              </>
+            }
+            confirmLabel="Autorizza invio"
+            onClose={() => setConfirm(null)}
+            onConfirm={() => void apply("enabled", { enabled: true })}
+          />
+          <ConfirmSettingDialog
+            open={confirm === "autoApproveHighConfidence"}
+            title="Approvare automaticamente le regole?"
+            description="Le regole valide con confidenza da 91 a 100, senza conflitti o veti manuali, verranno pubblicate senza revisione."
+            details={
+              <p>
+                La confidenza è una stima del provider, non l'accuratezza della
+                trascrizione. Vale anche per l'analisi programmata.
+              </p>
+            }
+            confirmLabel="Attiva approvazione"
+            onClose={() => setConfirm(null)}
+            onConfirm={() =>
+              void apply("autoApproveHighConfidence", {
+                autoApproveHighConfidence: true,
+              })
+            }
+          />
+        </>
+      )}
+    </SettingsSection>
   );
 }

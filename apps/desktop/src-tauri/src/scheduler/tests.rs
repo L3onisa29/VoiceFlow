@@ -76,7 +76,10 @@ impl Fixture {
         std::os::unix::fs::symlink("/usr/bin/true", self.data.join("node")).unwrap();
     }
     fn launch(&self) -> std::process::Child {
-        runtime::role_command("--launch", &self.data, -1)
+        self.launch_mode(false)
+    }
+    fn launch_mode(&self, manual: bool) -> std::process::Child {
+        runtime::role_command(if manual { "--manual" } else { "--launch" }, &self.data, -1)
             .unwrap()
             .env("PATH", format!("{}:/usr/bin:/bin", self.data.display()))
             .stdin(Stdio::null())
@@ -87,19 +90,21 @@ impl Fixture {
     }
     fn pid(&self, name: &str) -> i32 {
         let start = Instant::now();
-        while !self.data.join(name).is_file() {
+        loop {
+            if let Some(pid) = fs::read_to_string(self.data.join(name))
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0)
+            {
+                return pid;
+            }
             assert!(
                 start.elapsed() < Duration::from_secs(8),
-                "Missing {name}; analysis={:?}",
+                "Missing valid PID in {name}; analysis={:?}",
                 self.analysis().status(now_ms())
             );
             thread::sleep(Duration::from_millis(10));
         }
-        fs::read_to_string(self.data.join(name))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
     }
 }
 impl Drop for Fixture {
@@ -126,6 +131,23 @@ fn process_fixture() {
         runtime::run(serde_json::from_str(&args).unwrap()).unwrap();
     }
 }
+#[test]
+fn pid_fixture_waits_for_valid_content_after_file_creation() {
+    let f = Fixture::new();
+    let path = f.data.join("delayed.pid");
+    fs::write(&path, "").unwrap();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        fs::write(&path, "incomplete").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        fs::write(&path, "0").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        fs::write(&path, "12345\n").unwrap();
+    });
+    assert_eq!(f.pid("delayed.pid"), 12345);
+    writer.join().unwrap();
+}
+
 #[test]
 fn windows_defaults_overnight_boundaries_and_clock_transitions() {
     let mut s = Schedule {
@@ -278,61 +300,66 @@ fn persistent_backoff_expired_lease_and_clock_jump_do_not_grant_ownership() {
 }
 #[test]
 fn multiprocess_single_worker_capture_and_crash_cleanup() {
-    for mode in [
-        "capture",
-        "kill-launcher",
-        "kill-executor",
-        "stop-launcher",
-        "stop-executor",
-        "stop-watchdog",
-    ] {
-        let f = Fixture::new();
-        f.ready(&format!(
-            "/bin/sleep 30 &\necho $! > '{}/descendant.pid'\nwait",
-            f.data.display()
-        ));
-        let mut launcher = f.launch();
-        let provider = f.pid("provider.pid");
-        let descendant = f.pid("descendant.pid");
-        let executor = f.pid("executor.pid");
-        let watchdog = f.pid("watchdog.pid");
-        let c = Coordination::new(&f.data);
-        assert!(c.worker().unwrap().is_none());
-        assert!(c.work().unwrap().is_none());
-        f.store().phase("running", 1).unwrap(); // An expired timestamp cannot steal live ownership.
-        // A second OS process exits without a second provider attempt.
-        assert!(f.launch().wait().unwrap().success());
-        assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
-        match mode {
-            "kill-launcher" => signal(launcher.id() as i32, libc::SIGKILL),
-            "kill-executor" => signal(executor, libc::SIGKILL),
-            "stop-launcher" => signal(launcher.id() as i32, libc::SIGSTOP),
-            "stop-executor" => signal(executor, libc::SIGSTOP),
-            "stop-watchdog" => signal(watchdog, libc::SIGSTOP),
-            _ => (),
+    for manual in [false, true] {
+        for mode in [
+            "capture",
+            "kill-launcher",
+            "kill-executor",
+            "stop-launcher",
+            "stop-executor",
+            "stop-watchdog",
+        ] {
+            let f = Fixture::new();
+            f.ready(&format!(
+                "/bin/sleep 30 &\necho $! > '{}/descendant.pid'\nwait",
+                f.data.display()
+            ));
+            if manual {
+                f.store().save(&Schedule::default()).unwrap();
+            }
+            let mut launcher = f.launch_mode(manual);
+            let provider = f.pid("provider.pid");
+            let descendant = f.pid("descendant.pid");
+            let executor = f.pid("executor.pid");
+            let watchdog = f.pid("watchdog.pid");
+            let c = Coordination::new(&f.data);
+            assert!(c.worker().unwrap().is_none());
+            assert!(c.work().unwrap().is_none());
+            f.store().phase("running", 1).unwrap(); // An expired timestamp cannot steal live ownership.
+            // A second OS process exits without a second provider attempt.
+            assert!(f.launch().wait().unwrap().success());
+            assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
+            match mode {
+                "kill-launcher" => signal(launcher.id() as i32, libc::SIGKILL),
+                "kill-executor" => signal(executor, libc::SIGKILL),
+                "stop-launcher" => signal(launcher.id() as i32, libc::SIGSTOP),
+                "stop-executor" => signal(executor, libc::SIGSTOP),
+                "stop-watchdog" => signal(watchdog, libc::SIGSTOP),
+                _ => (),
+            }
+            let start = Instant::now();
+            let capture = c.capture().unwrap();
+            assert!(!capture.degraded(), "{mode}");
+            assert!(start.elapsed() < Duration::from_millis(1500), "{mode}");
+            wait_for(|| dead(provider) && dead(descendant));
+            assert!(c.recording());
+            assert!(c.work().unwrap().is_none());
+            if mode == "stop-launcher" {
+                signal(launcher.id() as i32, libc::SIGCONT);
+            }
+            launcher.wait().unwrap();
+            drop(capture);
+            wait_for(|| c.worker().unwrap().is_some());
+            assert!(!c.recording());
+            manager(&f, Arc::new(MockLaunch::default()))
+                .status()
+                .unwrap();
+            assert!(!f.data.join("analysis-runtime").exists());
+            // An expired lease never substitutes for the kernel lock. Only now is D1 recovery valid.
+            f.analysis().recover_interrupted().unwrap();
+            assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
+            assert!(f.analysis().prepare().unwrap().is_some());
         }
-        let start = Instant::now();
-        let capture = c.capture().unwrap();
-        assert!(!capture.degraded(), "{mode}");
-        assert!(start.elapsed() < Duration::from_millis(1500), "{mode}");
-        wait_for(|| dead(provider) && dead(descendant));
-        assert!(c.recording());
-        assert!(c.work().unwrap().is_none());
-        if mode == "stop-launcher" {
-            signal(launcher.id() as i32, libc::SIGCONT);
-        }
-        launcher.wait().unwrap();
-        drop(capture);
-        wait_for(|| c.worker().unwrap().is_some());
-        assert!(!c.recording());
-        manager(&f, Arc::new(MockLaunch::default()))
-            .status()
-            .unwrap();
-        assert!(!f.data.join("analysis-runtime").exists());
-        // An expired lease never substitutes for the kernel lock. Only now is D1 recovery valid.
-        f.analysis().recover_interrupted().unwrap();
-        assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
-        assert!(f.analysis().prepare().unwrap().is_some());
     }
 }
 #[test]
@@ -407,6 +434,95 @@ fn real_provider_faults_are_persisted_and_retry_is_bounded() {
         assert!(f.launch().wait().unwrap().success());
         assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
         assert!(!f.store().due(now_ms()).unwrap());
+    }
+}
+
+#[test]
+fn candidate_validation_distinguishes_empty_mixed_and_retryable_failure() {
+    use serde_json::json;
+    let candidate = |session_id| json!({"candidate":{"definition":{"category":"terminology","preferred":"VoiceFlow","variants":["voice flow"],"matching":"exact","context":{"before":null,"after":null,"exceptBefore":[],"exceptAfter":[]}},"language":"it","groupIds":[],"reason":"Fixture spelling","positiveExamples":[{"input":"voice flow","output":"VoiceFlow"}],"negativeExamples":[{"input":"voice flower","output":"voice flower"}]},"evidence":[{"sessionId":session_id,"revisionId":null,"originalIndex":null}]});
+    let response = |candidates| {
+        let event = json!({"type":"item.completed","item":{"type":"agent_message","text":json!({"candidates":candidates}).to_string()}});
+        format!("printf '%s\\n' '{event}' '{{\"type\":\"turn.completed\"}}'")
+    };
+    for manual in [false, true] {
+        for (values, state, error, accepted, rejected) in [
+            (json!([]), "completed", None, 0, 0),
+            (json!([{}]), "failed", Some("all-candidates-rejected"), 0, 1),
+            (
+                json!([candidate(999)]),
+                "failed",
+                Some("all-candidates-rejected"),
+                0,
+                1,
+            ),
+            (
+                json!([candidate(1), {}]),
+                "partial",
+                Some("candidate-rejected"),
+                1,
+                1,
+            ),
+        ] {
+            let f = Fixture::new();
+            f.ready(&response(values));
+            let started = now_ms();
+            assert!(f.launch_mode(manual).wait().unwrap().success());
+            let runs = f.analysis().runs(None, 20).unwrap();
+            let run = &runs.entries[0];
+            assert_eq!(run.state, state);
+            assert_eq!(run.error.as_deref(), error);
+            assert_eq!(
+                (run.accepted, run.rejected),
+                (Some(accepted), Some(rejected))
+            );
+            assert_eq!(f.store().invocations().unwrap()[0].reason, state);
+            let history = Connection::open(f.data.join("history.sqlite3")).unwrap();
+            let done = || {
+                history
+                    .query_row("SELECT done FROM analysis_events", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            };
+            assert_eq!(done(), i64::from(state != "failed"));
+            let scheduler = f.store().connect().unwrap();
+            let (failures, next_attempt): (i64, i64) = scheduler
+                .query_row("SELECT retry_count,next_attempt FROM scheduler", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(failures, i64::from(state == "failed"));
+            assert!(next_attempt >= started + if state == "failed" { 300_000 } else { 60_000 });
+            assert!(f.launch_mode(manual).wait().unwrap().success());
+            assert_eq!(f.store().invocations().unwrap()[0].reason, "backoff");
+            assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
+            if state == "failed" {
+                // Expire only the fixture's backoff so the real worker retries the same batch.
+                scheduler
+                    .execute("UPDATE scheduler SET next_attempt=0", [])
+                    .unwrap();
+                fs::write(
+                    f.data.join("codex"),
+                    format!(
+                        "#!/bin/sh\ncat >/dev/null\n{}\n",
+                        response(json!([candidate(1), candidate(1)]))
+                    ),
+                )
+                .unwrap();
+                assert!(f.launch_mode(manual).wait().unwrap().success());
+                let retried = f.analysis().runs(None, 20).unwrap();
+                assert_eq!(retried.entries.len(), 2);
+                assert_eq!(retried.entries[0].state, "completed");
+                assert_eq!(retried.entries[0].key.batch_id, run.key.batch_id);
+                assert_eq!(retried.entries[1].state, "failed");
+                assert_eq!(done(), 1);
+                let counts: (i64, i64) = history.query_row("SELECT (SELECT COUNT(*) FROM suggestions),(SELECT COUNT(*) FROM suggestion_evidence)", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert_eq!(counts, (1, 1));
+                assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 2);
+                assert_eq!(f.store().invocations().unwrap()[0].reason, "completed");
+            }
+        }
     }
 }
 #[test]
@@ -572,6 +688,8 @@ fn background_no_work_and_failure_have_durable_diagnostics() {
     child.wait().unwrap();
     let runs = f.analysis().runs(None, 20).unwrap();
     assert_eq!(runs.entries[0].state, "failed");
+    assert_eq!(runs.entries[0].origin.as_deref(), Some("automatic"));
+    assert_eq!(runs.entries[0].model.as_deref(), Some("gpt-6-luna"));
     assert_eq!(runs.entries[0].error.as_deref(), Some("provider-exit"));
     assert_eq!(f.store().invocations().unwrap()[0].reason, "failed");
     let f = Fixture::new();
@@ -583,4 +701,223 @@ fn background_no_work_and_failure_have_durable_diagnostics() {
     child.wait().unwrap();
     assert_eq!(f.store().invocations().unwrap()[0].reason, "no-work");
     assert!(!f.data.join("provider.pid").exists());
+}
+
+#[test]
+fn spent_budget_is_reported_without_a_worker_and_is_not_a_failure() {
+    let f = Fixture::new();
+    f.ready(EMPTY_SUCCESS);
+    f.analysis()
+        .configure(
+            AnalysisSettings {
+                enabled: true,
+                max_requests_per_day: 1,
+                request_timeout_seconds: 10,
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    assert!(f.launch().wait().unwrap().success());
+    assert_eq!(f.store().invocations().unwrap()[0].reason, "completed");
+    f.store()
+        .connect()
+        .unwrap()
+        .execute("UPDATE scheduler SET next_attempt=0", [])
+        .unwrap();
+    fs::remove_file(f.data.join("provider.pid")).unwrap();
+    for _ in 0..4 {
+        assert!(f.launch().wait().unwrap().success());
+    }
+    let records = f.store().invocations().unwrap();
+    // Four identical wakeups are one row, and the real outcome stays visible.
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["daily-limit", "completed"]
+    );
+    assert!(records[0].ended_at.unwrap() >= records[0].started_at);
+    assert!(!f.data.join("provider.pid").exists());
+    let (failures, phase, error): (i64, String, Option<String>) = f
+        .store()
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT retry_count,phase,last_error FROM scheduler",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((failures, phase.as_str(), error), (0, "idle", None));
+    // Raising the budget takes effect at the next wakeup, without waiting for a new day.
+    f.analysis()
+        .configure(
+            AnalysisSettings {
+                enabled: true,
+                max_requests_per_day: 2,
+                request_timeout_seconds: 10,
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    assert!(f.launch().wait().unwrap().success());
+    assert_eq!(f.store().invocations().unwrap()[0].reason, "no-work");
+}
+
+const EMPTY_SUCCESS: &str = "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"candidates\\\":[]}\"}}' '{\"type\":\"turn.completed\"}'";
+
+#[test]
+fn manual_request_outside_window_one_batch_checkpoints_metadata_and_durable_link() {
+    for enabled in [false, true] {
+        let f = Fixture::new();
+        f.ready(EMPTY_SUCCESS);
+        let mut config = f.analysis().status(now_ms()).unwrap().settings;
+        config.max_sources = 1;
+        config.model = "gpt-6-sol".into();
+        config.reasoning_effort = crate::analysis::ReasoningEffort::High;
+        f.analysis().configure(config, true).unwrap();
+        HistoryStore::new(f.data.join("history.sqlite3"))
+            .record(&CompletedDictation {
+                session_key: "second",
+                created_at: 2,
+                text: "second fixture",
+                duration_seconds: 1.0,
+                language: "it",
+                original_asr: Some(&["second fixture".into()]),
+                processing: None,
+            })
+            .unwrap();
+        let minute = local_minute(Local::now());
+        let schedule = Schedule {
+            enabled,
+            start_minute: (minute + 60) % 1440,
+            end_minute: (minute + 120) % 1440,
+        };
+        f.store().save(&schedule).unwrap();
+        let mock = Arc::new(MockLaunch::default());
+        let m = manager(&f, mock.clone());
+        let request = m.run_now().unwrap();
+        wait_for(|| {
+            !matches!(
+                f.store()
+                    .invocations()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == request.id)
+                    .unwrap()
+                    .reason
+                    .as_str(),
+                "requested" | "running"
+            )
+        });
+        let runs = f.analysis().runs(None, 20).unwrap();
+        assert_eq!(runs.entries.len(), 1);
+        let run = &runs.entries[0];
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.source_count, Some(1));
+        assert_eq!(run.origin.as_deref(), Some("manual"));
+        assert_eq!(run.model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(run.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(run.invocation_id, Some(request.id));
+        let job = f.store().invocations().unwrap().remove(0);
+        assert_eq!(job.reason, "completed");
+        assert_eq!(job.attempt_id, run.key.attempt_id);
+        assert_eq!(job.batch_id, Some(run.key.batch_id));
+        assert_eq!(f.analysis().status(now_ms()).unwrap().pending_sources, 1);
+        assert_eq!(f.store().schedule().unwrap(), schedule);
+        assert!(mock.state.lock().unwrap().1.is_empty());
+        assert!(!m.plist_path().exists());
+        wait_for(|| Coordination::new(&f.data).worker().unwrap().is_some());
+        let blocked = m.run_now().unwrap();
+        wait_for(|| {
+            f.store()
+                .invocations()
+                .unwrap()
+                .iter()
+                .any(|j| j.id == blocked.id && j.reason == "backoff")
+        });
+        assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
+    }
+}
+
+#[test]
+fn manual_no_work_consent_daily_budget_and_recording_blocks_are_durable() {
+    for reason in ["no-work", "consent-unavailable", "daily-limit", "recording"] {
+        let f = Fixture::new();
+        f.ready(EMPTY_SUCCESS);
+        f.store().save(&Schedule::default()).unwrap();
+        let capture = if reason == "recording" {
+            Some(Coordination::new(&f.data).capture().unwrap())
+        } else {
+            None
+        };
+        if reason == "no-work" {
+            HistoryStore::new(f.data.join("history.sqlite3"))
+                .delete(1)
+                .unwrap();
+        }
+        if reason == "consent-unavailable" {
+            f.analysis()
+                .configure(AnalysisSettings::default(), false)
+                .unwrap();
+        }
+        if reason == "daily-limit" {
+            let batch = f.analysis().prepare().unwrap().unwrap();
+            let c = Connection::open(f.data.join("history.sqlite3")).unwrap();
+            c.execute("INSERT INTO analysis_attempts(batch_id,started_at,input_bytes,reserved_ms,elapsed_ms,state) VALUES(?2,?1,0,0,3600000,'completed')",params![now_ms(),batch.id()]).unwrap();
+        }
+        assert!(f.launch_mode(true).wait().unwrap().success());
+        assert_eq!(f.store().invocations().unwrap()[0].reason, reason);
+        assert!(!f.data.join("provider.pid").exists());
+        drop(capture);
+    }
+}
+
+#[test]
+fn manual_concurrency_metadata_snapshot_and_consent_revocation_stop_all_processes() {
+    let f = Fixture::new();
+    f.ready(&format!(
+        "printf '%s\\n' \"$@\" > '{}/provider.args'\n/bin/sleep 30",
+        f.data.display()
+    ));
+    f.store().save(&Schedule::default()).unwrap();
+    let m = manager(&f, Arc::new(MockLaunch::default()));
+    let request = m.run_now().unwrap();
+    let provider = f.pid("provider.pid");
+    wait_for(|| f.data.join("provider.args").exists());
+    let args = fs::read_to_string(f.data.join("provider.args")).unwrap();
+    assert!(args.contains("gpt-6-luna") && args.contains("model_reasoning_effort=\"medium\""));
+    let mut config = f.analysis().status(now_ms()).unwrap().settings;
+    config.model = "gpt-6-sol".into();
+    config.reasoning_effort = crate::analysis::ReasoningEffort::Max;
+    f.analysis().configure(config, true).unwrap();
+    let mut handles = vec![];
+    for _ in 0..4 {
+        let m = m.clone();
+        handles.push(thread::spawn(move || m.run_now().unwrap()));
+    }
+    for handle in handles {
+        assert_eq!(handle.join().unwrap().reason, "worker-busy");
+    }
+    assert!(f.launch().wait().unwrap().success());
+    assert!(f.launch_mode(true).wait().unwrap().success());
+    let runs = f.analysis().runs(None, 20).unwrap();
+    assert_eq!(runs.entries.len(), 1);
+    assert_eq!(runs.entries[0].model.as_deref(), Some("gpt-6-luna"));
+    assert_eq!(runs.entries[0].reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(runs.entries[0].invocation_id, Some(request.id));
+    assert_eq!(f.analysis().status(now_ms()).unwrap().requests_today, 1);
+    f.analysis()
+        .configure(AnalysisSettings::default(), false)
+        .unwrap();
+    wait_for(|| dead(provider));
+    wait_for(|| Coordination::new(&f.data).worker().unwrap().is_some());
+    assert!(!Coordination::new(&f.data).capture().unwrap().degraded());
+    let permit = Coordination::new(&f.data).worker().unwrap().unwrap();
+    f.store().recover_invocations().unwrap();
+    drop(permit);
+    assert_eq!(f.analysis().status(now_ms()).unwrap().pending_sources, 1);
 }

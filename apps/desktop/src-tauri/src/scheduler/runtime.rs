@@ -11,6 +11,11 @@ pub fn entry() -> Result<()> {
 }
 pub(super) fn run(args: Vec<String>) -> Result<()> {
     let value = |name: &str| args.windows(2).find(|v| v[0] == name).map(|v| v[1].clone());
+    let origin = if args.iter().any(|a| a == "--manual") {
+        RunOrigin::Manual
+    } else {
+        RunOrigin::Automatic
+    };
     let data = PathBuf::from(value("--data").context("Directory dati mancante.")?);
     ensure!(data.is_absolute(), "Directory dati non assoluta.");
     #[cfg(test)]
@@ -32,7 +37,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             unsafe { libc::getpgrp() } != unsafe { libc::getpid() },
             "Watchdog senza gruppo del worker."
         );
-        return watchdog(&data);
+        return watchdog(&data, origin);
     }
     if args.iter().any(|a| a == "--execute") {
         Permit::validate_inherited(
@@ -49,7 +54,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             .filter(|v| !v.is_empty())
             .map(|v| v.parse::<i64>())
             .transpose()?;
-        let result = execute(&data, invocation);
+        let result = execute(&data, invocation, origin);
         if result.is_err() {
             let store = Store::new(data);
             let _ = store.error(Some("Analisi non completata. Consulta Analisi per gli esiti; verifica disponibilità CLI e archivio."));
@@ -60,19 +65,34 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     }
     let store = Store::new(data.clone());
     let coordination = Coordination::new(&data);
-    let Some(permit) = coordination.worker()? else {
+    let permit = if let Some(fd) = value("--launcher-permit-fd") {
+        Some(Permit::adopt(
+            fd.parse()?,
+            &coordination.root.join("worker.lock"),
+        )?)
+    } else {
+        coordination.worker()?
+    };
+    let Some(permit) = permit else {
         return Ok(());
     };
-    let invocation = store.begin_invocation().ok();
+    let invocation = if let Some(id) = value("--invocation") {
+        let id: i64 = id.parse()?;
+        ensure!(origin == RunOrigin::Manual && store.connect()?.query_row("SELECT EXISTS(SELECT 1 FROM scheduler_invocations WHERE id=?1 AND origin='manual' AND reason='requested')", [id], |r| r.get::<_, bool>(0))?, "Richiesta manuale non valida.");
+        Some(id)
+    } else {
+        store.recover_invocations()?;
+        Some(store.create_invocation(origin, "requested")?)
+    };
     let _observation = super::invocations::Observation {
         store: &store,
         id: invocation,
     };
     clear_scratch(&data)?;
     let schedule = store.schedule()?;
-    let skip = if !schedule.enabled {
+    let skip = if origin == RunOrigin::Automatic && !schedule.enabled {
         Some("disabled")
-    } else if !schedule.current() {
+    } else if origin == RunOrigin::Automatic && !schedule.current() {
         Some("outside-window")
     } else if !store.due(now_ms())? {
         Some("backoff")
@@ -80,11 +100,14 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
         Some("recording")
     } else if !consented(&data) {
         Some("consent-unavailable")
+    } else if budget_spent(&data) {
+        // A spent budget is not a failure: no worker, no batch, no retry counted.
+        Some("daily-limit")
     } else {
         None
     };
     if let Some(reason) = skip {
-        store.note(invocation, reason, None);
+        store.note_skip(invocation, reason, origin);
         return Ok(());
     }
     let previous: String =
@@ -111,6 +134,11 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
         &data,
         fd,
         &[
+            if origin == RunOrigin::Manual {
+                "--manual"
+            } else {
+                "--automatic"
+            },
             "--invocation",
             &invocation.map(|id| id.to_string()).unwrap_or_default(),
         ],
@@ -128,7 +156,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             break;
         }
         if coordination.recording()
-            || !store.schedule().is_ok_and(|s| s.current())
+            || !allowed(&store, origin)
             || !consented(&data)
             || start.elapsed() > Duration::from_secs(630)
         {
@@ -160,10 +188,16 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 pub(super) fn role_command(role: &str, data: &Path, fd: RawFd) -> Result<Command> {
     role_command_args(role, data, fd, &[])
 }
-fn role_command_args(role: &str, data: &Path, fd: RawFd, extra: &[&str]) -> Result<Command> {
+pub(super) fn role_command_args(
+    role: &str,
+    data: &Path,
+    fd: RawFd,
+    extra: &[&str],
+) -> Result<Command> {
     let mut args = vec![
         role.to_string(),
         "--data".into(),
@@ -246,7 +280,24 @@ fn consented(data: &Path) -> bool {
     })()
     .unwrap_or(false)
 }
-fn watchdog(data: &Path) -> Result<()> {
+/// Metadata only. An unreadable archive is left to the worker, which reports it properly.
+fn budget_spent(data: &Path) -> bool {
+    (|| -> Result<bool> {
+        let c = Connection::open_with_flags(
+            data.join("history.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        c.busy_timeout(Duration::from_millis(500))?;
+        let json: String =
+            c.query_row("SELECT json FROM analysis_settings WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        let config = serde_json::from_str::<crate::analysis::AnalysisSettings>(&json)?;
+        Ok(crate::analysis::budget_left(&c, &config, now_ms())?.is_none())
+    })()
+    .unwrap_or(false)
+}
+fn watchdog(data: &Path, origin: RunOrigin) -> Result<()> {
     nonblocking(0)?;
     let store = Store::new(data.to_path_buf());
     let coordination = Coordination::new(data);
@@ -257,7 +308,7 @@ fn watchdog(data: &Path) -> Result<()> {
             kill_execution_group();
         }
         if coordination.recording()
-            || !store.schedule().is_ok_and(|s| s.current())
+            || !allowed(&store, origin)
             || !consented(data)
             || started.elapsed() >= Duration::from_secs(620)
         {
@@ -271,7 +322,7 @@ fn watchdog(data: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
 }
-fn execute(data: &Path, invocation: Option<i64>) -> Result<()> {
+fn execute(data: &Path, invocation: Option<i64>, origin: RunOrigin) -> Result<()> {
     let store = Store::new(data.to_path_buf());
     let coordination = Coordination::new(data);
     let Some(work) = coordination.work()? else {
@@ -285,11 +336,20 @@ fn execute(data: &Path, invocation: Option<i64>) -> Result<()> {
     let work_fd = work.inherit()?;
     // No provider may start until watchdog spawn succeeds. It inherits the open
     // worker/work descriptions, as do all providers. A dead process never leaves a stale lock.
-    let mut watchdog = role_command("--watchdog", data, work_fd)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut watchdog = role_command_args(
+        "--watchdog",
+        data,
+        work_fd,
+        &[if origin == RunOrigin::Manual {
+            "--manual"
+        } else {
+            "--automatic"
+        }],
+    )?
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()?;
     let _watchdog_pipe = watchdog.stdin.take();
     // If launchd/launcher disappears, this thread kills the entire execution group.
     thread::spawn(|| {
@@ -301,7 +361,7 @@ fn execute(data: &Path, invocation: Option<i64>) -> Result<()> {
             }
         }
     });
-    if !store.schedule()?.current() || !consented(data) || !store.due(now_ms())? {
+    if !allowed(&store, origin) || !consented(data) || !store.due(now_ms())? {
         store.note(invocation, "conditions-changed", None);
         return Ok(());
     }
@@ -315,7 +375,7 @@ fn execute(data: &Path, invocation: Option<i64>) -> Result<()> {
     let started = Instant::now();
     let cancelled = || {
         coordination.recording()
-            || !store.schedule().is_ok_and(|s| s.current())
+            || !allowed(&store, origin)
             || !consented(data)
             || started.elapsed() >= Duration::from_secs(600)
     };
@@ -332,22 +392,38 @@ fn execute(data: &Path, invocation: Option<i64>) -> Result<()> {
         store.note(invocation, "cancelled", None);
         return Ok(());
     }
+    let batch_id = batch.id();
     if let Some(id) = invocation {
-        let _ = store.invocation_batch(id, batch.id());
+        let _ = store.invocation_batch(id, batch_id);
     }
     let executables = Executables::discover().inspect_err(|_| {
         store.note(invocation, "provider-unavailable", Some(batch.id()));
     })?;
     let provider = CodexProvider::in_worker_group(executables, data.join("analysis-runtime"))?;
-    let outcome = analysis
-        .run(batch, &provider, &cancelled, now_ms())
-        .inspect_err(|error| {
-            if error.is::<crate::analysis::DailyLimit>() {
-                store.note(invocation, "daily-limit", None);
+    if let Some(id) = invocation {
+        store.connect()?.execute(
+            "UPDATE scheduler_invocations SET reason='running' WHERE id=?1 AND reason='requested'",
+            [id],
+        )?;
+    }
+    let outcome =
+        match analysis.run_invoked(batch, &provider, &cancelled, now_ms(), origin, invocation) {
+            Ok(outcome) => outcome,
+            // The launcher checks the budget first; this covers a request racing past it.
+            // Nothing was sent, so it must not consume a retry or raise an error.
+            Err(error) if error.is::<crate::analysis::DailyLimit>() => {
+                store.note(invocation, "daily-limit", Some(batch_id));
+                store.phase("idle", 0)?;
+                return Ok(());
             }
-        })?;
+            Err(error) => return Err(error),
+        };
     store.note(invocation, &outcome.state, Some(outcome.batch_id));
     store.error(None)?;
     store.outcome(outcome.state == "failed", now_ms())?;
     Ok(())
+}
+
+fn allowed(store: &Store, origin: RunOrigin) -> bool {
+    origin == RunOrigin::Manual || store.schedule().is_ok_and(|s| s.current())
 }

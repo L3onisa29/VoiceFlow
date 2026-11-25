@@ -32,6 +32,10 @@ pub(super) fn candidate(value: &Value) -> bool {
         schema(),
     )
 }
+/// One "wrong spelling -> intended term" pair of the `misspellings` list.
+pub(super) fn misspelling(value: &Value) -> bool {
+    matches(value, &schema()["$defs"]["misspelling"], schema())
+}
 fn matches(value: &Value, rule: &Value, root: &Value) -> bool {
     if let Some(reference) = rule.get("$ref").and_then(Value::as_str) {
         return reference
@@ -82,6 +86,7 @@ fn matches(value: &Value, rule: &Value, root: &Value) -> bool {
         Some("integer") => value
             .as_u64()
             .is_some_and(|n| bound(n, rule, "minimum", "maximum")),
+        Some("boolean") => value.is_boolean(),
         Some("null") => value.is_null(),
         None => rule.get("enum").is_some() || rule.get("const").is_some(),
         _ => false,
@@ -103,6 +108,13 @@ mod tests {
     fn schema_uses_only_the_supported_validation_vocabulary() {
         fn check(rule: &Value) {
             let object = rule.as_object().expect("schema object");
+            if object.contains_key("enum") || object.contains_key("const") {
+                assert_eq!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("string"),
+                    "OpenAI structured output requires a type alongside string enum/const"
+                );
+            }
             for key in object.keys() {
                 assert!(
                     [
