@@ -4,12 +4,88 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-pub const BUILTIN_VERSION: &str = "cleanup-catalog-v1:builtin-1";
+pub const BUILTIN_VERSION: &str = "cleanup-catalog-v1:builtin-2";
 pub const MAX_RULES: usize = 256;
 pub const MAX_WORDS: usize = 7;
 const REPEATS: &[&str] = &[
-    "il", "lo", "la", "gli", "le", "un", "una", "di", "del", "della", "dello", "dei", "degli",
+    "il",
+    "lo",
+    "la",
+    "gli",
+    "le",
+    "un",
+    "una",
+    "di",
+    "del",
+    "della",
+    "dello",
+    "dei",
+    "degli",
     "delle",
+    "a",
+    "da",
+    "in",
+    "con",
+    "per",
+    "su",
+    "tra",
+    "fra",
+    "al",
+    "allo",
+    "alla",
+    "ai",
+    "agli",
+    "alle",
+    "dal",
+    "dallo",
+    "dalla",
+    "dai",
+    "dagli",
+    "dalle",
+    "nel",
+    "nello",
+    "nella",
+    "nei",
+    "negli",
+    "nelle",
+    "sul",
+    "sullo",
+    "sulla",
+    "sui",
+    "sugli",
+    "sulle",
+    "mi",
+    "ti",
+    "ci",
+    "vi",
+    "questo",
+    "questa",
+    "questi",
+    "queste",
+    "quello",
+    "quella",
+    "quelli",
+    "quelle",
+    "alcuni",
+    "alcune",
+    "qualche",
+    "più",
+    "un'altra",
+    "un’altra",
+    "un'altro",
+    "un’altro",
+    "nell'altra",
+    "nell’altra",
+    "the",
+    "an",
+    "of",
+    "to",
+    "on",
+    "at",
+    "by",
+    "from",
+    "for",
+    "with",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -340,7 +416,8 @@ impl CompiledCatalog {
             legacy_pairs: false,
         };
         for (index, rule) in result.catalog.rules.iter().enumerate() {
-            if rule.language != "*" && rule.language != result.language {
+            if result.language != "auto" && rule.language != "*" && rule.language != result.language
+            {
                 continue;
             }
             result.lookahead = result.lookahead.max(
@@ -361,9 +438,39 @@ impl CompiledCatalog {
         static BUILTIN: std::sync::OnceLock<CompiledCatalog> = std::sync::OnceLock::new();
         BUILTIN
             .get_or_init(|| {
-                let data: Catalog = serde_json::from_str(include_str!("cleanup-builtin.json"))
+                let mut data: Catalog = serde_json::from_str(include_str!("cleanup-builtin.json"))
                     .expect("builtin schema");
-                assert_eq!(data.version, BUILTIN_VERSION);
+                // Keep the original catalog available for archived publications.
+                assert_eq!(data.version, "cleanup-catalog-v1:builtin-1");
+                data.version = BUILTIN_VERSION.into();
+                for &word in REPEATS {
+                    if data
+                        .rules
+                        .iter()
+                        .any(|r| matches!(&r.operation, Operation::Repeat { word: w } if w == word))
+                    {
+                        continue;
+                    }
+                    data.rules.push(Rule {
+                        id: format!("builtin-repeat-{word}"),
+                        version: 1,
+                        language: "*".into(),
+                        operation: Operation::Repeat { word: word.into() },
+                        context: Context::default(),
+                        provenance: Provenance {
+                            source: "voiceflow-builtin-v2; function-word repetitions".into(),
+                            evidence_ids: vec![],
+                        },
+                        positive_examples: vec![Example {
+                            input: format!("{word} {word}"),
+                            output: word.into(),
+                        }],
+                        negative_examples: vec![Example {
+                            input: format!("{word}, {word}"),
+                            output: format!("{word}, {word}"),
+                        }],
+                    });
+                }
                 let mut compiled = Self::compile(data, "auto").expect("valid builtin rules");
                 compiled.legacy_pairs = true;
                 compiled
@@ -596,7 +703,7 @@ mod tests {
         assert_eq!(p.parts().0, "oggi vorrei volevo chiedere");
         for language in ["en-US", "auto"] {
             let compiled = CompiledCatalog::compile(catalog(vec![r.clone()]), language).unwrap();
-            assert!(compiled.is_empty());
+            assert_eq!(compiled.is_empty(), language != "auto");
             let mut p = TextProcessor::with_rules(
                 FormatMode::Faithful,
                 true,
@@ -604,7 +711,14 @@ mod tests {
                 compiled,
             );
             p.update("oggi vorrei volevo chiedere", true).unwrap();
-            assert_eq!(p.parts().0, "oggi vorrei volevo chiedere");
+            assert_eq!(
+                p.parts().0,
+                if language == "auto" {
+                    "oggi volevo chiedere"
+                } else {
+                    "oggi vorrei volevo chiedere"
+                }
+            );
         }
         let mut except = rule(&["vorrei", "volevo"]);
         except.context.except_after = vec!["sapere".into()];
@@ -1002,9 +1116,6 @@ mod tests {
             assert_eq!(process(rules.clone(), vec![], true, input), expected);
             assert_eq!(process(rules.clone(), vec![], false, input), input);
             assert_eq!(process(vec![], vec![], true, input), input);
-            let mut builtin = TextProcessor::new(FormatMode::Faithful, true);
-            builtin.update(input, true).unwrap();
-            assert_eq!(builtin.parts().0, input);
         }
     }
     #[test]
@@ -1232,7 +1343,7 @@ mod tests {
             assert!(CompiledCatalog::compile(catalog(vec![r]), "it").is_err());
         }
         for mut r in [
-            repetition(&["mi"], "mantieni"),
+            repetition(&["mantieni"], "questo"),
             repetition(&["le", "ultime"], "chat"),
         ] {
             r.context.after = None;

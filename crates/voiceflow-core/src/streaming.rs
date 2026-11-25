@@ -1,5 +1,6 @@
 use crate::audio::SAMPLE_RATE;
 use crate::formatting::{FormatMode, TextProcessor};
+use crate::recognition::{Accumulator, Recognition, ScoredToken};
 use anyhow::{Result, ensure};
 use parakeet_rs::{Nemotron, NemotronHandle, NemotronMode};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use std::{collections::VecDeque, path::Path, time::Instant};
 pub const MODEL_ID: &str = "nvidia/nemotron-3.5-asr-streaming-0.6b";
 pub const MODEL_FILES: [&str; 3] = ["encoder.onnx", "decoder_joint.onnx", "tokenizer.model"];
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Language {
     #[default]
@@ -43,18 +44,47 @@ pub trait StreamingDecoder {
     fn feed(&mut self, samples: &[f32]) -> Result<()>;
     fn text(&self) -> String;
     fn reset(&mut self);
+    /// Tokens behind `text()`, in emission order, plus any language tags the text omits.
+    /// Empty for a decoder that reports no scores.
+    fn tokens(&self) -> &[ScoredToken] {
+        &[]
+    }
 }
 
 pub struct NvidiaDecoder {
     model: Nemotron,
     needs_preroll: bool,
     preroll_chunks: usize,
+    tokens: Vec<ScoredToken>,
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Requires the local NVIDIA model via VOICEFLOW_TEST_MODEL"]
+    fn decoder_is_primed_before_the_microphone_can_start() {
+        let path = std::env::var("VOICEFLOW_TEST_MODEL").expect("Set VOICEFLOW_TEST_MODEL");
+        let model = load_model(Path::new(&path)).unwrap();
+        for language in [Language::Auto, Language::Italian, Language::English] {
+            let decoder = NvidiaDecoder::new(&model, language).unwrap();
+            assert!(
+                !decoder.needs_preroll,
+                "{language:?}: recording would start before inference initialization"
+            );
+            assert!(
+                decoder.text().is_empty(),
+                "Warmup must not add transcript words"
+            );
+        }
+    }
 }
 impl NvidiaDecoder {
     pub fn new(handle: &NemotronHandle, language: Language) -> Result<Self> {
         let mut model = Nemotron::from_shared(handle);
         model.set_target_lang(language.code())?;
-        Ok(Self {
+        let mut decoder = Self {
             model,
             needs_preroll: true,
             preroll_chunks: if matches!(language, Language::Auto) {
@@ -62,7 +92,22 @@ impl NvidiaDecoder {
             } else {
                 2
             },
-        })
+            tokens: Vec::new(),
+        };
+        decoder.prepare()?;
+        Ok(decoder)
+    }
+    fn prepare(&mut self) -> Result<()> {
+        if self.needs_preroll {
+            // Run before opening the microphone so first-use ONNX work and
+            // encoder pre-roll happen while the app still shows loading.
+            let silence = vec![0.0; self.model.chunk_samples()];
+            for _ in 0..self.preroll_chunks {
+                self.model.transcribe_chunk(&silence)?;
+            }
+            self.needs_preroll = false;
+        }
+        Ok(())
     }
 }
 impl StreamingDecoder for NvidiaDecoder {
@@ -70,19 +115,21 @@ impl StreamingDecoder for NvidiaDecoder {
         self.model.chunk_samples()
     }
     fn feed(&mut self, samples: &[f32]) -> Result<()> {
-        if self.needs_preroll {
-            // With empty encoder caches, Nemotron 3.5 can lose an immediate
-            // short word. Two silent chunks preserve the onset, including
-            // "Ciao" where one is insufficient. Auto needs four for "Pronto".
-            // Apply after every reset, outside the session's VAD, which skips silence.
-            // This is decoder context, not recorded audio or a wall-clock wait.
-            let silence = vec![0.0; self.model.chunk_samples()];
-            for _ in 0..self.preroll_chunks {
-                self.model.transcribe_chunk(&silence)?;
-            }
-            self.needs_preroll = false;
-        }
-        self.model.transcribe_chunk(samples)?;
+        // Resets after pause/silence still need fresh encoder context.
+        self.prepare()?;
+        // Same decode as `transcribe_chunk`; the transcript still comes from the model's
+        // own accumulated tokens, so the text is unchanged.
+        let emitted = self.model.transcribe_chunk_with_tokens(samples)?;
+        self.tokens.extend(
+            emitted
+                .into_iter()
+                // Out-of-vocabulary ids decode to nothing and never reach the transcript.
+                .filter(|token| !token.text.is_empty())
+                .map(|token| ScoredToken {
+                    text: token.text,
+                    probability: token.logprob.exp(),
+                }),
+        );
         Ok(())
     }
     fn text(&self) -> String {
@@ -90,7 +137,11 @@ impl StreamingDecoder for NvidiaDecoder {
     }
     fn reset(&mut self) {
         self.model.reset();
+        self.tokens.clear();
         self.needs_preroll = true;
+    }
+    fn tokens(&self) -> &[ScoredToken] {
+        &self.tokens
     }
 }
 
@@ -122,6 +173,8 @@ pub struct StreamingSession<D: StreamingDecoder> {
     silence_samples: usize,
     speech_seen: bool,
     original_utterances: Vec<String>,
+    recognition: Accumulator,
+    silence_closures: usize,
 }
 impl<D: StreamingDecoder> StreamingSession<D> {
     pub fn new(decoder: D) -> Self {
@@ -136,6 +189,8 @@ impl<D: StreamingDecoder> StreamingSession<D> {
             silence_samples: 0,
             speech_seen: false,
             original_utterances: Vec::new(),
+            recognition: Accumulator::default(),
+            silence_closures: 0,
         }
     }
     pub fn with_dictionary(
@@ -205,6 +260,7 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         self.transcript.chunks += 1;
         self.processor.update(&self.decoder.text(), false)?;
         if self.silence_samples >= SAMPLE_RATE * 2 {
+            self.silence_closures += 1;
             self.commit()?;
             self.decoder.reset();
             self.speech_seen = false;
@@ -218,9 +274,31 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         // A decoder snapshot replaces its own revisable utterance. Retain only
         // the final snapshot before reset, never intermediate hypotheses.
         if self.speech_seen {
+            self.recognition.utterance(
+                self.original_utterances.len(),
+                &original,
+                self.decoder.tokens(),
+            );
             self.original_utterances.push(original);
         }
         Ok(())
+    }
+    /// Recogniser confidence and dropped markers for the saved utterances.
+    /// Like the originals, available only after successful finalization.
+    pub fn recognition(&self) -> Option<Recognition> {
+        self.transcript.finished.then(|| self.recognition.finish())
+    }
+    /// Applications per rule in the confirmed text. See `TextProcessor::rule_hits`.
+    pub fn rule_hits(&self) -> &std::collections::BTreeMap<String, u32> {
+        self.processor.rule_hits()
+    }
+    /// Decoded chunks so far. The text can only change when this does.
+    pub fn chunks(&self) -> usize {
+        self.transcript.chunks
+    }
+    /// Utterances closed because two seconds of silence followed speech.
+    pub fn silence_closures(&self) -> usize {
+        self.silence_closures
     }
     /// Exact ASR snapshots at utterance boundaries, including markers/commands.
     /// Available for persistence only after successful finalization.
@@ -257,6 +335,18 @@ impl<D: StreamingDecoder> StreamingSession<D> {
         self.speech_seen = false;
         self.silence_samples = 0;
         Ok(())
+    }
+}
+
+impl<D: StreamingDecoder> StreamingSession<D> {
+    /// Run a complete 16 kHz recording through this session, in the same small frames a
+    /// live capture delivers. Returns the processed text and the raw utterances.
+    pub fn transcribe(mut self, samples: &[f32]) -> Result<(Transcript, Vec<String>)> {
+        for frame in samples.chunks(320) {
+            self.push(frame)?;
+        }
+        let transcript = self.finish()?;
+        Ok((transcript, self.original_utterances))
     }
 }
 
@@ -439,6 +529,11 @@ mod processing_tests {
             active.finish().unwrap().text(),
             "VoiceFlow VoiceFlow non 42"
         );
+        // The preview of the first utterance matched too, but only confirmed text counts.
+        assert_eq!(
+            active.rule_hits().iter().collect::<Vec<_>>(),
+            [(&"dictionary:1".to_owned(), &2)]
+        );
         assert_eq!(
             active.original_utterances().unwrap(),
             ["voice flow ", "voice flow non 42"]
@@ -504,6 +599,8 @@ mod processing_tests {
             "volevo chiedere vorrei volevo chiedere volevo sapere"
         );
         assert_eq!(active.cleanup_version(), "fixture-published-2");
+        // Three revisions of the first utterance are one application, not three.
+        assert_eq!(active.rule_hits()["cleanup:fixture-new-variant"], 2);
         assert_eq!(
             active.original_utterances().unwrap(),
             [
@@ -545,6 +642,84 @@ mod processing_tests {
         assert_eq!(session.original_utterances().unwrap(), expected);
         session.finish().unwrap();
         assert_eq!(session.original_utterances().unwrap(), expected);
+    }
+
+    #[test]
+    fn recognition_follows_saved_utterances_and_counts_silence_closures() {
+        struct Scored {
+            current: Vec<ScoredToken>,
+            next: VecDeque<Vec<(&'static str, f32)>>,
+        }
+        impl StreamingDecoder for Scored {
+            fn chunk_samples(&self) -> usize {
+                8_960
+            }
+            fn feed(&mut self, _: &[f32]) -> Result<()> {
+                if let Some(tokens) = self.next.pop_front() {
+                    self.current
+                        .extend(tokens.into_iter().map(|(text, probability)| ScoredToken {
+                            text: text.into(),
+                            probability,
+                        }));
+                }
+                Ok(())
+            }
+            fn text(&self) -> String {
+                self.current
+                    .iter()
+                    .filter(|t| !t.text.starts_with("<it"))
+                    .map(|t| t.text.as_str())
+                    .collect::<String>()
+                    .trim_start()
+                    .into()
+            }
+            fn reset(&mut self) {
+                self.current.clear();
+            }
+            fn tokens(&self) -> &[ScoredToken] {
+                &self.current
+            }
+        }
+        let mut session = StreamingSession::new(Scored {
+            current: vec![],
+            next: [
+                vec![("<it-IT>", 0.9), (" prima", 0.95), (" <unk>", 0.4)],
+                vec![(" fra", 0.2), ("se", 0.9)],
+            ]
+            .into(),
+        });
+        session.push(&[0.1; 8_960 * 2]).unwrap();
+        assert!(session.recognition().is_none());
+        // Two seconds of silence close the first utterance and reset the decoder.
+        session.push(&[0.0; 8_960 * 4]).unwrap();
+        assert_eq!(session.silence_closures(), 1);
+        session
+            .decoder
+            .next
+            .push_back(vec![(" seconda", 0.3), (" chiara", 0.99)]);
+        session.push(&[0.1; 8_960]).unwrap();
+        assert_eq!(
+            session.finish().unwrap().text(),
+            "prima frase seconda chiara"
+        );
+        assert_eq!(
+            session.original_utterances().unwrap(),
+            ["prima <unk> frase", "seconda chiara"]
+        );
+        let recognition = session.recognition().unwrap();
+        assert_eq!(
+            recognition
+                .low_words
+                .iter()
+                .map(|p| (p.utterance, p.word))
+                .collect::<Vec<_>>(),
+            [(0, 2), (1, 0)]
+        );
+        assert_eq!(recognition.unknown_removed, 1);
+        assert_eq!(recognition.scored_tokens, 5);
+        assert_eq!(recognition.language_tags["<it-IT>"], 1);
+        // An explicit stop is not a silence closure.
+        assert_eq!(session.silence_closures(), 1);
     }
 
     #[test]

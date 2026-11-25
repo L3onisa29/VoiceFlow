@@ -2,7 +2,7 @@ use crate::cleanup::CompiledCatalog;
 use crate::dictionary::{Dictionary, Match};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -22,12 +22,15 @@ struct Word {
     separator: String,
     text: String,
     end: usize,
+    quoted: bool,
+    quotes_after: u8,
 }
 
 struct Atom<'a> {
     separator: &'a str,
     text: &'a str,
     command: bool,
+    quoted: bool,
 }
 
 /// Keep seven revisable words and bounded frozen-source dependency context.
@@ -58,6 +61,10 @@ pub struct TextProcessor {
     released_offset: usize,
     after_command: bool,
     utterance_start: bool,
+    quotes: u8,
+    released_quotes: u8,
+    // Rule applications on frozen source only, so previews and revisions never count.
+    hits: BTreeMap<String, u32>,
 }
 
 impl TextProcessor {
@@ -79,6 +86,9 @@ impl TextProcessor {
             released_offset: 0,
             after_command: false,
             utterance_start: true,
+            quotes: 0,
+            released_quotes: 0,
+            hits: BTreeMap::new(),
         }
     }
 
@@ -106,6 +116,14 @@ impl TextProcessor {
 
     pub fn cleanup_version(&self) -> &str {
         self.cleanup_catalog.version()
+    }
+
+    /// Applications per rule in the confirmed text: `dictionary:<rule id>` for a
+    /// terminology replacement and `cleanup:<rule id>` for a catalog deletion.
+    /// With only the builtin pair catalog nothing is attributed, because that path
+    /// does not identify the rule behind a deletion.
+    pub fn rule_hits(&self) -> &BTreeMap<String, u32> {
+        &self.hits
     }
 
     fn extended_rules(&self) -> bool {
@@ -137,6 +155,7 @@ impl TextProcessor {
         {
             self.pending.clear();
             self.parsed_offset = self.released_offset;
+            self.quotes = self.released_quotes;
         }
         let mut cursor = self.parsed_offset;
         while cursor < snapshot.len() {
@@ -147,10 +166,15 @@ impl TextProcessor {
             let Some(end) = decoder_word_end(&rest[start..], complete).map(|n| start + n) else {
                 break;
             };
+            let text = strip_decoder_markers(&rest[start..end], true);
+            let (quoted, quotes_after) = quotation_state(&text, self.quotes);
+            self.quotes = quotes_after;
             self.pending.push_back(Word {
                 separator: rest[..start].to_owned(),
-                text: strip_decoder_markers(&rest[start..end], true),
+                text,
                 end: cursor + end,
+                quoted,
+                quotes_after,
             });
             cursor += end;
             self.parsed_offset = cursor;
@@ -190,6 +214,7 @@ impl TextProcessor {
                     separator: &word.separator,
                     text,
                     command: true,
+                    quoted: word.quoted || next.quoted,
                 });
                 i += 2;
                 continue;
@@ -198,10 +223,13 @@ impl TextProcessor {
                 separator: &word.separator,
                 text: &word.text,
                 command: false,
+                quoted: word.quoted,
             };
             if self.cleanup
                 && let Some(previous) = atoms.iter_mut().rev().find(|atom| !atom.text.is_empty())
                 && !previous.command
+                && !previous.quoted
+                && !atom.quoted
                 && self
                     .cleanup_catalog
                     .pair(previous.text, atom.text, atom.separator)
@@ -224,6 +252,7 @@ impl TextProcessor {
         while !self.pending.is_empty() && (all || self.pending.len() > MUTABLE_WORDS) {
             let mut word = self.pending.pop_front().unwrap();
             self.released_offset = word.end;
+            self.released_quotes = word.quotes_after;
             if word.text.is_empty() {
                 continue;
             }
@@ -235,6 +264,8 @@ impl TextProcessor {
                     continue;
                 }
                 if self.cleanup
+                    && !previous.quoted
+                    && !word.quoted
                     && self
                         .cleanup_catalog
                         .pair(&previous.text, &word.text, &word.separator)
@@ -258,7 +289,7 @@ impl TextProcessor {
         &self,
         words: &VecDeque<Word>,
         before: Option<&str>,
-    ) -> (usize, String, bool, bool) {
+    ) -> (usize, String, bool, bool, Option<String>) {
         let first = &words[0];
         let source: Vec<_> = words
             .iter()
@@ -271,7 +302,7 @@ impl TextProcessor {
                     command(&words[i].text, &words[i + 1].text, &words[i + 1].separator)
                 {
                     if i == 0 {
-                        return (2, text.into(), true, false);
+                        return (2, text.into(), true, false, None);
                     }
                     protected[i] = true;
                     protected[i + 1] = true;
@@ -280,16 +311,27 @@ impl TextProcessor {
         }
         if let Some(found) = self.dictionary.apply(&source, before, &protected) {
             match found {
-                Match::Replace { words, text } => return (words, text, false, false),
+                Match::Replace { words, text, rule } => {
+                    return (
+                        words,
+                        text,
+                        false,
+                        false,
+                        Some(format!("dictionary:{rule}")),
+                    );
+                }
                 Match::Conflict { words: count } => {
                     let mut text = first.text.clone();
                     for word in words.iter().take(count).skip(1) {
                         text.push_str(&word.separator);
                         text.push_str(&word.text);
                     }
-                    return (count, text, false, false);
+                    return (count, text, false, false, None);
                 }
             }
+        }
+        for (protected, word) in protected.iter_mut().zip(words) {
+            *protected |= word.quoted;
         }
         if self.cleanup
             && let Some(rule) = self
@@ -303,16 +345,23 @@ impl TextProcessor {
                 .skip(1)
                 .any(|(_, word)| self.dictionary.can_start_at(word))
             {
-                return (deleted, String::new(), false, true);
+                return (
+                    deleted,
+                    String::new(),
+                    false,
+                    true,
+                    Some(format!("cleanup:{}", rule.id)),
+                );
             }
         }
-        (1, first.text.clone(), false, false)
+        (1, first.text.clone(), false, false, None)
     }
 
     fn release_dictionary(&mut self, all: bool) {
         while !self.pending.is_empty() && (all || self.pending.len() > MUTABLE_WORDS) {
             let word = self.pending.pop_front().unwrap();
             self.released_offset = word.end;
+            self.released_quotes = word.quotes_after;
             if !word.text.is_empty() {
                 self.frozen.push_back(word);
             }
@@ -326,8 +375,11 @@ impl TextProcessor {
     fn commit_dictionary(&mut self, all: bool) {
         while !self.frozen.is_empty() && (all || self.frozen.len() >= self.required_frozen_words())
         {
-            let (count, text, command, deleted) =
+            let (count, text, command, deleted, hit) =
                 self.dictionary_prefix(&self.frozen, self.source_before.as_deref());
+            if let Some(rule) = hit {
+                *self.hits.entry(rule).or_default() += 1;
+            }
             let separator = self
                 .rendering_separator
                 .take()
@@ -351,6 +403,7 @@ impl TextProcessor {
                 separator,
                 text,
                 command,
+                quoted: false,
             },
             &mut self.after_command,
             self.utterance_start,
@@ -377,7 +430,7 @@ impl TextProcessor {
             let mut before = self.source_before.clone();
             let mut rendering_separator = self.rendering_separator.clone();
             while !words.is_empty() {
-                let (count, text, command, deleted) =
+                let (count, text, command, deleted, _) =
                     self.dictionary_prefix(&words, before.as_deref());
                 let separator = rendering_separator
                     .take()
@@ -395,6 +448,7 @@ impl TextProcessor {
                         separator: &separator,
                         text: &text,
                         command,
+                        quoted: false,
                     },
                     &mut after_command,
                     utterance_start,
@@ -428,6 +482,7 @@ impl TextProcessor {
                 separator: &self.incomplete[..start],
                 text: &self.incomplete[start..],
                 command: false,
+                quoted: false,
             };
             render(
                 &mut partial,
@@ -453,6 +508,38 @@ impl TextProcessor {
             + usize::from(self.lookbehind.is_some())
             + usize::from(self.source_before.is_some())
     }
+}
+
+/// Apostrophes inside words are not quotation delimiters. State follows the
+/// frozen source so revisions can reparse the mutable tail without leaking it.
+fn quotation_state(text: &str, mut state: u8) -> (bool, u8) {
+    let mut quoted = state != 0;
+    for (index, ch) in text.char_indices() {
+        let before = text[..index].chars().next_back();
+        let after = text[index + ch.len_utf8()..].chars().next();
+        let between_letters =
+            before.is_some_and(char::is_alphanumeric) && after.is_some_and(char::is_alphanumeric);
+        match ch {
+            '"' => state ^= 1,
+            '«' => state |= 2,
+            '»' => state &= !2,
+            '‘' => state |= 4,
+            '\'' | '’'
+                if !between_letters
+                    && state & 4 != 0
+                    && !after.is_some_and(char::is_alphanumeric) =>
+            {
+                state &= !4
+            }
+            '\'' if !before.is_some_and(char::is_alphanumeric) => state |= 4,
+            '`' => state ^= 8,
+            '“' => state |= 16,
+            '”' => state &= !16,
+            _ => continue,
+        }
+        quoted = true;
+    }
+    (quoted, state)
 }
 
 /// Marker contents may contain whitespace. Keep raw byte offsets so decoder
@@ -568,6 +655,101 @@ mod tests {
         let mut processor = TextProcessor::new(FormatMode::Faithful, true);
         processor.update(text, true).unwrap();
         processor.parts().0.trim().to_owned()
+    }
+
+    #[test]
+    fn obvious_function_word_repetitions_are_removed_locally() {
+        for (input, expected) in [
+            (
+                "gradi da da parte di sviluppo",
+                "gradi da parte di sviluppo",
+            ),
+            (
+                "avvia un'altra un'altra finestra",
+                "avvia un'altra finestra",
+            ),
+            (
+                "memoria alcune alcune richieste",
+                "memoria alcune richieste",
+            ),
+            ("versione più più ristretta", "versione più ristretta"),
+            (
+                "quindi mi mi mantieni in in caso",
+                "quindi mi mantieni in caso",
+            ),
+            ("passa alla alla schermata", "passa alla schermata"),
+            ("con con con il microfono", "con il microfono"),
+        ] {
+            assert_eq!(clean(input), expected, "{input}");
+            assert_eq!(format_transcript(input, FormatMode::Faithful), input);
+        }
+    }
+
+    #[test]
+    fn repetition_cleanup_preserves_emphasis_negation_and_quoted_passages() {
+        let prefix = "uno due tre quattro cinque sei sette otto nove dieci ";
+        for quoted in [
+            "\"qui scrivi mi mi in in il il\"",
+            "«qui scrivi mi mi in in il il»",
+            "“qui scrivi mi mi in in il il”",
+            "'qui scrivi mi mi in in il il'",
+            "`qui scrivi mi mi in in il il`",
+        ] {
+            let input = format!("cita {quoted} poi il il progetto");
+            let expected = format!("cita {quoted} poi il progetto");
+            assert_eq!(clean(&input), expected);
+            let catalog =
+                CompiledCatalog::compile(CompiledCatalog::builtin().definition().clone(), "auto")
+                    .unwrap();
+            let mut configured = TextProcessor::with_rules(
+                FormatMode::Faithful,
+                true,
+                Dictionary::default(),
+                catalog,
+            );
+            configured.update(&input, true).unwrap();
+            assert_eq!(configured.parts().0, expected);
+            // Quotation protection must survive confirmation of the opening quote.
+            let input = format!("cita \"{prefix}il il progetto\" poi il il testo");
+            let expected = format!("cita \"{prefix}il il progetto\" poi il testo");
+            let mut processor = TextProcessor::new(FormatMode::Faithful, true);
+            for end in (0..=input.len()).filter(|&n| input.is_char_boundary(n)) {
+                processor.update(&input[..end], false).unwrap();
+            }
+            processor.update(&input, true).unwrap();
+            assert_eq!(processor.parts().0, expected);
+        }
+        for input in [
+            "molto molto importante non non cancellare mai mai i dati",
+            "piano piano bene bene forte forte",
+            "Anna Anna 20 20 the The",
+            "il, il progetto mi. mi serve in\nin caso",
+        ] {
+            assert_eq!(clean(input), input);
+        }
+    }
+
+    #[test]
+    fn quotation_state_follows_decoder_revisions_and_utterance_boundaries() {
+        let mut processor = TextProcessor::new(FormatMode::Faithful, true);
+        processor.update("cita \"qui il il testo ", false).unwrap();
+        processor.update("cita qui il il testo ", false).unwrap();
+        processor.update("cita qui il il testo", true).unwrap();
+        assert_eq!(processor.parts().0, "cita qui il testo");
+
+        let mut processor = TextProcessor::new(FormatMode::Faithful, true);
+        processor.update("cita \"qui", true).unwrap();
+        processor
+            .update("il il testo\" poi il il progetto", true)
+            .unwrap();
+        assert_eq!(
+            processor.parts().0,
+            "cita \"qui il il testo\" poi il progetto"
+        );
+        assert_eq!(
+            clean("nell'altra nell'altra finestra"),
+            "nell'altra finestra"
+        );
     }
 
     #[test]

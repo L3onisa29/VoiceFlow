@@ -93,7 +93,8 @@ fn main() -> Result<()> {
         "inferenceSeconds":result.inference_seconds, "realTimeFactor":result.inference_seconds/result.audio_seconds.max(0.001),
         "firstPartialAudioSeconds":first_partial, "firstPartialWallSeconds":first_partial_wall,
         "chunkP95Ms":p95, "finalizeMs":stop.elapsed().as_secs_f64()*1000.0,
-        "chunks":result.chunks, "text":result.text(), "paced":realtime, "cleanup":cleanup, "format":mode});
+        "chunks":result.chunks, "text":result.text(), "paced":realtime, "cleanup":cleanup, "format":mode,
+        "silenceClosures":session.silence_closures(), "recognition":session.recognition()});
     println!("{output}");
     ensure!(!result.text().is_empty(), "No speech recognized");
     Ok(())

@@ -45,8 +45,15 @@ pub struct Dictionary {
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Match {
-    Replace { words: usize, text: String },
-    Conflict { words: usize },
+    /// `rule` is the id of the rule that supplied the replacement.
+    Replace {
+        words: usize,
+        text: String,
+        rule: i64,
+    },
+    Conflict {
+        words: usize,
+    },
 }
 
 pub fn validate_rule(rule: &Rule) -> Result<()> {
@@ -208,7 +215,7 @@ impl Dictionary {
                 .flatten(),
         );
         type Specificity = (usize, usize, u8, bool);
-        let mut best: Option<(Specificity, usize, String)> = None;
+        let mut best: Option<(Specificity, usize, String, i64)> = None;
         let mut conflict = false;
         for &index in candidates {
             let compiled = &self.rules[index];
@@ -258,21 +265,21 @@ impl Dictionary {
             );
             let replacement = format!("{}{suffix}", rule.preferred);
             match &best {
-                Some((old, _, _)) if *old > rank => (),
-                Some((old, _, text)) if *old == rank => {
+                Some((old, _, _, _)) if *old > rank => (),
+                Some((old, _, text, _)) if *old == rank => {
                     conflict |= *text != replacement;
                 }
                 _ => {
-                    best = Some((rank, count, replacement));
+                    best = Some((rank, count, replacement, rule.id));
                     conflict = false;
                 }
             }
         }
-        best.map(|(_, words, text)| {
+        best.map(|(_, words, text, rule)| {
             if conflict {
                 Match::Conflict { words }
             } else {
-                Match::Replace { words, text }
+                Match::Replace { words, text, rule }
             }
         })
     }
