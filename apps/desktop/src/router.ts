@@ -1,21 +1,26 @@
 import { createHashHistory, createRouter } from "@tanstack/react-router";
-import { Route as rootRoute } from "./routes/__root";
-import { Route as indexRoute } from "./routes";
-import { Route as dictionaryRoute } from "./routes/dictionary";
-import { Route as suggestionsRoute } from "./routes/suggestions";
-import { Route as analysisRoute } from "./routes/analysis";
-import { Route as settingsRoute } from "./routes/settings";
+import { queryClient } from "./lib/query-client";
+import { routeTree } from "./routeTree.gen";
+import {
+  RouteError,
+  RouteNotFound,
+  RoutePending,
+} from "./components/layout/route-states";
 
-// Keep navigation inside the Tauri WebView's document, including on reload.
 export const router = createRouter({
-  routeTree: rootRoute.addChildren([
-    indexRoute,
-    dictionaryRoute,
-    settingsRoute,
-    suggestionsRoute,
-    analysisRoute,
-  ]),
+  routeTree,
+  // Keep navigation inside the Tauri WebView's document, including on reload.
   history: createHashHistory(),
+  context: { queryClient },
+  defaultPreload: "intent",
+  // Loaders only warm the Query cache; Query owns freshness.
+  defaultPreloadStaleTime: 0,
+  defaultPendingComponent: RoutePending,
+  defaultErrorComponent: RouteError,
+  defaultNotFoundComponent: RouteNotFound,
+  // Pages scroll inside the shell's #page-content, not the window.
+  scrollRestoration: true,
+  scrollToTopSelectors: ["#page-content"],
 });
 
 declare module "@tanstack/react-router" {

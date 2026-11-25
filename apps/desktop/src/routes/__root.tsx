@@ -1,39 +1,26 @@
-import { createRootRoute, Link, Outlet } from "@tanstack/react-router";
+import type { QueryClient } from "@tanstack/react-query";
+import { createRootRouteWithContext, Outlet } from "@tanstack/react-router";
 import { AppShell } from "@/components/layout/app-shell";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Button } from "@/components/ui/button";
-import {
-  Empty,
-  EmptyHeader,
-  EmptyTitle,
-  EmptyDescription,
-  EmptyContent,
-} from "@/components/ui/empty";
-import { DictationProvider } from "@/contexts/dictation";
+import { Toaster } from "@/components/ui/sonner";
+import { useDictationConnection } from "@/hooks/use-dictation-connection";
+import { useQueryEvents } from "@/hooks/use-query-events";
 
-export const Route = createRootRoute({
-  component: () => (
-    <DictationProvider>
-      <TooltipProvider>
-        <AppShell>
-          <Outlet />
-        </AppShell>
-      </TooltipProvider>
-    </DictationProvider>
-  ),
-  notFoundComponent: () => (
-    <Empty>
-      <EmptyHeader>
-        <EmptyTitle>
-          <h1>Pagina non trovata</h1>
-        </EmptyTitle>
-        <EmptyDescription>Questa pagina non è disponibile.</EmptyDescription>
-      </EmptyHeader>
-      <EmptyContent>
-        <Button asChild variant="outline">
-          <Link to="/">Torna alla dettatura</Link>
-        </Button>
-      </EmptyContent>
-    </Empty>
-  ),
+export type RouterContext = { queryClient: QueryClient };
+
+export const Route = createRootRouteWithContext<RouterContext>()({
+  component: RootLayout,
 });
+
+function RootLayout() {
+  useQueryEvents();
+  useDictationConnection();
+  return (
+    <TooltipProvider>
+      <AppShell>
+        <Outlet />
+      </AppShell>
+      <Toaster containerAriaLabel="Notifiche" />
+    </TooltipProvider>
+  );
+}

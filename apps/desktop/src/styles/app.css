@@ -1,13 +1,14 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/manrope";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    sans-serif;
   --font-heading: var(--font-sans);
-  --font-sans: "Manrope Variable", sans-serif;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -25,7 +26,9 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-success-foreground: var(--success-foreground);
   --color-success: var(--success);
+  --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
@@ -50,6 +53,85 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+:root {
+  color-scheme: light;
+  --radius: 0.625rem;
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.2 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0 0);
+  --primary: oklch(0.555 0.18 42);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.955 0 0);
+  --secondary-foreground: oklch(0.2 0 0);
+  --muted: oklch(0.955 0 0);
+  --muted-foreground: oklch(0.5 0 0);
+  --accent: oklch(0.945 0 0);
+  --accent-foreground: oklch(0.2 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --success: oklch(0.52 0.13 150);
+  --success-foreground: oklch(0.985 0 0);
+  --warning: oklch(0.55 0.12 65);
+  --warning-foreground: oklch(0.985 0 0);
+  --border: oklch(0.9 0 0);
+  --input: oklch(0.88 0 0);
+  --ring: oklch(0.555 0.18 42);
+  --chart-1: oklch(0.555 0.18 42);
+  --chart-2: oklch(0.7 0.15 55);
+  --chart-3: oklch(0.45 0.14 40);
+  --chart-4: oklch(0.65 0 0);
+  --chart-5: oklch(0.45 0 0);
+  --sidebar: oklch(0.96 0 0);
+  --sidebar-foreground: oklch(0.2 0 0);
+  --sidebar-primary: oklch(0.555 0.18 42);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.92 0 0);
+  --sidebar-accent-foreground: oklch(0.2 0 0);
+  --sidebar-border: oklch(0.9 0 0);
+  --sidebar-ring: oklch(0.555 0.18 42);
+}
+
+.dark {
+  color-scheme: dark;
+  --background: oklch(0.215 0 0);
+  --foreground: oklch(0.97 0 0);
+  --card: oklch(0.25 0 0);
+  --card-foreground: oklch(0.97 0 0);
+  --popover: oklch(0.27 0 0);
+  --popover-foreground: oklch(0.97 0 0);
+  --primary: oklch(0.74 0.16 52);
+  --primary-foreground: oklch(0.2 0.02 50);
+  --secondary: oklch(0.29 0 0);
+  --secondary-foreground: oklch(0.97 0 0);
+  --muted: oklch(0.29 0 0);
+  --muted-foreground: oklch(0.72 0 0);
+  --accent: oklch(0.31 0 0);
+  --accent-foreground: oklch(0.97 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --success: oklch(0.78 0.15 150);
+  --success-foreground: oklch(0.2 0.03 150);
+  --warning: oklch(0.84 0.15 85);
+  --warning-foreground: oklch(0.2 0.03 85);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.74 0.16 52);
+  --chart-1: oklch(0.74 0.16 52);
+  --chart-2: oklch(0.82 0.11 60);
+  --chart-3: oklch(0.62 0.17 42);
+  --chart-4: oklch(0.78 0 0);
+  --chart-5: oklch(0.55 0 0);
+  --sidebar: oklch(0.235 0 0);
+  --sidebar-foreground: oklch(0.97 0 0);
+  --sidebar-primary: oklch(0.74 0.16 52);
+  --sidebar-primary-foreground: oklch(0.2 0.02 50);
+  --sidebar-accent: oklch(0.31 0 0);
+  --sidebar-accent-foreground: oklch(0.97 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.74 0.16 52);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
@@ -60,131 +142,16 @@
   html {
     @apply font-sans;
   }
-}
-:root,
-.dark {
-  color-scheme: dark;
-  --font-sans: "Manrope Variable", sans-serif;
-  --background: #0c0c0c;
-  --foreground: #f5f5f5;
-  --card: #151515;
-  --card-foreground: var(--foreground);
-  --popover: #1b1b1b;
-  --popover-foreground: var(--foreground);
-  --primary: #ff8a3d;
-  --primary-foreground: #111111;
-  --secondary: #242424;
-  --secondary-foreground: #ededed;
-  --muted: #202020;
-  --muted-foreground: #a3a3a3;
-  --accent: #2e2017;
-  --accent-foreground: #ffad76;
-  --destructive: #ff7878;
-  --success: #86efac;
-  --warning: #fde047;
-  --border: #303030;
-  --input: #3b3b3b;
-  --ring: var(--primary);
-  --chart-1: #ff8a3d;
-  --chart-2: #ffad76;
-  --chart-3: #d9651b;
-  --chart-4: #bcbcbc;
-  --chart-5: #787878;
-  --sidebar: #101010;
-  --sidebar-foreground: var(--foreground);
-  --sidebar-primary: var(--primary);
-  --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
-  --sidebar-accent-foreground: var(--accent-foreground);
-  --sidebar-border: var(--border);
-  --sidebar-ring: var(--ring);
-  --radius: 0.7rem;
-}
-
-body {
-  margin: 0;
-  -webkit-font-smoothing: antialiased;
-}
-button:not(:disabled) {
-  cursor: pointer;
-}
-.window-drag {
-  height: 38px;
-  position: fixed;
-  inset: 0 0 auto;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0 23px 0 91px;
-  font-size: 9px;
-  letter-spacing: 0.14em;
-  color: var(--muted-foreground);
-  background: var(--background);
-  user-select: none;
-}
-.window-drag span {
-  pointer-events: none;
-}
-.page-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 8px;
-}
-.eyebrow {
-  font-size: 10px;
-  letter-spacing: 0.17em;
-  font-weight: 700;
-  color: var(--primary);
-  margin-bottom: 10px;
-}
-.page-header h1 {
-  font-size: clamp(25px, 3vw, 29px);
-  font-weight: 600;
-  letter-spacing: -1.4px;
-  line-height: 1.25;
-}
-.page-header p:last-child {
-  font-size: 12px;
-  color: var(--muted-foreground);
-  margin-top: 10px;
-}
-.typing-caret {
-  display: inline-block;
-  height: 19px;
-  width: 2px;
-  background: var(--primary);
-  vertical-align: middle;
-  margin-left: 3px;
-  animation: breathe 1s ease-in-out infinite;
-}
-.audio-meter {
-  display: flex;
-  gap: 3px;
-  height: 35px;
-  align-items: center;
-  padding: 0 5px;
-}
-.audio-meter span {
-  display: block;
-  width: 3px;
-  min-height: 4px;
-  border-radius: 3px;
-  background: var(--primary);
-  transition: height 100ms;
-}
-@keyframes breathe {
-  50% {
-    opacity: 0.3;
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
   }
-}
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation: none !important;
-    transition: none !important;
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation: none !important;
+      transition: none !important;
+    }
   }
 }

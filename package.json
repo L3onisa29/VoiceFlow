@@ -16,10 +16,17 @@
     "test:rust": "cargo test --workspace --locked",
     "test:streaming": "cargo build --release --locked -p voiceflow-core --bin streaming-benchmark && node scripts/verify-streaming.ts",
     "test:short-recordings": "cargo build --release --locked -p voiceflow-core --bin streaming-benchmark && node scripts/verify-short-recordings.ts",
-    "test:signing": "node --test scripts/build-signing.test.ts"
+    "test:signing": "node --test scripts/build-signing.test.ts",
+    "test:errors": "node --test scripts/errors.test.ts",
+    "test:ui": "node scripts/verify-ui.ts",
+    "test:native-helper": "cargo build --release --locked -p voiceflow-desktop --bin voiceflow-analysis && node scripts/verify-native-helper.ts",
+    "test:state": "node scripts/verify-state-renders.ts",
+    "voice-profile:eval": "cargo run --release --locked -p voiceflow-desktop --bin voice-profile-eval --",
+    "test:corrections": "node --test scripts/corrections.test.ts"
   },
   "type": "module",
   "devDependencies": {
+    "playwright": "1.62.1",
     "prettier": "^3.9.9"
   }
 }
